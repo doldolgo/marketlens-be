@@ -1,0 +1,21 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    setps:
+      - name: Depoly to EC2 over SSH
+        uses: appleboy/ssh-actions@v1
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd ~/marketlens-be
+            git pull origin main
+            docker compose up -d --build
