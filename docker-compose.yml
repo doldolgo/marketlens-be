@@ -1,0 +1,10 @@
+services:
+  be:
+    build: .
+    container_name: market-lens-be
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+
+    
