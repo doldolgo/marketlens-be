@@ -5,11 +5,20 @@
 """
 
 from app.exchanges.base import BaseExchange
-from app.exchanges.registry import all_exchanges, exchange_ids, get_exchange, reload
+from app.exchanges.registry import (
+    all_exchanges,
+    domestic_exchange_ids,
+    domestic_exchanges,
+    exchange_ids,
+    get_exchange,
+    reload,
+)
 
 __all__ = [
     "BaseExchange",
     "all_exchanges",
+    "domestic_exchange_ids",
+    "domestic_exchanges",
     "exchange_ids",
     "get_exchange",
     "reload",

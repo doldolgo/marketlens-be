@@ -8,6 +8,8 @@ keep-alive 커넥션을 재사용하고, 여러 거래소를 동시에 호출한
 
 from __future__ import annotations
 
+from collections import Counter
+
 import httpx
 
 from app.core.config import settings
@@ -15,10 +17,27 @@ from app.core.config import settings
 _client: httpx.AsyncClient | None = None
 
 
+#: 거래소별 누적 API 호출 수. 응답에 "거래소별 호출 횟수" 를 정직하게 싣기 위한 계측용.
+#: ``BaseExchange._get_json`` 에서 증가시킨다 — 거래소 API 호출이 전부 그곳을 지난다.
+_call_counts: Counter[str] = Counter()
+
+
+def record_call(exchange_id: str) -> None:
+    """거래소 API 호출 1회를 기록한다."""
+    _call_counts[exchange_id] += 1
+
+
+def request_counts() -> Counter[str]:
+    """지금까지의 거래소별 누적 호출 수 사본."""
+    return _call_counts.copy()
+
+
 def create_client() -> httpx.AsyncClient:
     """설정값이 적용된 AsyncClient 를 생성한다."""
     return httpx.AsyncClient(
-        timeout=httpx.Timeout(settings.http_timeout, connect=settings.http_connect_timeout),
+        timeout=httpx.Timeout(
+            settings.http_timeout, connect=settings.http_connect_timeout
+        ),
         limits=httpx.Limits(
             max_connections=settings.http_max_connections,
             max_keepalive_connections=settings.http_max_keepalive,

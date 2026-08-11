@@ -1,18 +1,24 @@
-"""업비트(Upbit) 커넥터 — 독립 구현.
+"""빗썸(Bithumb) 커넥터 — 독립 구현.
 
-원본 엔드포인트 — 전부 인증 불필요 (public quotation API)
-    GET https://api.upbit.com/v1/orderbook?markets=KRW-BTC
-    GET https://api.upbit.com/v1/ticker?markets=KRW-BTC
-    GET https://api.upbit.com/v1/market/all
+원본 엔드포인트 — 전부 인증 불필요
+    GET https://api.bithumb.com/v1/orderbook?markets=KRW-BTC
+    GET https://api.bithumb.com/v1/ticker?markets=KRW-BTC
+    GET https://api.bithumb.com/v1/market/all
 
-- Rate limit: **엔드포인트 그룹별 초당 10회** (`Remaining-Req` 헤더로 잔여량 확인)
-- 호가 개수를 요청할 수 없고 **항상 최대 30단계**를 내려주므로,
-  ``depth`` 는 응답을 받은 뒤 잘라내는 방식으로 적용한다.
-- ``markets`` 에 쉼표로 여러 마켓을 넘길 수 있다 (281개 KRW 마켓을 3회 호출로).
-
-빗썸 v1 API 와 응답 형태가 같지만 **일부러 코드를 공유하지 않는다.**
+빗썸 v1 API 는 현재 업비트와 응답 형태가 같지만 **일부러 코드를 공유하지 않는다.**
 어느 한쪽 API 가 바뀌었을 때 다른 쪽이 함께 흔들리는 구조를 피하기 위해
 거래소마다 전체 구현을 따로 둔다.
+
+업비트와 다른 점
+    - Rate limit 이 훨씬 넉넉하다: **초당 150회**
+      (`X-RateLimit-Remaining` / `X-RateLimit-Burst-Capacity` 헤더)
+    - **잔량이 0 인 유령 호가가 섞여 나온다.** 실측: KRW-BTC 30단계 중
+      매수 7개 · 매도 4개가 ``size: 0`` 이었다 (업비트는 0개).
+      그대로 두면 최우선 호가가 체결 불가능한 가격으로 잡히므로 걸러낸다.
+      → 걸러낸 뒤 **실제로 쓸 수 있는 호가는 마켓당 15단계 안팎**이다.
+    - ``ticker`` 의 ``trade_timestamp`` 가 KST 벽시계 기준이라 **정확히 9시간
+      미래**로 온다 (orderbook 의 ``timestamp`` 는 정상). 파싱에서 보정한다.
+    - KRW 마켓이 479개로 업비트(281개)보다 많다.
 """
 
 from __future__ import annotations
@@ -34,10 +40,10 @@ from app.models.symbol import Symbol
 from app.models.ticker import Ticker
 
 
-class Upbit(BaseExchange):
-    id: ClassVar[str] = "upbit"
-    name: ClassVar[str] = "업비트"
-    quote_currencies: ClassVar[frozenset[str]] = frozenset({"KRW", "BTC", "USDT"})
+class Bithumb(BaseExchange):
+    id: ClassVar[str] = "bithumb"
+    name: ClassVar[str] = "빗썸"
+    quote_currencies: ClassVar[frozenset[str]] = frozenset({"KRW"})
     default_quote: ClassVar[str] = "KRW"
     supported_market_types: ClassVar[frozenset[MarketType]] = frozenset(
         {MarketType.SPOT}
@@ -61,7 +67,7 @@ class Upbit(BaseExchange):
 
     @property
     def base_url(self) -> str:
-        return settings.upbit_base_url
+        return settings.bithumb_base_url
 
     # ------------------------------------------------------------------
     # 심볼 · 요청
@@ -74,8 +80,7 @@ class Upbit(BaseExchange):
     async def _get_market_json(self, path: str, native_symbol: str) -> Any:
         """마켓 코드를 넘기는 조회 API 공통 호출부.
 
-        없는 마켓에는 404 + ``{"error": {"name": 404, ...}}`` 가 오므로
-        MarketNotFoundError 로 옮겨준다.
+        없는 마켓에는 404 가 오므로 MarketNotFoundError 로 옮겨준다.
         """
         try:
             return await self._get_json(
@@ -106,18 +111,21 @@ class Upbit(BaseExchange):
     ) -> list[OrderBookLevel]:
         """orderbook_units 에서 한쪽 호가만 뽑는다.
 
-        업비트는 하나의 unit 안에 같은 단계의 bid/ask 를 함께 담아 내려주고,
+        하나의 unit 안에 같은 단계의 bid/ask 가 함께 담겨 내려오고,
         bid 는 내림차순 · ask 는 오름차순으로 이미 정렬되어 있다.
-        (빗썸과 달리 잔량 0 인 유령 호가는 나오지 않는다 — 실측 확인)
+
+        **잔량 0 인 유령 호가는 반드시 걸러낸다.** 그대로 두면 최우선 호가가
+        체결 불가능한 가격으로 잡히고 호가 소진 계산도 어긋난다.
         """
         price_key = "bid_price" if is_bid else "ask_price"
         size_key = "bid_size" if is_bid else "ask_size"
 
         levels = []
         for unit in units:
-            levels.append(
-                OrderBookLevel(price=float(unit[price_key]), size=float(unit[size_key]))
-            )
+            size = float(unit[size_key])
+            if size <= 0:
+                continue
+            levels.append(OrderBookLevel(price=float(unit[price_key]), size=size))
             if len(levels) >= depth:
                 break
         return levels
@@ -175,9 +183,8 @@ class Upbit(BaseExchange):
             )
 
         t = raw[0]
-        # trade_price / trade_timestamp 는 진짜 마지막 체결값이다 (업비트 실측 검증).
-        # 함께 오는 opening_price / high_price / acc_trade_* 등 기간 요약은 쓰지 않는다 —
-        # 집계 구간이 거래소마다 달라 비교가 성립하지 않는다.
+        # trade_price / trade_timestamp 는 마지막 체결값이다.
+        # 함께 오는 기간 요약(opening_price 등)은 집계 구간이 거래소마다 달라 쓰지 않는다.
         return Ticker(
             exchange=self.id,
             symbol=str(symbol),
@@ -186,9 +193,30 @@ class Upbit(BaseExchange):
             base=symbol.base,
             quote=symbol.quote,
             last_price=float(t["trade_price"]),
-            timestamp=int(t.get("trade_timestamp", 0)),
+            timestamp=self._normalize_trade_timestamp(
+                int(t.get("trade_timestamp", 0))
+            ),
             latency_ms=round(latency_ms, 2),
         )
+
+    #: KST(UTC+9) 오프셋 (ms). 빗썸 trade_timestamp 보정에 쓴다.
+    _KST_OFFSET_MS = 9 * 3600 * 1000
+
+    @staticmethod
+    def _normalize_trade_timestamp(ts: int) -> int:
+        """빗썸의 KST 시프트된 체결 시각을 표준 epoch ms 로 보정한다.
+
+        실측: 빗썸 v1 ticker 의 ``trade_timestamp`` 는 KST 벽시계를 epoch 처럼
+        인코딩해 **정확히 9시간 미래**로 온다 (orderbook 의 ``timestamp`` 는 정상).
+        1시간 이상 미래면 시프트로 판단해 9시간을 빼고, 빗썸이 고치면
+        그대로 통과한다.
+        """
+        if ts <= 0:
+            return ts
+        now_ms = time.time() * 1000
+        if ts - now_ms > 3600 * 1000:
+            return ts - Bithumb._KST_OFFSET_MS
+        return ts
 
     # ------------------------------------------------------------------
     # 전종목 일괄 조회
@@ -266,20 +294,21 @@ class Upbit(BaseExchange):
     def _bulk_from_book(
         self, base: str, quote: str, native: str, row: dict
     ) -> BulkQuote | None:
-        """호가 응답에서 최우선 매수/매도를 뽑는다."""
+        """호가 응답에서 최우선 매수/매도를 뽑는다. 잔량 0 단계는 건너뛴다."""
         units = row.get("orderbook_units") or []
-        if not units:
+        bid = next((u for u in units if float(u["bid_size"]) > 0), None)
+        ask = next((u for u in units if float(u["ask_size"]) > 0), None)
+        if bid is None or ask is None:
             return None
-        top = units[0]
 
         return BulkQuote(
             base=base,
             quote=quote,
             native_symbol=native,
-            bid=float(top["bid_price"]),
-            ask=float(top["ask_price"]),
-            bid_size=float(top["bid_size"]),
-            ask_size=float(top["ask_size"]),
+            bid=float(bid["bid_price"]),
+            ask=float(ask["ask_price"]),
+            bid_size=float(bid["bid_size"]),
+            ask_size=float(ask["ask_size"]),
         )
 
     def _bulk_from_ticker(
@@ -301,7 +330,7 @@ class Upbit(BaseExchange):
     ) -> dict[str, OrderBook]:
         """전종목 호가창을 **깊이까지** 한 번에 가져온다.
 
-        업비트의 ``/v1/orderbook?markets=...`` 은 마켓당 **30단계 전부**를
+        빗썸의 ``/v1/orderbook?markets=...`` 은 마켓당 **30단계 전부**를
         내려준다. 즉 최우선 호가만 쓰는 일괄 조회와 **호출 수가 완전히 같은데**
         깊이까지 얻을 수 있다. 슬리피지 계산에 그대로 쓸 수 있다.
         """

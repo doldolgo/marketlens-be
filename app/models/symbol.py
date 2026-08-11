@@ -20,8 +20,6 @@ class Symbol:
 
     base: str
     quote: str
-    
-
 
     @classmethod
     def parse(cls, raw: str) -> "Symbol":

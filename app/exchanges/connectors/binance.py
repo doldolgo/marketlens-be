@@ -17,19 +17,24 @@ import time
 from typing import Any, ClassVar
 
 from app.core.config import settings
-from app.core.errors import ExchangeAPIError, MarketNotFoundError
+from app.core.errors import (
+    ExchangeAPIError,
+    MarketNotFoundError,
+    UnsupportedMarketError,
+)
+from app.models.bulk import BulkQuote
 from app.models.orderbook import MarketType, OrderBook, OrderBookLevel
 from app.models.symbol import Symbol
 from app.models.ticker import Ticker
 from app.exchanges.base import BaseExchange
 
 
-
-
 class Binance(BaseExchange):
     id: ClassVar[str] = "binance"
     name: ClassVar[str] = "바이낸스"
-    quote_currencies: ClassVar[frozenset[str]] = frozenset({"USDT", "USDC", "BTC", "ETH", "BNB", "FDUSD"})
+    quote_currencies: ClassVar[frozenset[str]] = frozenset(
+        {"USDT", "USDC", "BTC", "ETH", "BNB", "FDUSD"}
+    )
     default_quote: ClassVar[str] = "USDT"
     supported_market_types: ClassVar[frozenset[MarketType]] = frozenset(
         {MarketType.SPOT, MarketType.FUTURES}
@@ -47,6 +52,15 @@ class Binance(BaseExchange):
 
     #: 바이낸스가 허용하는 limit 값. 요청 depth 를 이 중 하나로 올림한다.
     ALLOWED_LIMITS: ClassVar[tuple[int, ...]] = (5, 10, 20, 50, 100, 500, 1000)
+
+    # 전종목 일괄 조회 — 심볼을 지정하지 않으면 전체가 오고 weight 는 4밖에 안 든다.
+    # (단일 심볼 조회가 weight 2 이므로, 2개 이상이면 전체 조회가 오히려 싸다)
+    SPOT_BULK_PRICE_PATH = "/api/v3/ticker/price"
+    SPOT_BULK_BOOK_PATH = "/api/v3/ticker/bookTicker"
+    FUTURES_BULK_PRICE_PATH = "/fapi/v1/ticker/price"
+    FUTURES_BULK_BOOK_PATH = "/fapi/v1/ticker/bookTicker"
+
+    supports_bulk: ClassVar[bool] = True
 
     def to_native_symbol(self, symbol: Symbol, market_type: MarketType) -> str:
         """BTC/USDT -> BTCUSDT (바이낸스는 구분자 없는 BASE+QUOTE)."""
@@ -128,10 +142,92 @@ class Binance(BaseExchange):
             market_type=market_type,
             base=symbol.base,
             quote=symbol.quote,
-            last_price=float(trade["p"]),   # 체결 가격
-            timestamp=int(trade["T"]),      # 체결 시각 (진짜 마지막 체결 시각)
+            last_price=float(trade["p"]),  # 체결 가격
+            timestamp=int(trade["T"]),  # 체결 시각 (진짜 마지막 체결 시각)
             latency_ms=round(latency_ms, 2),
         )
+
+    # ------------------------------------------------------------------
+    # 전종목 일괄 조회
+    # ------------------------------------------------------------------
+
+    async def fetch_bulk_quotes(
+        self,
+        quote: str,
+        *,
+        need_book: bool,
+        market_type: MarketType = MarketType.SPOT,
+    ) -> dict[str, BulkQuote]:
+        """바이낸스 전종목 시세를 가져온다.
+
+        심볼 파라미터 없이 호출하면 전체(현물 약 3,700개)가 오고 **weight 는 4**다.
+        단일 조회가 weight 2 이므로 2종목만 넘어가도 전체 조회가 더 싸다.
+
+        바이낸스 심볼에는 구분자가 없어서(``BTCUSDT``) 접미사로 결제 통화를 판별한다.
+        """
+        quote = quote.upper()
+        if quote not in self.quote_currencies:
+            raise UnsupportedMarketError(
+                f"바이낸스는 {quote} 마켓을 지원하지 않습니다.",
+                detail={"exchange": self.id, "quote": quote},
+            )
+
+        if market_type is MarketType.FUTURES:
+            base_url = settings.binance_futures_base_url
+            path = (
+                self.FUTURES_BULK_BOOK_PATH
+                if need_book
+                else self.FUTURES_BULK_PRICE_PATH
+            )
+        else:
+            base_url = settings.binance_spot_base_url
+            path = self.SPOT_BULK_BOOK_PATH if need_book else self.SPOT_BULK_PRICE_PATH
+
+        rows = await self._get_json(f"{base_url}{path}")
+        if not isinstance(rows, list):
+            raise ExchangeAPIError(
+                "바이낸스 전종목 응답 형식이 올바르지 않습니다.",
+                detail={"exchange": self.id, "path": path},
+            )
+
+        result: dict[str, BulkQuote] = {}
+        for row in rows:
+            native = row.get("symbol")
+            if not native or not native.endswith(quote):
+                continue
+            base = native[: -len(quote)]
+            if not base:
+                continue
+
+            if need_book:
+                bid, ask = row.get("bidPrice"), row.get("askPrice")
+                if bid is None or ask is None:
+                    continue
+                bid_f, ask_f = float(bid), float(ask)
+                # 거래가 없는 심볼은 호가가 0 으로 온다.
+                if bid_f <= 0 or ask_f <= 0:
+                    continue
+                result[base] = BulkQuote(
+                    base=base,
+                    quote=quote,
+                    native_symbol=native,
+                    bid=bid_f,
+                    ask=ask_f,
+                    bid_size=float(row.get("bidQty") or 0.0),
+                    ask_size=float(row.get("askQty") or 0.0),
+                )
+            else:
+                price = row.get("price")
+                if price is None:
+                    continue
+                price_f = float(price)
+                if price_f <= 0:
+                    continue
+                result[base] = BulkQuote(
+                    base=base, quote=quote, native_symbol=native, last=price_f
+                )
+
+        return result
 
     def _parse_orderbook(
         self,

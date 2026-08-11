@@ -31,7 +31,9 @@ from app.exchanges.base import BaseExchange
 def _iter_connector_modules() -> list[ModuleType]:
     """connectors 패키지 안의 모든 모듈을 임포트해서 반환한다."""
     modules = []
-    for info in pkgutil.iter_modules(connectors.__path__, prefix=f"{connectors.__name__}."):
+    for info in pkgutil.iter_modules(
+        connectors.__path__, prefix=f"{connectors.__name__}."
+    ):
         if info.name.rsplit(".", 1)[-1].startswith("_"):
             continue  # _private.py 같은 내부 모듈은 건너뛴다
         modules.append(importlib.import_module(info.name))
@@ -44,8 +46,8 @@ def _is_connector(obj: object, module: ModuleType) -> bool:
         inspect.isclass(obj)
         and issubclass(obj, BaseExchange)
         and obj is not BaseExchange
-        and not inspect.isabstract(obj)          # 추상 메서드가 남아있으면 제외
-        and obj.__module__ == module.__name__    # import 해온 클래스는 제외
+        and not inspect.isabstract(obj)  # 추상 메서드가 남아있으면 제외
+        and obj.__module__ == module.__name__  # import 해온 클래스는 제외
         and isinstance(getattr(obj, "id", None), str)
     )
 
@@ -101,6 +103,16 @@ def get_exchange(exchange_id: str) -> BaseExchange:
 def all_exchanges() -> list[BaseExchange]:
     """등록된 모든 커넥터를 반환한다."""
     return list(_REGISTRY.values())
+
+
+def domestic_exchanges() -> list[BaseExchange]:
+    """국내(원화) 거래소 목록. 프리미엄의 KRW 축이 될 수 있는 곳들."""
+    return [e for e in _REGISTRY.values() if e.is_domestic]
+
+
+def domestic_exchange_ids() -> list[str]:
+    """국내 거래소 ID 목록."""
+    return sorted(e.id for e in domestic_exchanges())
 
 
 def exchange_ids() -> list[str]:

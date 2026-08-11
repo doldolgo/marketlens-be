@@ -31,16 +31,39 @@ class OrderBook(BaseModel):
 
     exchange: str = Field(..., description="거래소 ID (예: upbit, binance)")
     symbol: str = Field(..., description="통일 심볼 (예: BTC/KRW, BTC/USDT)")
-    native_symbol: str = Field(..., description="거래소 원본 심볼 (예: KRW-BTC, BTCUSDT)")
-    market_type: MarketType = Field(default=MarketType.SPOT, description="현물/선물 구분")
+    native_symbol: str = Field(
+        ..., description="거래소 원본 심볼 (예: KRW-BTC, BTCUSDT)"
+    )
+    market_type: MarketType = Field(
+        default=MarketType.SPOT, description="현물/선물 구분"
+    )
     base: str = Field(..., description="기준 통화 (예: BTC)")
     quote: str = Field(..., description="결제 통화 (예: KRW, USDT)")
 
-    bids: list[OrderBookLevel] = Field(default_factory=list, description="매수 호가, 가격 내림차순")
-    asks: list[OrderBookLevel] = Field(default_factory=list, description="매도 호가, 가격 오름차순")
+    bids: list[OrderBookLevel] = Field(
+        default_factory=list, description="매수 호가, 가격 내림차순"
+    )
+    asks: list[OrderBookLevel] = Field(
+        default_factory=list, description="매도 호가, 가격 오름차순"
+    )
 
-    timestamp: int = Field(..., description="거래소 기준 호가 시각 (epoch milliseconds)")
-    latency_ms: float = Field(..., description="요청 시작~응답 파싱 완료까지 걸린 시간 (ms)")
+    timestamp: int = Field(
+        ..., description="거래소 기준 호가 시각 (epoch milliseconds)"
+    )
+    latency_ms: float = Field(
+        ...,
+        description=(
+            "거래소 요청~파싱까지 걸린 시간 (ms). DB 스냅샷에서 나온 응답은 "
+            "거래소를 부르지 않으므로 0.0"
+        ),
+    )
+    data_updated_at: int | None = Field(
+        None,
+        description=(
+            "DB 스냅샷 갱신 시각 (epoch ms). DB 에서 나온 응답에만 채워진다 — "
+            "지금과의 차이가 크면 POST /refresh 로 갱신할 것"
+        ),
+    )
 
     @property
     def best_bid(self) -> float | None:

@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from app.core.errors import InvalidSymbolError, MarketNotFoundError, UnsupportedMarketError
+from app.core.errors import (
+    InvalidSymbolError,
+    MarketNotFoundError,
+    UnsupportedMarketError,
+)
 from app.exchanges import all_exchanges
 from app.exchanges.connectors.binance import Binance
 from app.exchanges.connectors.upbit import Upbit
@@ -16,7 +20,9 @@ BTC_USDT = Symbol(base="BTC", quote="USDT")
 
 
 class TestSymbol:
-    @pytest.mark.parametrize("raw", ["BTC/KRW", "btc/krw", "BTC-KRW", "btc_krw", " BTC/KRW "])
+    @pytest.mark.parametrize(
+        "raw", ["BTC/KRW", "btc/krw", "BTC-KRW", "btc_krw", " BTC/KRW "]
+    )
     def test_parse_accepts_common_formats(self, raw: str) -> None:
         assert Symbol.parse(raw) == BTC_KRW
 
@@ -36,8 +42,18 @@ class TestUpbit:
                 "market": "KRW-BTC",
                 "timestamp": 1700000000000,
                 "orderbook_units": [
-                    {"ask_price": 101.0, "ask_size": 1.0, "bid_price": 99.0, "bid_size": 2.0},
-                    {"ask_price": 102.0, "ask_size": 3.0, "bid_price": 98.0, "bid_size": 4.0},
+                    {
+                        "ask_price": 101.0,
+                        "ask_size": 1.0,
+                        "bid_price": 99.0,
+                        "bid_size": 2.0,
+                    },
+                    {
+                        "ask_price": 102.0,
+                        "ask_size": 3.0,
+                        "bid_price": 98.0,
+                        "bid_size": 4.0,
+                    },
                 ],
             }
         ]
@@ -62,7 +78,12 @@ class TestUpbit:
                 "market": "KRW-BTC",
                 "timestamp": 1700000000000,
                 "orderbook_units": [
-                    {"ask_price": 100.0 + i, "ask_size": 1.0, "bid_price": 99.0 - i, "bid_size": 1.0}
+                    {
+                        "ask_price": 100.0 + i,
+                        "ask_size": 1.0,
+                        "bid_price": 99.0 - i,
+                        "bid_size": 1.0,
+                    }
                     for i in range(30)
                 ],
             }
@@ -99,9 +120,12 @@ class TestBinance:
         assert Binance().to_native_symbol(BTC_USDT, MarketType.SPOT) == "BTCUSDT"
 
     @pytest.mark.parametrize(
-        ("requested", "expected"), [(1, 5), (5, 5), (7, 10), (10, 10), (30, 50), (9999, 1000)]
+        ("requested", "expected"),
+        [(1, 5), (5, 5), (7, 10), (10, 10), (30, 50), (9999, 1000)],
     )
-    def test_limit_is_rounded_up_to_allowed_value(self, requested: int, expected: int) -> None:
+    def test_limit_is_rounded_up_to_allowed_value(
+        self, requested: int, expected: int
+    ) -> None:
         assert Binance()._normalize_limit(requested) == expected
 
     def test_parse_orderbook_converts_string_prices(self) -> None:
@@ -124,7 +148,12 @@ class TestBinance:
         assert isinstance(book.bids[0].price, float)
 
     def test_futures_uses_event_timestamp(self) -> None:
-        raw = {"E": 1700000000000, "T": 1699999999999, "bids": [["1", "1"]], "asks": [["2", "1"]]}
+        raw = {
+            "E": 1700000000000,
+            "T": 1699999999999,
+            "bids": [["1", "1"]],
+            "asks": [["2", "1"]],
+        }
         book = Binance()._parse_orderbook(
             raw,
             symbol=BTC_USDT,
