@@ -16,6 +16,18 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
+            set -e
             cd ~/marketlens-be
+            # .env 없이 올리면 be 가 크래시 루프에 빠지므로 여기서 미리 막는다.
+            if [ ! -f .env ]; then
+              echo "::error::EC2 에 ~/marketlens-be/.env 가 없습니다. DATABASE_URL(RDS) 등을 담아 먼저 만들어야 합니다."
+              exit 1
+            fi
+            if ! grep -q "^DATABASE_URL=postgresql" .env; then
+              echo "::error::.env 에 DATABASE_URL 이 없습니다. RDS 엔드포인트를 지정해야 합니다."
+              exit 1
+            fi
             git pull origin main
             docker compose up -d --build
+            # 오래된 이미지 레이어가 EC2 디스크를 채우지 않게 정리한다.
+            docker image prune -f

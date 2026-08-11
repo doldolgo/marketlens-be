@@ -1,0 +1,39 @@
+# 로컬 개발용 PostgreSQL + Adminer.
+# (docker-compose.yml 은 EC2 배포용 be 컨테이너 — 이 파일과 용도가 다르다)
+#
+#   docker compose -f docker-compose.dev.yml up -d     # 시작
+#   docker compose -f docker-compose.dev.yml down      # 중지 (데이터 유지)
+#   docker compose -f docker-compose.dev.yml down -v   # 중지 + 데이터 삭제
+#
+# 접속 정보는 .env.example 의 DATABASE_URL 로컬 예시와 일치한다.
+services:
+  db:
+    image: postgres:17
+    container_name: marketlens-db
+    environment:
+      POSTGRES_USER: marketlens
+      POSTGRES_PASSWORD: marketlens
+      POSTGRES_DB: marketlens
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U marketlens"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # DB 웹 뷰어 — http://localhost:8080 (시스템: PostgreSQL, 서버: db,
+  # 사용자/비밀번호/데이터베이스: marketlens)
+  adminer:
+    image: adminer
+    container_name: marketlens-adminer
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
