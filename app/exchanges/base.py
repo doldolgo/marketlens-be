@@ -19,7 +19,8 @@ from app.core.errors import (
     ExchangeTimeoutError,
     UnsupportedMarketError,
 )
-from app.core.http import get_client
+from app.core.http import get_client, record_call
+from app.models.bulk import BulkQuote
 from app.models.orderbook import MarketType, OrderBook
 from app.models.symbol import Symbol
 from app.models.ticker import Ticker
@@ -37,7 +38,11 @@ class BaseExchange(ABC):
     #: 심볼에 quote 가 지정되지 않았을 때 사용할 기본 결제 통화
     default_quote: ClassVar[str]
     #: 이 거래소가 지원하는 시장 구분
-    supported_market_types: ClassVar[frozenset[MarketType]] = frozenset({MarketType.SPOT})
+    supported_market_types: ClassVar[frozenset[MarketType]] = frozenset(
+        {MarketType.SPOT}
+    )
+    #: 국내(원화) 거래소인지. 프리미엄의 KRW 축이 될 수 있는 거래소만 True.
+    is_domestic: ClassVar[bool] = False
 
     def __init__(self, client: httpx.AsyncClient | None = None) -> None:
         self._client = client
@@ -181,8 +186,73 @@ class BaseExchange(ABC):
             latency_ms=latency_ms,
         )
 
+    # ------------------------------------------------------------------
+    # 전종목 일괄 조회 (선택 기능)
+    # ------------------------------------------------------------------
+
+    #: 전종목 일괄 조회를 지원하는지 (최우선 호가 / 체결가).
+    #: 지원하지 않아도 나머지 기능은 전부 동작하므로 새 거래소 추가 부담이 늘지 않는다.
+    supports_bulk: ClassVar[bool] = False
+    #: 전종목을 **호가 깊이까지** 일괄로 받을 수 있는지.
+    #: 슬리피지 계산에는 깊이가 필요한데, 거래소에 따라 일괄 엔드포인트가 없다.
+    #: (바이낸스는 depth 가 심볼당 조회만 가능 → False → 심볼별 폴백)
+    supports_bulk_depth: ClassVar[bool] = False
+
+    async def fetch_bulk_quotes(
+        self,
+        quote: str,
+        *,
+        need_book: bool,
+        market_type: MarketType = MarketType.SPOT,
+    ) -> dict[str, BulkQuote]:
+        """해당 결제 통화의 **전종목 시세**를 한 번에 가져온다.
+
+        Args:
+            quote: 결제 통화 (예: "KRW", "USDT").
+            need_book: True 면 최우선 호가(bid/ask), False 면 마지막 체결가(last).
+            market_type: 현물/선물 구분.
+
+        Returns:
+            ``{기준통화: BulkQuote}`` 사전. 예: ``{"BTC": BulkQuote(...), ...}``
+
+        Raises:
+            UnsupportedMarketError: 이 거래소가 일괄 조회를 지원하지 않는 경우.
+        """
+        raise UnsupportedMarketError(
+            f"{self.name}는 전종목 일괄 조회를 지원하지 않습니다.",
+            detail={"exchange": self.id},
+        )
+
+    async def fetch_bulk_orderbooks(
+        self,
+        quote: str,
+        *,
+        depth: int,
+        market_type: MarketType = MarketType.SPOT,
+    ) -> dict[str, OrderBook]:
+        """해당 결제 통화의 **전종목 호가창을 깊이까지** 한 번에 가져온다.
+
+        슬리피지 계산에 필요하다. 지원하지 않는 거래소는 호출부가 심볼별 조회로
+        폴백해야 한다 (``supports_bulk_depth`` 로 판별).
+
+        Returns:
+            ``{기준통화: OrderBook}`` 사전.
+
+        Raises:
+            UnsupportedMarketError: 깊이 일괄 조회를 지원하지 않는 경우.
+        """
+        raise UnsupportedMarketError(
+            f"{self.name}는 호가 깊이의 전종목 일괄 조회를 지원하지 않습니다. "
+            "심볼별로 조회해야 합니다.",
+            detail={"exchange": self.id},
+        )
+
     async def _get_json(self, url: str, params: dict[str, Any] | None = None) -> Any:
-        """GET 요청 후 JSON 을 반환하고, 실패는 도메인 예외로 변환한다."""
+        """GET 요청 후 JSON 을 반환하고, 실패는 도메인 예외로 변환한다.
+
+        모든 거래소 API 호출이 이 메서드를 지나므로, 여기서 호출 수를 센다.
+        """
+        record_call(self.id)
         try:
             response = await self.client.get(url, params=params)
         except httpx.TimeoutException as exc:

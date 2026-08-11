@@ -6,13 +6,16 @@
 둘은 다르다. 프리미엄은 최우선 호가(또는 체결가) **한 점**만 보지만,
 실제 주문은 호가창을 위에서부터 **훑어 내려가며** 체결된다. 금액이 커질수록
 불리한 가격까지 먹게 되고(슬리피지), 프리미엄이 3%여도 실수령은 그보다 적다.
+
+데이터는 전부 ``POST /refresh`` 가 저장해둔 DB 스냅샷에서 나온다.
+거래소 직접 호출은 없다.
 """
 
 from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from app.models.orderbook import MarketType
+from app.models.premium import PremiumDirection
 
 
 class VenueQuote(BaseModel):
@@ -20,13 +23,13 @@ class VenueQuote(BaseModel):
 
     exchange: str = Field(..., description="거래소 ID")
     name: str = Field(..., description="거래소 이름")
-    symbol: str = Field(..., description="통일 심볼")
-    native_symbol: str = Field(..., description="거래소 원본 심볼")
-    quote_currency: str = Field(..., description="결제 통화")
 
-    best_bid_krw: float = Field(..., description="최우선 매수호가 (원화 환산) — 여기 팔면 받는 값")
-    best_ask_krw: float = Field(..., description="최우선 매도호가 (원화 환산) — 여기 사면 내는 값")
-    mid_price_krw: float = Field(..., description="중간가 (원화 환산)")
+    best_bid_krw: float = Field(
+        ..., description="최우선 매수호가 (원화 환산) — 여기 팔면 받는 값"
+    )
+    best_ask_krw: float = Field(
+        ..., description="최우선 매도호가 (원화 환산) — 여기 사면 내는 값"
+    )
     depth_levels: int = Field(..., description="확보한 호가 단계 수")
 
 
@@ -35,15 +38,10 @@ class ExecutionSide(BaseModel):
 
     exchange: str = Field(..., description="거래소 ID")
     name: str = Field(..., description="거래소 이름")
-    symbol: str = Field(..., description="통일 심볼")
-    native_symbol: str = Field(..., description="거래소 원본 심볼")
-    quote_currency: str = Field(..., description="결제 통화 (KRW / USDT)")
 
-    best_price: float = Field(..., description="최우선 호가 (결제 통화 기준)")
-    average_price: float = Field(..., description="실제 평균 체결가 (결제 통화 기준)")
-    average_price_krw: float = Field(..., description="평균 체결가 원화 환산")
-
-    amount: float = Field(..., description="소요/수령 금액 (결제 통화 기준)")
+    average_price_krw: float = Field(
+        ..., description="실제 평균 체결가 (원화 환산)"
+    )
     amount_krw: float = Field(..., description="소요/수령 금액 (원화 환산)")
 
     slippage_percent: float = Field(
@@ -58,8 +56,9 @@ class ExecutionSide(BaseModel):
         ..., description="호가창이 부족해 요청 수량을 다 채우지 못했는지"
     )
 
-    timestamp: int = Field(..., description="호가 기준 시각 (epoch ms)")
-    latency_ms: float = Field(..., description="해당 거래소 호출 지연시간 (ms)")
+    data_updated_at: int | None = Field(
+        None, description="이 호가 스냅샷을 DB 에 저장한 시각 (epoch ms)"
+    )
 
 
 class ArbitrageFailure(BaseModel):
@@ -74,15 +73,28 @@ class ArbitrageFailure(BaseModel):
 class ArbitrageResult(BaseModel):
     """금액 기준 차익거래 시뮬레이션 응답."""
 
-    base: str = Field(..., description="대상 코인")
-    market_type: MarketType = Field(..., description="현물/선물 구분")
+    sym: str = Field(..., description="대상 코인 심볼")
+    direction: PremiumDirection | None = Field(
+        None,
+        description=(
+            "고정한 차익 방향. `fwd`=해외 매수→국내 매도, `rev`=국내 매수→해외 매도. "
+            "`null` 이면 자동 선택 — 가장 싼 곳에서 사고 가장 비싼 곳에서 판다. "
+            "자동 선택은 **가능한 조합 중 가장 유리한 것**일 뿐이며, 스프레드가 "
+            "가격차보다 크면 음수 수익이 나올 수 있다 (`warnings` 참고)"
+        ),
+    )
 
-    input_amount: float = Field(..., description="입력한 투입 금액")
-    input_currency: str = Field(..., description="입력 금액의 통화 (KRW / USDT)")
-    input_amount_krw: float = Field(..., description="투입 금액의 원화 환산")
+    input_amount_krw: float = Field(
+        ..., description="투입 금액의 원화 환산 (기준 환율 적용)"
+    )
 
-    usdt_krw_rate: float = Field(..., description="적용한 USDT/KRW 환율")
-    fx_source: str = Field(..., description="환율 출처")
+    usdt_krw_rate: float = Field(
+        ...,
+        description=(
+            "적용한 기준 USDT/KRW 환율 (DB `krw_rates`). 국내 거래소 호가에는 "
+            "각 거래소 자기 환율을 우선 쓰고, 없으면 이 값으로 폴백한다"
+        ),
+    )
 
     premium_percent: float = Field(
         ...,
@@ -96,6 +108,22 @@ class ArbitrageResult(BaseModel):
     sell: ExecutionSide = Field(..., description="비싼 곳에서의 매도 시뮬레이션")
 
     quantity: float = Field(..., description="싼 곳에서 매수된 코인 개수")
+
+    withdrawal_available: bool | None = Field(
+        None,
+        description=(
+            "**매수처에서 이 코인을 출금할 수 있는지.** 코인을 매도처로 옮겨야 "
+            "차익이 실현되므로 False 면 이 경로는 실행 불가능하다. "
+            "확인 불가(키 없음 등)면 null"
+        ),
+    )
+    deposit_available: bool | None = Field(
+        None,
+        description=(
+            "**매도처에서 이 코인을 입금받을 수 있는지.** False 면 이 경로는 "
+            "실행 불가능하다. 확인 불가면 null"
+        ),
+    )
 
     profit_krw: float = Field(..., description="차익 (원화). 매도 수령액 - 매수 소요액")
     profit_percent: float = Field(
@@ -117,6 +145,17 @@ class ArbitrageResult(BaseModel):
     )
     warnings: list[str] = Field(
         default_factory=list, description="결과 해석 시 반드시 확인해야 할 경고"
+    )
+
+    data_oldest_at: int | None = Field(
+        None,
+        description=(
+            "비교에 쓴 스냅샷 중 **가장 오래된** 갱신 시각 (epoch ms). "
+            "지금과의 차이가 크면 POST /refresh 로 갱신할 것"
+        ),
+    )
+    data_newest_at: int | None = Field(
+        None, description="비교에 쓴 스냅샷 중 가장 최근 갱신 시각 (epoch ms)"
     )
 
     fetched_at: int = Field(..., description="서버 응답 생성 시각 (epoch ms)")

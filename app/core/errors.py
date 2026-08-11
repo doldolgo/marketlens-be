@@ -77,3 +77,14 @@ class MarketNotFoundError(MarketLensError):
 
     status_code = 404
     code = "market_not_found"
+
+
+class MarketDataNotFoundError(MarketLensError):
+    """DB 에 요청한 데이터가 없음.
+
+    조회 API 는 거래소를 직접 부르지 않고 DB 만 읽는다. 아직 수집을 안 했거나
+    (``POST /refresh``), 그 거래소에 상장되지 않은 코인이면 이 예외가 난다.
+    """
+
+    status_code = 404
+    code = "market_data_not_found"

@@ -1,6 +1,6 @@
 """티커(마지막 체결가) 파싱 테스트 (네트워크 불필요).
 
-티커는 공개 엔드포인트가 아니라 `/premium` 의 `price_basis=last` 를 위한
+티커는 공개 엔드포인트가 아니라 수집기가 마지막 체결가를 저장할 때 쓰는
 내부 조회 수단이다. 그래서 검증도 파싱 정확성에 집중한다.
 """
 
@@ -66,8 +66,15 @@ class TestUpbitTicker:
         )
 
         assert ticker.last_price == 100.0
-        for dropped in ("open_price", "high_price", "low_price", "change_percent",
-                        "volume_24h", "quote_volume_24h", "stats_window"):
+        for dropped in (
+            "open_price",
+            "high_price",
+            "low_price",
+            "change_percent",
+            "volume_24h",
+            "quote_volume_24h",
+            "stats_window",
+        ):
             assert not hasattr(ticker, dropped)
 
     def test_empty_response_raises(self) -> None:
@@ -87,12 +94,20 @@ class TestBinanceTicker:
 
     def test_parses_aggtrade_price_and_time(self) -> None:
         ticker = self.parse(
-            [{"a": 486, "p": "231.95000000", "q": "0.051", "T": 1786073258565, "m": False}]
+            [
+                {
+                    "a": 486,
+                    "p": "231.95000000",
+                    "q": "0.051",
+                    "T": 1786073258565,
+                    "m": False,
+                }
+            ]
         )
 
         assert ticker.last_price == 231.95
         assert isinstance(ticker.last_price, float)
-        assert ticker.timestamp == 1786073258565   # 체결 시각 (윈도우 끝이 아님)
+        assert ticker.timestamp == 1786073258565  # 체결 시각 (윈도우 끝이 아님)
 
     def test_takes_latest_when_multiple_returned(self) -> None:
         """aggTrades 는 오래된 순으로 오므로 마지막 원소가 최신이다."""
@@ -112,7 +127,7 @@ class TestBinanceTicker:
 
     def test_malformed_response_raises(self) -> None:
         with pytest.raises(ExchangeAPIError):
-            self.parse([{"a": 1}])   # p / T 없음
+            self.parse([{"a": 1}])  # p / T 없음
 
     def test_futures_ticker_parses(self) -> None:
         ticker = self.parse(
@@ -138,14 +153,29 @@ class TestTickerModel:
 
     def test_only_carries_last_price_and_metadata(self) -> None:
         assert set(Ticker.model_fields) == {
-            "exchange", "symbol", "native_symbol", "market_type", "base", "quote",
-            "last_price", "timestamp", "latency_ms",
+            "exchange",
+            "symbol",
+            "native_symbol",
+            "market_type",
+            "base",
+            "quote",
+            "last_price",
+            "timestamp",
+            "latency_ms",
         }
 
     def test_no_period_summary_fields(self) -> None:
-        for dropped in ("open_price", "high_price", "low_price", "change_percent",
-                        "volume", "volume_24h", "quote_volume", "quote_volume_24h",
-                        "stats_window"):
+        for dropped in (
+            "open_price",
+            "high_price",
+            "low_price",
+            "change_percent",
+            "volume",
+            "volume_24h",
+            "quote_volume",
+            "quote_volume_24h",
+            "stats_window",
+        ):
             assert dropped not in Ticker.model_fields
 
 

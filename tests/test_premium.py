@@ -1,173 +1,317 @@
-"""프리미엄 계산 로직 테스트 (네트워크 불필요)."""
+"""김프 / 역김프 계산 로직 테스트 — DB 스냅샷 기반 (네트워크 불필요)."""
 
 from __future__ import annotations
 
 import pytest
+from conftest import (
+    KRW_RATES,
+    NOW_MS,
+    best_ask,
+    best_bid,
+    fwd_execution_percent,
+    rev_execution_percent,
+    seed_rates,
+    seed_rows,
+    seed_standard,
+    snapshot_row,
+)
 
-from app.core.errors import ExchangeAPIError, UnsupportedMarketError
-from app.models.orderbook import MarketType, OrderBook, OrderBookLevel
-from app.models.ticker import PriceBasis, Ticker
-from app.services.fx import FxRate
-from app.services.premium_service import PremiumService, PricePoint
+from app.core.config import settings
+from app.core.errors import (
+    InvalidRequestError,
+    MarketDataNotFoundError,
+    UnsupportedExchangeError,
+)
+from app.db.models import MarketSnapshot
+from app.models.premium import PremiumDirection
+from app.models.ticker import PriceSide
+from app.services.premium_service import (
+    PremiumService,
+    premium_service,
+    resolve_side,
+    snapshot_price,
+)
 
-FX = FxRate(rate=1400.0, source="test", timestamp=1700000000000)
 
-
-def make_book(exchange: str, quote: str, bid: float, ask: float) -> OrderBook:
-    return OrderBook(
+def make_snap(
+    exchange: str = "binance",
+    base: str = "BTC",
+    quote: str = "USDT",
+    *,
+    price: float = 100.0,
+    bids: list | None = None,
+    asks: list | None = None,
+) -> MarketSnapshot:
+    return MarketSnapshot(
         exchange=exchange,
-        symbol=f"BTC/{quote}",
-        native_symbol="X",
-        market_type=MarketType.SPOT,
-        base="BTC",
+        base=base,
+        native_symbol=f"{base}{quote}" if quote == "USDT" else f"{quote}-{base}",
         quote=quote,
-        bids=[OrderBookLevel(price=bid, size=1.0)],
-        asks=[OrderBookLevel(price=ask, size=1.0)],
-        timestamp=1700000000000,
-        latency_ms=1.0,
+        price=price,
+        bids=bids if bids is not None else [],
+        asks=asks if asks is not None else [],
+        price_timestamp=NOW_MS,
     )
 
 
-def make_ticker(exchange: str, quote: str, last: float) -> Ticker:
-    return Ticker(
-        exchange=exchange,
-        symbol=f"BTC/{quote}",
-        native_symbol="X",
-        market_type=MarketType.SPOT,
-        base="BTC",
-        quote=quote,
-        last_price=last,
-        timestamp=1700000000000,
-        latency_ms=1.0,
-    )
+class TestResolveSide:
+    """매수/매도 → 어느 호가를 집을지."""
+
+    def test_buy_uses_ask(self) -> None:
+        """살 때는 매도호가에 체결된다."""
+        assert resolve_side(is_buy=True) is PriceSide.ASK
+
+    def test_sell_uses_bid(self) -> None:
+        """팔 때는 매수호가에 체결된다."""
+        assert resolve_side(is_buy=False) is PriceSide.BID
 
 
-def point(price: float, quote: str = "USDT") -> PricePoint:
-    return PricePoint.from_source(make_ticker("binance", quote, price))
+class TestSnapshotPrice:
+    """스냅샷에서 최우선 호가를 뽑는다."""
+
+    def snap(self) -> MarketSnapshot:
+        return make_snap(price=100.5, bids=[[99.0, 1.0]], asks=[[101.0, 1.0]])
+
+    def test_bid_and_ask(self) -> None:
+        assert snapshot_price(self.snap(), PriceSide.BID) == 99.0
+        assert snapshot_price(self.snap(), PriceSide.ASK) == 101.0
+
+    def test_empty_book_returns_none(self) -> None:
+        snap = make_snap(bids=[], asks=[])
+        assert snapshot_price(snap, PriceSide.BID) is None
+        assert snapshot_price(snap, PriceSide.ASK) is None
 
 
-class TestPricePoint:
-    """OrderBook 과 Ticker 를 같은 형태로 눕히는 어댑터."""
+class TestBuildEntry:
+    """방향별 프리미엄 계산식."""
 
-    def test_ticker_uses_last_price(self) -> None:
-        p = PricePoint.from_source(make_ticker("binance", "USDT", 100.0))
-        assert p.price == 100.0
-
-    def test_orderbook_uses_mid_price(self) -> None:
-        p = PricePoint.from_source(make_book("binance", "USDT", bid=90.0, ask=110.0))
-        assert p.price == 100.0
-
-    def test_metadata_is_preserved(self) -> None:
-        p = PricePoint.from_source(make_ticker("binance", "USDT", 100.0))
-        assert p.exchange == "binance"
-        assert p.symbol == "BTC/USDT"
-        assert p.quote == "USDT"
-        assert p.timestamp == 1700000000000
-
-    def test_empty_orderbook_raises(self) -> None:
-        book = make_book("binance", "USDT", 100.0, 100.0)
-        book.bids.clear()
-        book.asks.clear()
-
-        with pytest.raises(ExchangeAPIError):
-            PricePoint.from_source(book)
-
-    def test_zero_price_raises(self) -> None:
-        with pytest.raises(ExchangeAPIError):
-            PricePoint.from_source(make_ticker("binance", "USDT", 0.0))
-
-
-class TestPremiumCalculation:
     def setup_method(self) -> None:
         self.service = PremiumService()
 
-    def test_no_premium_when_prices_match_exactly(self) -> None:
-        # 해외 100 USDT × 환율 1400 = 140,000원. 국내도 140,000원이면 프리미엄 0.
-        entry = self.service._build_entry(point(100.0), krw_price=140_000.0, fx=FX)
-
-        assert entry.premium_ratio == pytest.approx(1.0)
-        assert entry.premium_percent == pytest.approx(0.0)
-        assert entry.premium_krw == pytest.approx(0.0)
-
-    def test_positive_premium_when_domestic_is_expensive(self) -> None:
-        # 국내 147,000원 vs 해외 환산 140,000원 → 5% 김프
-        entry = self.service._build_entry(point(100.0), krw_price=147_000.0, fx=FX)
-
-        assert entry.premium_percent == pytest.approx(5.0)
-        assert entry.premium_krw == pytest.approx(7_000.0)
-        assert entry.price_in_krw == pytest.approx(140_000.0)
-
-    def test_negative_premium_when_domestic_is_cheap(self) -> None:
-        # 국내 133,000원 vs 해외 환산 140,000원 → -5% 역프
-        entry = self.service._build_entry(point(100.0), krw_price=133_000.0, fx=FX)
-
-        assert entry.premium_percent == pytest.approx(-5.0)
-        assert entry.premium_krw == pytest.approx(-7_000.0)
-
-    def test_ratio_is_independent_of_scale(self) -> None:
-        """가격 단위가 커져도 비율은 같아야 한다 (BTC든 XRP든)."""
-        cheap = self.service._build_entry(point(1.0), krw_price=1_470.0, fx=FX)
-        pricey = self.service._build_entry(point(60_000.0), krw_price=88_200_000.0, fx=FX)
-
-        assert cheap.premium_percent == pytest.approx(pricey.premium_percent)
-        assert cheap.premium_percent == pytest.approx(5.0)
-
-    def test_last_and_mid_agree_when_spread_is_symmetric(self) -> None:
-        """중간가 100 인 호가와 체결가 100 인 티커는 같은 프리미엄을 낸다."""
-        from_ticker = self.service._build_entry(
-            PricePoint.from_source(make_ticker("binance", "USDT", 100.0)), 147_000.0, FX
+    def build(self, direction, overseas_usdt: float, domestic_krw: float):
+        return self.service._build_entry(
+            make_snap(),
+            overseas_usdt,
+            domestic_krw,
+            1000.0,  # 환율
+            direction,
         )
-        from_book = self.service._build_entry(
-            PricePoint.from_source(make_book("binance", "USDT", 90.0, 110.0)), 147_000.0, FX
-        )
-        assert from_ticker.premium_percent == pytest.approx(from_book.premium_percent)
 
-    def test_basis_choice_changes_result_when_last_trade_hit_the_ask(self) -> None:
-        """마지막 체결이 매도호가에서 났다면 체결가 기준이 프리미엄을 낮게 만든다."""
-        # 호가 90/110 → 중간가 100. 마지막 체결은 매도호가 110 에서 발생.
-        mid = self.service._build_entry(
-            PricePoint.from_source(make_book("binance", "USDT", 90.0, 110.0)), 147_000.0, FX
-        )
-        last = self.service._build_entry(
-            PricePoint.from_source(make_ticker("binance", "USDT", 110.0)), 147_000.0, FX
-        )
-        # 해외 가격이 더 비싸게 잡히므로 프리미엄은 더 작아진다.
-        assert last.premium_percent < mid.premium_percent
+    def test_kimchi_no_premium_when_equal(self) -> None:
+        # 해외 100 USDT × 환율 1000 = 100,000원, 국내도 100,000원
+        e = self.build(PremiumDirection.FWD, 100.0, 100_000.0)
+        assert e.premium_percent == pytest.approx(0.0)
+        assert e.profitable is False
+
+    def test_kimchi_profitable_when_domestic_is_expensive(self) -> None:
+        # 국내 105,000원에 팔고 해외 100,000원에 산다 → +5%
+        e = self.build(PremiumDirection.FWD, 100.0, 105_000.0)
+        assert e.premium_percent == pytest.approx(5.0)
+        assert e.premium_krw == pytest.approx(5_000.0)
+        assert e.profitable is True
+        assert e.usd == pytest.approx(100.0)
+
+    def test_kimchi_loss_when_domestic_is_cheap(self) -> None:
+        e = self.build(PremiumDirection.FWD, 100.0, 95_000.0)
+        assert e.premium_percent == pytest.approx(-5.0)
+        assert e.profitable is False
+
+    def test_reverse_profitable_when_overseas_is_expensive(self) -> None:
+        # 국내 100,000원에 사서 해외 105,000원(105 USDT)에 판다 → +5%
+        e = self.build(PremiumDirection.REV, 105.0, 100_000.0)
+        assert e.premium_percent == pytest.approx(5.0)
+        assert e.profitable is True
+
+    def test_directions_are_reciprocal_not_negation(self) -> None:
+        """같은 가격이라도 김프 +5% 의 반대는 -5% 가 아니라 -4.76% 다."""
+        fwd = self.build(PremiumDirection.FWD, 100.0, 105_000.0)
+        rev = self.build(PremiumDirection.REV, 100.0, 105_000.0)
+
+        assert fwd.premium_percent == pytest.approx(5.0)
+        assert rev.premium_percent == pytest.approx(-100 / 21)  # ≈ -4.762%
+        assert rev.premium_percent != pytest.approx(-fwd.premium_percent)
+
+    def test_premium_krw_is_exact_mirror(self) -> None:
+        """원화 절대 차익은 정확히 부호가 뒤집힌다 (비율과 달리)."""
+        fwd = self.build(PremiumDirection.FWD, 100.0, 105_000.0)
+        rev = self.build(PremiumDirection.REV, 100.0, 105_000.0)
+        assert rev.premium_krw == pytest.approx(-fwd.premium_krw)
 
 
-class TestTargetResolution:
+class TestResolveDomestic:
     def setup_method(self) -> None:
         self.service = PremiumService()
 
-    def test_auto_selection_excludes_krw_reference_exchange(self) -> None:
-        targets = self.service.resolve_targets("BTC", None, MarketType.SPOT)
-        ids = [exchange_id for exchange_id, _, _ in targets]
+    def test_default_comes_from_settings(self) -> None:
+        assert self.service.resolve_domestic(None) == settings.krw_reference_exchange
 
-        assert "upbit" not in ids          # 기준 거래소는 대상에서 제외
-        assert "binance" in ids
+    @pytest.mark.parametrize("exchange_id", ["upbit", "bithumb"])
+    def test_domestic_exchanges_are_selectable(self, exchange_id: str) -> None:
+        assert self.service.resolve_domestic(exchange_id) == exchange_id
 
-    def test_auto_selection_uses_usdt_market(self) -> None:
-        targets = self.service.resolve_targets("BTC", None, MarketType.SPOT)
-        assert all(str(symbol) == "BTC/USDT" for _, symbol, _ in targets)
+    def test_overseas_exchange_is_rejected(self) -> None:
+        """바이낸스는 원화 거래소가 아니므로 국내 축이 될 수 없다."""
+        with pytest.raises(InvalidRequestError):
+            self.service.resolve_domestic("binance")
 
-    def test_explicit_request_can_include_krw_reference_exchange(self) -> None:
-        # 업비트를 명시하면 업비트 USDT 마켓과 비교한다 (거래소 내부 테더 괴리)
-        targets = self.service.resolve_targets("BTC", ["upbit"], MarketType.SPOT)
-        assert [exchange_id for exchange_id, _, _ in targets] == ["upbit"]
-
-    def test_unsupported_market_raises(self) -> None:
-        # 업비트는 선물 미지원
-        with pytest.raises(UnsupportedMarketError):
-            self.service.resolve_targets("BTC", ["upbit"], MarketType.FUTURES)
+    def test_unknown_exchange_raises(self) -> None:
+        with pytest.raises(UnsupportedExchangeError):
+            self.service.resolve_domestic("coinbase")
 
 
-class TestPriceBasisEnum:
-    def test_default_is_last_traded_price(self) -> None:
+class TestFetchPremiums:
+    """DB 스냅샷으로 실제 계산 (in-memory SQLite)."""
+
+    async def test_empty_db_raises_404_style(self, db) -> None:
+        with pytest.raises(MarketDataNotFoundError):
+            await premium_service.fetch_premiums(
+                db, "BTC", direction=PremiumDirection.FWD
+            )
+
+    async def test_missing_rate_raises(self, db) -> None:
+        await seed_rows(db, "upbit", [snapshot_row("upbit", "BTC", 100_000_000.0)])
+        with pytest.raises(MarketDataNotFoundError):
+            await premium_service.fetch_premiums(
+                db, "BTC", direction=PremiumDirection.FWD
+            )
+
+    async def test_wrong_domestic_quote_raises(self, db) -> None:
+        """국내 기준 거래소의 스냅샷이 KRW 마켓이 아니면 404 성격의 예외."""
+        await seed_rows(
+            db, "upbit", [snapshot_row("upbit", "BTC", 71_000.0, quote="USDT")]
+        )
+        await seed_rates(db)
+        with pytest.raises(MarketDataNotFoundError):
+            await premium_service.fetch_premiums(
+                db, "BTC", direction=PremiumDirection.FWD
+            )
+
+    async def test_kimchi_uses_execution_sides(self, db) -> None:
+        await seed_standard(db)
+        res = await premium_service.fetch_premiums(
+            db, "btc", direction=PremiumDirection.FWD
+        )
+
+        assert res.sym == "BTC"
+        assert res.dom == "upbit"
+        assert res.usdt_krw_rate == KRW_RATES["upbit"]
+        # 김프: 국내에서 팔므로 최우선 매수호가(bid)
+        assert res.dom_price == pytest.approx(best_bid(100_000_000.0))
+
+        assert [e.fx for e in res.premiums] == ["binance"]
+        expected = fwd_execution_percent(100_000_000.0, 71_000.0, 1400.0)
+        assert res.premiums[0].premium_percent == pytest.approx(expected)
+        assert res.premiums[0].profitable is True
+
+    async def test_reverse_is_negative_here(self, db) -> None:
+        await seed_standard(db)
+        res = await premium_service.fetch_premiums(
+            db, "BTC", direction=PremiumDirection.REV
+        )
+
+        expected = rev_execution_percent(100_000_000.0, 71_000.0, 1400.0)
+        assert res.premiums[0].premium_percent == pytest.approx(expected)
+        assert res.premiums[0].profitable is False
+
+    async def test_directions_use_opposite_sides(self, db) -> None:
+        """김프는 국내 bid·해외 ask, 역김프는 국내 ask·해외 bid 를 쓴다."""
+        await seed_standard(db)
+        fwd = await premium_service.fetch_premiums(
+            db, "BTC", direction=PremiumDirection.FWD
+        )
+        rev = await premium_service.fetch_premiums(
+            db, "BTC", direction=PremiumDirection.REV
+        )
+
+        # 방향마다 다른 호가를 집으므로 국내가/해외 원화가가 서로 다르다
+        assert fwd.dom_price == pytest.approx(best_bid(100_000_000.0))
+        assert rev.dom_price == pytest.approx(best_ask(100_000_000.0))
+        assert fwd.premiums[0].usd > rev.premiums[0].usd
+
+    async def test_domestic_selection_uses_own_rate(self, db) -> None:
+        await seed_standard(db)
+        upbit = await premium_service.fetch_premiums(
+            db, "BTC", direction=PremiumDirection.FWD
+        )
+        bithumb = await premium_service.fetch_premiums(
+            db,
+            "BTC",
+            direction=PremiumDirection.FWD,
+            domestic="bithumb",
+        )
+
+        assert bithumb.dom == "bithumb"
+        assert bithumb.dom_price == pytest.approx(best_bid(100_100_000.0))
+        assert bithumb.usdt_krw_rate == KRW_RATES["bithumb"]
+        assert bithumb.usdt_krw_rate != upbit.usdt_krw_rate
+
+    async def test_missing_own_rate_falls_back_to_reference(self, db) -> None:
+        await seed_rows(
+            db, "bithumb", [snapshot_row("bithumb", "BTC", 100_100_000.0)]
+        )
+        await seed_rows(
+            db,
+            "binance",
+            [snapshot_row("binance", "BTC", 71_000.0, quote="USDT", krw_factor=1400)],
+        )
+        await seed_rates(db, {"upbit": 1400.0})  # 빗썸 자기 환율은 없다
+
+        res = await premium_service.fetch_premiums(
+            db,
+            "BTC",
+            direction=PremiumDirection.FWD,
+            domestic="bithumb",
+        )
+        assert res.usdt_krw_rate == 1400.0
+
+    async def test_explicit_exchange_without_snapshot_is_partial_failure(
+        self, db
+    ) -> None:
+        """명시한 해외 거래소의 스냅샷이 없으면 failures 에 기록하고 계속한다."""
+        await seed_rows(db, "upbit", [snapshot_row("upbit", "BTC", 100_000_000.0)])
+        await seed_rates(db, {"upbit": 1400.0})
+
+        res = await premium_service.fetch_premiums(
+            db,
+            "BTC",
+            direction=PremiumDirection.FWD,
+            exchanges=["binance"],
+        )
+        assert res.premiums == []
+        assert len(res.failures) == 1
+        assert res.failures[0].exchange == "binance"
+        assert res.failures[0].error_code == "market_data_not_found"
+
+    async def test_unknown_overseas_exchange_raises(self, db) -> None:
+        await seed_standard(db)
+        with pytest.raises(UnsupportedExchangeError):
+            await premium_service.fetch_premiums(
+                db,
+                "BTC",
+                direction=PremiumDirection.FWD,
+                exchanges=["coinbase"],
+            )
+
+    async def test_data_freshness_fields_are_filled(self, db) -> None:
+        await seed_standard(db)
+        res = await premium_service.fetch_premiums(
+            db, "BTC", direction=PremiumDirection.FWD
+        )
+        assert res.data_oldest_at is not None
+        assert res.data_newest_at is not None
+        assert res.data_oldest_at <= res.data_newest_at
+
+
+class TestServiceSignature:
+    def test_direction_is_required(self) -> None:
+        """방향은 기본값 없이 반드시 지정해야 한다 (엔드포인트가 결정)."""
         import inspect
 
         sig = inspect.signature(PremiumService.fetch_premiums)
-        assert sig.parameters["price_basis"].default is PriceBasis.LAST
+        assert sig.parameters["direction"].default is inspect.Parameter.empty
 
     def test_values_are_url_friendly(self) -> None:
-        assert PriceBasis.LAST.value == "last"
-        assert PriceBasis.MID.value == "mid"
+        assert PriceSide.BID.value == "bid"
+        assert PriceSide.ASK.value == "ask"
+        assert PremiumDirection.FWD.value == "fwd"
+        assert PremiumDirection.REV.value == "rev"

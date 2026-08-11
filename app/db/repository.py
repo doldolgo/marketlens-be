@@ -1,0 +1,226 @@
+"""DB 읽기·쓰기의 단일 창구.
+
+조회 API 들은 거래소를 직접 부르지 않고 전부 이 모듈을 통해 DB 를 읽는다.
+쓰는 쪽은 수집기(:mod:`app.services.collector_service`) 하나뿐이다.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from sqlalchemy import delete, func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.errors import MarketDataNotFoundError
+from app.db.models import KrwRate, MarketSnapshot
+from app.models.orderbook import MarketType, OrderBook, OrderBookLevel
+
+
+@dataclass(slots=True)
+class SnapshotRow:
+    """수집기가 만들어 넘기는 스냅샷 한 행."""
+
+    exchange: str
+    base: str
+    native_symbol: str
+    quote: str
+    price: float
+    asks: list[list[float]] = field(default_factory=list)
+    bids: list[list[float]] = field(default_factory=list)
+    deposit_enabled: bool | None = None
+    withdrawal_enabled: bool | None = None
+    price_timestamp: int = 0
+
+
+def _upsert(session: AsyncSession, table, rows: list[dict], index: list[str]):
+    """방언에 맞는 UPSERT 문을 만든다 (PostgreSQL / SQLite 둘 다 지원)."""
+    dialect = session.get_bind().dialect.name
+    stmt = (pg_insert if dialect == "postgresql" else sqlite_insert)(table).values(rows)
+    update_cols = {
+        c.name: stmt.excluded[c.name]
+        for c in table.__table__.columns
+        if c.name not in index and c.name != "updated_at"
+    }
+    # onupdate 는 ORM update 에만 걸리므로, upsert 에서는 updated_at 을 직접 갱신한다.
+    update_cols["updated_at"] = func.now()
+    return stmt.on_conflict_do_update(index_elements=index, set_=update_cols)
+
+
+# ----------------------------------------------------------------------
+# 쓰기 — 수집기 전용
+# ----------------------------------------------------------------------
+
+
+async def replace_exchange_snapshots(
+    session: AsyncSession, exchange: str, rows: list[SnapshotRow]
+) -> tuple[int, int]:
+    """한 거래소의 스냅샷을 통째로 갱신한다.
+
+    있는 행은 UPSERT 하고, 이번 수집에 없는 코인(상장폐지 등)은 지운다.
+    호가는 초 단위로 낡으므로 남겨둘 이유가 없다.
+
+    Returns:
+        (저장한 행 수, 지운 행 수)
+    """
+    if rows:
+        payload = [
+            {
+                "exchange": r.exchange,
+                "base": r.base,
+                "native_symbol": r.native_symbol,
+                "quote": r.quote,
+                "price": r.price,
+                "asks": r.asks,
+                "bids": r.bids,
+                "deposit_enabled": r.deposit_enabled,
+                "withdrawal_enabled": r.withdrawal_enabled,
+                "price_timestamp": r.price_timestamp,
+            }
+            for r in rows
+        ]
+        await session.execute(
+            _upsert(session, MarketSnapshot, payload, ["exchange", "base"])
+        )
+
+    # 이번 수집에 없는 코인은 지운다. rows 가 비었으면 그 거래소 행 전체가 지워진다.
+    keep = {r.base for r in rows}
+    stmt = delete(MarketSnapshot).where(MarketSnapshot.exchange == exchange)
+    if keep:
+        stmt = stmt.where(MarketSnapshot.base.not_in(keep))
+    result = await session.execute(stmt)
+    return len(rows), result.rowcount or 0
+
+
+async def upsert_krw_rate(
+    session: AsyncSession,
+    *,
+    exchange: str,
+    rate: float,
+    native_symbol: str,
+    price_timestamp: int,
+) -> None:
+    """국내 거래소 하나의 KRW-USDT 환율을 저장한다."""
+    await session.execute(
+        _upsert(
+            session,
+            KrwRate,
+            [
+                {
+                    "exchange": exchange,
+                    "rate": rate,
+                    "native_symbol": native_symbol,
+                    "price_timestamp": price_timestamp,
+                }
+            ],
+            ["exchange"],
+        )
+    )
+
+
+# ----------------------------------------------------------------------
+# 읽기 — 조회 API 공용
+# ----------------------------------------------------------------------
+
+
+async def get_snapshots(
+    session: AsyncSession,
+    *,
+    exchange: str | None = None,
+    base: str | None = None,
+) -> list[MarketSnapshot]:
+    """스냅샷을 조건으로 조회한다. 조건이 없으면 전체."""
+    stmt = select(MarketSnapshot)
+    if exchange is not None:
+        stmt = stmt.where(MarketSnapshot.exchange == exchange)
+    if base is not None:
+        stmt = stmt.where(MarketSnapshot.base == base.upper())
+    result = await session.execute(stmt)
+    return list(result.scalars())
+
+
+async def get_snapshot(
+    session: AsyncSession, exchange: str, base: str
+) -> MarketSnapshot | None:
+    """거래소 × 코인 하나의 스냅샷."""
+    return await session.get(MarketSnapshot, (exchange, base.upper()))
+
+
+async def require_snapshot(
+    session: AsyncSession, exchange: str, base: str
+) -> MarketSnapshot:
+    """스냅샷을 가져오되, 없으면 404 성격의 도메인 예외를 던진다."""
+    snap = await get_snapshot(session, exchange, base)
+    if snap is None:
+        raise MarketDataNotFoundError(
+            f"DB 에 {exchange} 거래소의 {base.upper()} 스냅샷이 없습니다. "
+            "POST /refresh 로 데이터를 수집했는지, 해당 거래소에 상장된 코인인지 "
+            "확인하세요.",
+            detail={"exchange": exchange, "base": base.upper()},
+        )
+    return snap
+
+
+async def get_krw_rates(session: AsyncSession) -> list[KrwRate]:
+    """저장된 모든 국내 거래소 환율."""
+    result = await session.execute(select(KrwRate))
+    return list(result.scalars())
+
+
+async def get_krw_rate(session: AsyncSession, exchange: str) -> KrwRate | None:
+    """국내 거래소 하나의 환율."""
+    return await session.get(KrwRate, exchange)
+
+
+async def require_krw_rate(session: AsyncSession, exchange: str) -> KrwRate:
+    """환율을 가져오되, 없으면 도메인 예외를 던진다."""
+    rate = await get_krw_rate(session, exchange)
+    if rate is None:
+        raise MarketDataNotFoundError(
+            f"DB 에 {exchange} 거래소의 KRW-USDT 환율이 없습니다. "
+            "POST /refresh 로 데이터를 수집했는지 확인하세요.",
+            detail={"exchange": exchange},
+        )
+    return rate
+
+
+# ----------------------------------------------------------------------
+# 변환 헬퍼
+# ----------------------------------------------------------------------
+
+
+def levels_from_json(raw: list) -> list[OrderBookLevel]:
+    """DB 의 [[가격, 잔량], ...] 를 OrderBookLevel 리스트로 바꾼다."""
+    return [OrderBookLevel(price=float(p), size=float(s)) for p, s in raw]
+
+
+def orderbook_from_snapshot(
+    snap: MarketSnapshot, *, depth: int | None = None
+) -> OrderBook:
+    """스냅샷 한 행을 기존 OrderBook 모델로 되살린다.
+
+    조회 API 들이 기존 계산 로직(orderbook_walk 등)을 그대로 재사용할 수 있다.
+    """
+    asks = levels_from_json(snap.asks)
+    bids = levels_from_json(snap.bids)
+    if depth is not None:
+        asks = asks[:depth]
+        bids = bids[:depth]
+    return OrderBook(
+        exchange=snap.exchange,
+        symbol=f"{snap.base}/{snap.quote}",
+        native_symbol=snap.native_symbol,
+        market_type=MarketType.SPOT,
+        base=snap.base,
+        quote=snap.quote,
+        bids=bids,
+        asks=asks,
+        timestamp=snap.price_timestamp,
+        latency_ms=0.0,
+        data_updated_at=(
+            int(snap.updated_at.timestamp() * 1000)
+            if snap.updated_at is not None
+            else None
+        ),
+    )
