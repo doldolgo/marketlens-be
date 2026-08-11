@@ -1,180 +1,226 @@
-"""호가창 소진 계산과 차익 시뮬레이션 테스트 (네트워크 불필요)."""
+"""금액 기준 차익 시뮬레이션 테스트 — DB 스냅샷 기반 (네트워크 불필요)."""
 
 from __future__ import annotations
 
 import pytest
+from conftest import (
+    BINANCE_PRICES,
+    BITHUMB_PRICES,
+    KRW_RATES,
+    best_ask,
+    best_bid,
+    seed_rates,
+    seed_rows,
+    seed_standard,
+    snapshot_row,
+)
 
-from app.core.errors import ExchangeAPIError
-from app.models.orderbook import MarketType, OrderBook, OrderBookLevel
-from app.services.arbitrage_service import ArbitrageService
-from app.services.fx import FxRate
-from app.services.orderbook_walk import walk_buy, walk_sell
-
-FX = FxRate(rate=1000.0, source="test", timestamp=1700000000000)
-
-
-def levels(*pairs: tuple[float, float]) -> list[OrderBookLevel]:
-    return [OrderBookLevel(price=p, size=s) for p, s in pairs]
-
-
-def make_book(exchange: str, quote: str, bids, asks) -> OrderBook:
-    return OrderBook(
-        exchange=exchange,
-        symbol=f"BTC/{quote}",
-        native_symbol=f"{exchange}-BTC",
-        market_type=MarketType.SPOT,
-        base="BTC",
-        quote=quote,
-        bids=bids,
-        asks=asks,
-        timestamp=1700000000000,
-        latency_ms=1.0,
-    )
+from app.core.errors import (
+    InvalidRequestError,
+    MarketDataNotFoundError,
+    NoArbitrageOpportunityError,
+    UnsupportedExchangeError,
+)
+from app.db.repository import SnapshotRow
+from app.models.premium import PremiumDirection
+from app.services.arbitrage_service import arbitrage_service
 
 
-class TestWalkBuy:
-    def test_single_level_partial_fill(self) -> None:
-        # 100원짜리 10개 중 3개어치(300원)만 산다
-        r = walk_buy(levels((100.0, 10.0)), budget=300.0)
+class TestValidation:
+    async def test_invalid_currency_raises(self, db) -> None:
+        with pytest.raises(InvalidRequestError):
+            await arbitrage_service.simulate(
+                db, "BTC", amount=1_000_000.0, currency="EUR"
+            )
 
-        assert r.quantity == pytest.approx(3.0)
-        assert r.amount == pytest.approx(300.0)
-        assert r.levels_consumed == 1
-        assert r.exhausted is False
-        assert r.average_price == pytest.approx(100.0)
+    async def test_empty_db_raises(self, db) -> None:
+        with pytest.raises(MarketDataNotFoundError):
+            await arbitrage_service.simulate(db, "BTC", amount=1_000_000.0)
 
-    def test_walks_multiple_levels(self) -> None:
-        # 100원×1개(100원) 전부 + 110원에서 나머지 100원어치
-        r = walk_buy(levels((100.0, 1.0), (110.0, 5.0)), budget=200.0)
+    async def test_missing_rates_raise(self, db) -> None:
+        await seed_rows(db, "upbit", [snapshot_row("upbit", "BTC", 100_000_000.0)])
+        with pytest.raises(MarketDataNotFoundError):
+            await arbitrage_service.simulate(db, "BTC", amount=1_000_000.0)
 
-        assert r.amount == pytest.approx(200.0)
-        assert r.quantity == pytest.approx(1.0 + 100.0 / 110.0)
-        assert r.levels_consumed == 2
-        assert r.average_price > 100.0        # 평균가가 최우선 호가보다 불리해짐
+    async def test_unknown_exchange_raises(self, db) -> None:
+        await seed_standard(db)
+        with pytest.raises(UnsupportedExchangeError):
+            await arbitrage_service.simulate(
+                db, "BTC", amount=1_000_000.0, exchanges=["coinbase"]
+            )
 
-    def test_exhausted_when_budget_exceeds_book(self) -> None:
-        r = walk_buy(levels((100.0, 1.0), (110.0, 1.0)), budget=10_000.0)
-
-        assert r.exhausted is True
-        assert r.quantity == pytest.approx(2.0)
-        assert r.amount == pytest.approx(210.0)   # 예산이 아니라 실제 체결액
-
-    def test_exact_level_boundary(self) -> None:
-        """예산이 한 단계 잔량과 정확히 같으면 그 단계에서 끝난다."""
-        r = walk_buy(levels((100.0, 2.0), (110.0, 1.0)), budget=200.0)
-
-        assert r.quantity == pytest.approx(2.0)
-        assert r.levels_consumed == 1
-        assert r.exhausted is False
-
-    def test_zero_budget(self) -> None:
-        r = walk_buy(levels((100.0, 1.0)), budget=0.0)
-        assert r.quantity == 0.0 and r.exhausted is False
-
-    def test_empty_book_is_exhausted(self) -> None:
-        r = walk_buy([], budget=100.0)
-        assert r.exhausted is True and r.quantity == 0.0
+    async def test_single_venue_is_409_style(self, db) -> None:
+        await seed_rows(db, "upbit", [snapshot_row("upbit", "BTC", 100_000_000.0)])
+        await seed_rates(db, {"upbit": 1400.0})
+        with pytest.raises(NoArbitrageOpportunityError):
+            await arbitrage_service.simulate(db, "BTC", amount=1_000_000.0)
 
 
-class TestWalkSell:
-    def test_single_level_partial_fill(self) -> None:
-        r = walk_sell(levels((100.0, 10.0)), quantity=3.0)
+class TestAutoDirection:
+    """방향 생략 시 가장 싼 곳 ↔ 가장 비싼 곳을 자동 선택한다."""
 
-        assert r.amount == pytest.approx(300.0)
-        assert r.quantity == pytest.approx(3.0)
-        assert r.exhausted is False
+    async def test_picks_profitable_pair(self, db) -> None:
+        await seed_standard(db)
+        res = await arbitrage_service.simulate(db, "btc", amount=1_000_000.0)
 
-    def test_walks_down_the_book(self) -> None:
-        # 100원에 1개, 90원에 1개 → 190원
-        r = walk_sell(levels((100.0, 1.0), (90.0, 5.0)), quantity=2.0)
+        # 최저 매도호가 = 바이낸스(99.45M 환산), 최고 매수호가 = 빗썸(100.05M)
+        assert res.sym == "BTC"
+        assert res.direction is None
+        assert res.buy.exchange == "binance"
+        assert res.sell.exchange == "bithumb"
+        assert res.profit_krw > 0
+        assert res.profit_percent > 0
 
-        assert r.amount == pytest.approx(190.0)
-        assert r.average_price == pytest.approx(95.0)
-        assert r.levels_consumed == 2
+    async def test_surface_premium_matches_top_of_book(self, db) -> None:
+        await seed_standard(db)
+        res = await arbitrage_service.simulate(db, "BTC", amount=1_000_000.0)
 
-    def test_exhausted_when_quantity_exceeds_book(self) -> None:
-        r = walk_sell(levels((100.0, 1.0)), quantity=5.0)
+        buy_krw = best_ask(BINANCE_PRICES["BTC"]) * KRW_RATES["upbit"]
+        sell_krw = best_bid(BITHUMB_PRICES["BTC"])
+        assert res.premium_percent == pytest.approx((sell_krw / buy_krw - 1) * 100)
+        # 소액이라 1단계 안에서 끝난다 → 슬리피지 0, 프리미엄을 그대로 다 먹는다
+        assert res.profit_percent == pytest.approx(res.premium_percent)
+        assert res.premium_capture_percent == pytest.approx(100.0)
 
-        assert r.exhausted is True
-        assert r.quantity == pytest.approx(1.0)   # 실제로 팔린 수량만
-        assert r.amount == pytest.approx(100.0)
+    async def test_candidates_are_sorted_by_best_ask(self, db) -> None:
+        await seed_standard(db)
+        res = await arbitrage_service.simulate(db, "BTC", amount=1_000_000.0)
 
+        assert [c.exchange for c in res.candidates] == ["binance", "upbit", "bithumb"]
 
-class TestSlippage:
-    def test_no_slippage_on_single_level(self) -> None:
-        r = walk_buy(levels((100.0, 10.0)), budget=100.0)
-        assert r.slippage_percent(100.0, is_buy=True) == pytest.approx(0.0)
+    async def test_larger_amount_reduces_capture(self, db) -> None:
+        """금액이 커지면 호가를 파고들어 프리미엄 대비 실현율이 떨어진다."""
+        await seed_standard(db)
+        small = await arbitrage_service.simulate(db, "BTC", amount=1_000_000.0)
+        large = await arbitrage_service.simulate(db, "BTC", amount=10_000_000.0)
 
-    def test_buy_slippage_is_positive(self) -> None:
-        r = walk_buy(levels((100.0, 1.0), (120.0, 10.0)), budget=220.0)
-        # 평균 110원 vs 최우선 100원 → +10%
-        assert r.slippage_percent(100.0, is_buy=True) == pytest.approx(10.0)
+        assert large.profit_percent < small.profit_percent
+        assert large.premium_capture_percent < small.premium_capture_percent
+        assert large.buy.levels_consumed > 1
 
-    def test_sell_slippage_is_also_positive(self) -> None:
-        """매도는 평균가가 낮아질수록 불리하다. 부호를 뒤집어 양수로 만든다."""
-        r = walk_sell(levels((100.0, 1.0), (80.0, 1.0)), quantity=2.0)
-        # 평균 90원 vs 최우선 100원 → +10% 불리
-        assert r.slippage_percent(100.0, is_buy=False) == pytest.approx(10.0)
+    async def test_same_exchange_both_sides_is_409_style(self, db) -> None:
+        """한 거래소가 최저 매도·최고 매수를 동시에 갖으면 차익 기회가 없다."""
+        await seed_rows(
+            db,
+            "upbit",
+            [
+                SnapshotRow(
+                    exchange="upbit",
+                    base="BTC",
+                    native_symbol="KRW-BTC",
+                    quote="KRW",
+                    price=100_000_000.0,
+                    # 스프레드가 아주 넓은 국내 호가
+                    asks=[[101_000_000.0, 1.0]],
+                    bids=[[99_000_000.0, 1.0]],
+                )
+            ],
+        )
+        await seed_rows(
+            db,
+            "binance",
+            [snapshot_row("binance", "BTC", 71_000.0, quote="USDT", krw_factor=1400)],
+        )
+        await seed_rates(db, {"upbit": 1400.0})
 
-    def test_never_returns_negative_zero(self) -> None:
-        r = walk_sell(levels((100.0, 10.0)), quantity=1.0)
-        assert r.slippage_percent(100.0, is_buy=False) == 0.0
+        with pytest.raises(NoArbitrageOpportunityError):
+            await arbitrage_service.simulate(db, "BTC", amount=1_000_000.0)
 
+    async def test_depth_exhausted_adds_warning(self, db) -> None:
+        """저장 호가(단계당 300만원 × 5단계)를 넘는 금액은 소진 경고가 붙는다."""
+        await seed_standard(db)
+        res = await arbitrage_service.simulate(db, "BTC", amount=100_000_000.0)
 
-class TestVenueSelection:
-    def setup_method(self) -> None:
-        self.service = ArbitrageService()
-
-    def test_converts_usdt_book_to_krw(self) -> None:
-        book = make_book("binance", "USDT", levels((100.0, 1.0)), levels((101.0, 1.0)))
-        venue = self.service._to_venue(book, FX)
-
-        assert venue.best_bid_krw == pytest.approx(100_000.0)   # × 환율 1000
-        assert venue.best_ask_krw == pytest.approx(101_000.0)
-
-    def test_krw_book_is_not_converted(self) -> None:
-        book = make_book("upbit", "KRW", levels((100_000.0, 1.0)), levels((101_000.0, 1.0)))
-        venue = self.service._to_venue(book, FX)
-
-        assert venue.best_bid_krw == pytest.approx(100_000.0)
-
-    def test_empty_book_raises(self) -> None:
-        with pytest.raises(ExchangeAPIError):
-            self.service._to_venue(make_book("upbit", "KRW", [], []), FX)
-
-    def test_unsupported_quote_raises(self) -> None:
-        with pytest.raises(ExchangeAPIError):
-            self.service._to_krw_factor("ETH", FX)
-
-    def test_krw_levels_are_scaled(self) -> None:
-        scaled = self.service._krw_levels(levels((100.0, 2.0), (101.0, 3.0)), 1000.0)
-
-        assert [lv.price for lv in scaled] == [100_000.0, 101_000.0]
-        assert [lv.size for lv in scaled] == [2.0, 3.0]     # 수량은 그대로
-
-    def test_krw_levels_returns_same_object_when_factor_is_one(self) -> None:
-        original = levels((100.0, 1.0))
-        assert self.service._krw_levels(original, 1.0) is original
+        assert res.buy.depth_exhausted is True
+        assert any("소진" in w for w in res.warnings)
 
 
-class TestProfitMath:
-    """차익 계산이 손으로 계산한 값과 맞는지 확인한다."""
+class TestFixedDirection:
+    async def test_kimchi_buys_overseas_sells_domestic(self, db) -> None:
+        await seed_standard(db)
+        res = await arbitrage_service.simulate(
+            db, "BTC", amount=1_000_000.0, direction=PremiumDirection.FWD
+        )
 
-    def test_end_to_end_numbers(self) -> None:
-        service = ArbitrageService()
+        assert res.direction is PremiumDirection.FWD
+        assert res.buy.exchange == "binance"  # 해외에서 산다
+        assert res.sell.exchange == "bithumb"  # 국내 최고 매수호가
+        assert res.profit_krw > 0
 
-        # 싼 곳: 100,000원에 무제한 / 비싼 곳: 110,000원에 무제한
-        cheap = make_book("upbit", "KRW",
-                          levels((99_000.0, 100.0)), levels((100_000.0, 100.0)))
-        pricey = make_book("binance", "USDT",
-                           levels((110.0, 100.0)), levels((111.0, 100.0)))   # ×1000 환산
+    async def test_reverse_can_lose_and_warns(self, db) -> None:
+        """방향을 고정하면 손해(음수)가 그대로 나온다 — 그게 정상이다."""
+        await seed_standard(db)
+        res = await arbitrage_service.simulate(
+            db, "BTC", amount=1_000_000.0, direction=PremiumDirection.REV
+        )
 
-        buy_walk = walk_buy(service._krw_levels(cheap.asks, 1.0), 1_000_000.0)
-        sell_walk = walk_sell(service._krw_levels(pricey.bids, 1000.0), buy_walk.quantity)
+        assert res.direction is PremiumDirection.REV
+        assert res.buy.exchange in ("upbit", "bithumb")  # 국내에서 산다
+        assert res.sell.exchange == "binance"  # 해외에서 판다
+        assert res.profit_krw < 0  # 국내가 비싼 시나리오라 역방향은 손해
+        assert any("손해" in w for w in res.warnings)
 
-        assert buy_walk.quantity == pytest.approx(10.0)          # 100만원 / 10만원
-        assert sell_walk.amount == pytest.approx(1_100_000.0)    # 10개 × 11만원
+    async def test_direction_with_exchanges_auto_includes_domestic(self, db) -> None:
+        """direction 지정 시 exchanges 는 해외 목록으로 해석되고 국내는 자동 포함."""
+        await seed_standard(db)
+        res = await arbitrage_service.simulate(
+            db,
+            "BTC",
+            amount=1_000_000.0,
+            direction=PremiumDirection.FWD,
+            exchanges=["binance"],
+        )
 
-        profit = sell_walk.amount - buy_walk.amount
-        assert profit == pytest.approx(100_000.0)
-        assert profit / buy_walk.amount * 100 == pytest.approx(10.0)
+        assert res.buy.exchange == "binance"
+        assert res.sell.exchange in ("upbit", "bithumb")  # 국내가 자동으로 살아있다
+
+    async def test_direction_without_domestic_snapshot_is_409_style(self, db) -> None:
+        await seed_rows(
+            db,
+            "binance",
+            [snapshot_row("binance", "BTC", 71_000.0, quote="USDT", krw_factor=1400)],
+        )
+        # 해외 하나 + KRW 스냅샷 없음 → 방향 고정 계산 불가. 다만 후보 2곳 미만
+        # 검사가 먼저라 NoArbitrageOpportunityError 로 걸린다.
+        await seed_rates(db, {"upbit": 1400.0})
+        with pytest.raises(NoArbitrageOpportunityError):
+            await arbitrage_service.simulate(
+                db, "BTC", amount=1_000_000.0, direction=PremiumDirection.FWD
+            )
+
+
+class TestCurrencyConversion:
+    async def test_usdt_input(self, db) -> None:
+        """USDT 를 넣으면 모든 호가를 USDT 로 환산해 비교·체결한다."""
+        await seed_standard(db)
+        res = await arbitrage_service.simulate(
+            db, "BTC", amount=1_000.0, currency="USDT"
+        )
+
+        # 원화 환산은 기준(업비트) 환율
+        assert res.input_amount_krw == pytest.approx(1_000.0 * KRW_RATES["upbit"])
+        assert res.buy.exchange == "binance"
+        assert res.profit_percent > 0
+
+    async def test_amounts_are_reported_in_krw(self, db) -> None:
+        await seed_standard(db)
+        res = await arbitrage_service.simulate(db, "BTC", amount=1_000_000.0)
+
+        # 투입 1,000,000원이 전부 체결된다 (1단계 잔량 안)
+        assert res.buy.amount_krw == pytest.approx(1_000_000.0)
+
+    async def test_explicit_exchange_without_snapshot_is_partial_failure(
+        self, db
+    ) -> None:
+        """빗썸에 없는 ETH — 요청에 넣으면 failures 로 기록하고 나머지로 계산한다."""
+        await seed_standard(db)
+        res = await arbitrage_service.simulate(
+            db,
+            "ETH",
+            amount=1_000_000.0,
+            exchanges=["upbit", "bithumb", "binance"],
+        )
+
+        assert [f.exchange for f in res.failures] == ["bithumb"]
+        assert {res.buy.exchange, res.sell.exchange} == {"binance", "upbit"}
+        assert res.profit_krw > 0  # ETH 도 김프 양수 시나리오
