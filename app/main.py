@@ -19,6 +19,7 @@ from app.api.routes import (
     premium,
     refresh,
     slippage,
+    spreads,
 )
 from app.core.config import settings
 from app.core.errors import MarketLensError
@@ -81,6 +82,7 @@ app.include_router(rate.router)
 app.include_router(orderbook.router)
 app.include_router(compare.router)
 app.include_router(premium.router)
+app.include_router(spreads.router)
 app.include_router(slippage.router)
 app.include_router(matrix.router)
 app.include_router(arbitrage.router)

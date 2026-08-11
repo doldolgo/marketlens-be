@@ -61,6 +61,9 @@ class Settings(BaseSettings):
     #: 티커 충돌이 확인된 코인. 스캔에서 아예 제외한다.
     scan_excluded_bases: list[str] = []
 
+    #: /spreads 에서 스냅샷이 이 초 이상 오래되면 status=stale 로 표시한다.
+    spread_stale_seconds: float = 30.0
+
     # 거래소 API 베이스 URL (장애 시 프록시/미러로 갈아끼울 수 있게 설정으로 노출)
     upbit_base_url: str = "https://api.upbit.com"
     bithumb_base_url: str = "https://api.bithumb.com"
