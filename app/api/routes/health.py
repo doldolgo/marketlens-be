@@ -1,4 +1,8 @@
-"""헬스체크 라우터."""
+"""헬스체크 라우터.
+
+테스트 예시:
+    http://3.34.104.16:8000/health
+"""
 
 from __future__ import annotations
 

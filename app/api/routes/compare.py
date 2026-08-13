@@ -1,4 +1,8 @@
-"""거래소 간 가격 비교 라우터 — DB 스냅샷 기반."""
+"""거래소 간 가격 비교 라우터 — DB 스냅샷 기반.
+
+테스트 예시:
+    http://3.34.104.16:8000/compare?sym=BTC
+"""
 
 from __future__ import annotations
 

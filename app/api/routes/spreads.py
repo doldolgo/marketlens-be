@@ -2,6 +2,9 @@
 
 거래소를 직접 호출하지 않는다. ``POST /refresh`` 가 저장해둔
 DB 스냅샷을 읽어서만 계산한다.
+
+테스트 예시:
+    http://3.34.104.16:8000/spreads
 """
 
 from __future__ import annotations
