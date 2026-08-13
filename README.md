@@ -246,6 +246,10 @@ SCAN_EXCLUDED_BASES=["AI","PROS"]       # 티커 충돌 코인 제외
 - 업비트 입출금 상태를 쓰려면 업비트 Open API 에 **EC2 의 IP** 도 등록해야 한다.
 - 시세 갱신은 자동이 아니다. EC2 crontab 등으로 주기 호출한다:
   `* * * * * curl -s -X POST -H "X-Refresh-Token: <토큰>" http://localhost:8000/refresh > /dev/null`
+- **가격 변동 이력**(김프/역프 통계용, `/history/*`)도 같은 방식으로 주기 수집한다:
+  `* * * * * curl -s -X POST -H "X-Refresh-Token: <토큰>" http://localhost:8000/history/sync > /dev/null`
+  최초 1회는 3개월 백필을 돌려둔다 (재실행 시 이어서 진행됨):
+  `docker compose exec be python -m scripts.backfill_history --bases BTC`
 
 ## 협업 규칙
 
