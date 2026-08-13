@@ -50,8 +50,20 @@ class Settings(BaseSettings):
     # 원화 기준 거래소. 프리미엄 계산의 KRW 축이 될 수 있는 거래소.
     krw_reference_exchange: str = "upbit"
     krw_reference_quote: str = "KRW"
-    #: 환율 산출에 쓰는 스테이블코인.
+    #: 해외 거래소 마켓의 호가 통화 (바이낸스 USDT 마켓).
     fx_stablecoin: str = "USDT"
+
+    # ── 환율 (하나은행 고시 USD/KRW) ─────────────────────────────────
+    #: 하나은행 고시환율 조회 베이스 URL. 모든 원화 환산이 이 환율로 통일된다.
+    hana_fx_base_url: str = "https://www.kebhana.com"
+
+    # ── 가격 변동 이력 ────────────────────────────────────────────────
+    #: 변동 이력을 수집할 코인 목록. POST /history/sync 가 이 코인들을 돈다.
+    #: (백필 스크립트는 --bases 인자로 별도 지정)
+    history_bases: list[str] = ["BTC"]
+    #: 커서가 없는 시리즈의 첫 sync 가 거슬러 올라갈 최대 시간(초).
+    #: 그보다 먼 과거는 scripts/backfill_history.py 몫이다.
+    history_sync_lookback_seconds: int = 3600
 
     # 전종목 스캔 —
     #: 이 값을 넘는 프리미엄은 '의심' 으로 표시한다.
