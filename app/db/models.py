@@ -170,15 +170,19 @@ class PricePoint(Base):
     오늘(UTC) 데이터가 여기 쌓이고, 하루가 완결되면 팩킹이 청크로 옮긴다.
     가격은 거래소 API 가 준 십진 표기 그대로의 문자열이다 — 정확한 값 보존이
     목적이고, 산술은 팩킹/조회 때 Decimal 로 한다.
+
+    **가격 단위는 exchange 가 결정한다** — upbit 행은 KRW, binance 행은 USDT.
+    ts 는 epoch 초라 연도까지 담긴 완전한 시각이다. 사람이 읽는 형태는
+    ``v_price_points`` 뷰(:mod:`app.db.views`)로 본다.
     """
 
     __tablename__ = "price_points"
 
     exchange: Mapped[str] = mapped_column(String(32), primary_key=True)
     base: Mapped[str] = mapped_column(String(32), primary_key=True)
-    #: 변동 시각 (절대 epoch 초)
+    #: 변동 시각 (절대 epoch 초 — 연도 포함 완전한 시각)
     ts: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    #: 변동 후 가격 (십진 문자열, 예: "90191000" / "1518.4")
+    #: 변동 후 가격 (십진 문자열, 단위는 exchange 따라 KRW 또는 USDT)
     price: Mapped[str] = mapped_column(String(40))
 
 
@@ -214,9 +218,9 @@ class FxPoint(Base):
 
     __tablename__ = "fx_points"
 
-    #: 고시 시각 (절대 epoch 초)
+    #: 고시 시각 (절대 epoch 초 — 연도 포함 완전한 시각)
     ts: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    #: 매매기준율 (십진 문자열, 예: "1518.4")
+    #: 매매기준율 (십진 문자열, 단위: USD 1달러당 원)
     price: Mapped[str] = mapped_column(String(40))
 
 

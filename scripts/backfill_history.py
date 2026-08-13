@@ -48,7 +48,7 @@ def _day_bounds(day: date) -> tuple[int, int]:
 
 
 def _log(msg: str) -> None:
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
 
 async def _advance_cursor(
