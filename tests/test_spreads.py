@@ -6,12 +6,12 @@ import pytest
 from conftest import (
     BINANCE_PRICES,
     BITHUMB_PRICES,
-    KRW_RATES,
+    FX_RATE,
     LEVEL_AMOUNT_KRW,
     UPBIT_PRICES,
     fwd_execution_percent,
     rev_execution_percent,
-    seed_rates,
+    seed_fx_rate,
     seed_rows,
     seed_standard,
     snapshot_row,
@@ -52,7 +52,7 @@ class TestBuild:
         assert [(r.sym, r.dom) for r in res.rows] == sorted(
             (r.sym, r.dom) for r in res.rows
         )
-        assert res.rate == KRW_RATES["upbit"]  # 기준 거래소 환율
+        assert res.rate == FX_RATE  # 기준 거래소 환율
 
     async def test_fwd_and_rev_match_premium_formula(self, db) -> None:
         """한 행의 fwd/rev 는 /premium/fwd · /premium/rev 와 같은 공식이다."""
@@ -76,7 +76,7 @@ class TestBuild:
         bithumb = next(r for r in res.rows if r.sym == "BTC" and r.dom == "bithumb")
         assert bithumb.fwd == pytest.approx(
             fwd_execution_percent(
-                BITHUMB_PRICES["BTC"], BINANCE_PRICES["BTC"], KRW_RATES["bithumb"]
+                BITHUMB_PRICES["BTC"], BINANCE_PRICES["BTC"], FX_RATE
             )
         )
 
@@ -124,7 +124,7 @@ class TestBuild:
             "binance",
             [snapshot_row("binance", "BTC", 71_000.0, quote="USDT", krw_factor=1400)],
         )
-        await seed_rates(db, {"upbit": 1400.0})
+        await seed_fx_rate(db)
 
         res = await spread_service.build(db)
         row = res.rows[0]
@@ -146,7 +146,7 @@ class TestEndpoint:
         """응답 키가 FE SpreadRow 계약(camelCase 포함)과 일치해야 한다."""
         d = (await seeded_client.get("/spreads")).json()
 
-        assert d["rate"] == KRW_RATES["upbit"]
+        assert d["rate"] == FX_RATE
         row = d["rows"][0]
         assert set(row) == {
             "sym", "dom", "fx", "fwd", "rev", "usd",

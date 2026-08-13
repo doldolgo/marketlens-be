@@ -2,6 +2,10 @@
 
 이 백엔드에서 거래소 API 를 실제로 호출하는 엔드포인트는 이것 하나다.
 나머지 모든 조회 API 는 여기서 저장한 DB 를 읽는다.
+(가격 "변동 이력" 의 증분 수집은 별도의 POST /history/sync 가 담당한다)
+
+테스트 예시:
+    curl -X POST -H "X-Refresh-Token: <토큰>" http://3.34.104.16:8000/refresh
 """
 
 from __future__ import annotations
@@ -52,10 +56,11 @@ def _check_refresh_token(
         "| KRW 전종목 현재가 + 호가 | 업비트 · 빗썸 (일괄 조회) | `market_snapshots` |\n"
         "| USDT 마켓 현재가 + 호가 | 바이낸스 (국내 상장 코인만, 심볼별) | `market_snapshots` |\n"
         "| 입출금 가능 여부 | 업비트 · 바이낸스 (API 키 필요) · 빗썸 (public) | `market_snapshots` |\n"
-        "| KRW-USDT 환율 | 업비트 · 빗썸 | `krw_rates` |\n\n"
+        "| USD/KRW 환율 | 하나은행 고시 (매매기준율) | `fx_rate` + `fx_points` |\n\n"
         "가격과 호가는 **환산 없이 그 거래소 통화 그대로** 저장된다 "
         "(업비트·빗썸 = KRW, 바이낸스 = USDT). 원화 환산은 조회 시점에 "
-        "`krw_rates` 를 곱해서 한다.\n\n"
+        "`fx_rate` (하나은행 고시 USD/KRW) 를 곱해서 한다. 수집한 최신 고시는 "
+        "환율 변동 이력(`fx_points`)에도 같이 쌓인다.\n\n"
         "호가는 설정된 최대 금액(`ORDERBOOK_MAX_AMOUNT_KRW`)의 체결을 커버하는 "
         "깊이까지만 저장된다.\n\n"
         "API 키가 없으면 입출금 가능 여부만 null 로 저장되고 나머지는 정상 수집된다 "

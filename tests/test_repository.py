@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from conftest import NOW_MS, seed_rates, snapshot_row
+from conftest import NOW_MS, seed_fx_rate, snapshot_row
 
 from app.core.errors import MarketDataNotFoundError
 from app.db import repository
@@ -72,39 +72,36 @@ class TestReplaceExchangeSnapshots:
         assert len(await repository.get_snapshots(db, exchange="binance")) == 1
 
 
-class TestKrwRate:
-    async def test_insert_then_update(self, db) -> None:
-        await repository.upsert_krw_rate(
-            db,
-            exchange="upbit",
-            rate=1400.0,
-            native_symbol="KRW-USDT",
-            price_timestamp=NOW_MS,
+class TestFxRate:
+    async def test_insert_then_update_keeps_single_row(self, db) -> None:
+        """통일 환율은 단일 행 — 갱신해도 행이 늘지 않는다."""
+        await repository.upsert_fx_rate(
+            db, rate=1400.0, source_time=NOW_MS // 1000, round_no=1
         )
         await db.commit()
-        await repository.upsert_krw_rate(
-            db,
-            exchange="upbit",
-            rate=1410.0,
-            native_symbol="KRW-USDT",
-            price_timestamp=NOW_MS + 1,
+        await repository.upsert_fx_rate(
+            db, rate=1410.0, source_time=NOW_MS // 1000 + 60, round_no=2
         )
         await db.commit()
 
-        rates = await repository.get_krw_rates(db)
-        assert len(rates) == 1  # 거래소당 한 행
-        assert rates[0].rate == 1410.0
-        assert rates[0].price_timestamp == NOW_MS + 1
+        row = await repository.get_fx_rate(db)
+        assert row is not None
+        assert row.rate == 1410.0
+        assert row.round_no == 2
+        assert row.source_time == NOW_MS // 1000 + 60
 
-    async def test_multiple_exchanges_have_separate_rows(self, db) -> None:
-        await seed_rates(db, {"upbit": 1400.0, "bithumb": 1401.0})
-
-        by_exchange = {r.exchange: r.rate for r in await repository.get_krw_rates(db)}
-        assert by_exchange == {"upbit": 1400.0, "bithumb": 1401.0}
-
-    async def test_require_krw_rate_raises_when_missing(self, db) -> None:
+    async def test_require_fx_rate_raises_when_missing(self, db) -> None:
         with pytest.raises(MarketDataNotFoundError):
-            await repository.require_krw_rate(db, "upbit")
+            await repository.require_fx_rate(db)
+
+    async def test_require_fx_rate_rejects_non_positive(self, db) -> None:
+        """0 이하 환율은 없는 것으로 취급한다 — 나눗셈 보호."""
+        await repository.upsert_fx_rate(
+            db, rate=0.0, source_time=NOW_MS // 1000, round_no=1
+        )
+        await db.commit()
+        with pytest.raises(MarketDataNotFoundError):
+            await repository.require_fx_rate(db)
 
 
 class TestQueries:

@@ -4,7 +4,7 @@
 **서로 다른 거래**이기 때문이다.
 
 거래소를 직접 호출하지 않는다. ``POST /refresh`` 가 저장해둔
-``market_snapshots`` / ``krw_rates`` 를 읽어서만 계산한다.
+``market_snapshots`` / ``fx_rate`` 를 읽어서만 계산한다.
 """
 
 from __future__ import annotations
@@ -41,8 +41,8 @@ DomQuery = Annotated[
     Query(
         description=(
             "**국내 거래소** ID (업비트 / 빗썸 등). 김프의 원화 축이 된다. "
-            "생략하면 설정 기본값. 환율도 이 거래소의 KRW-USDT 저장값을 쓴다 "
-            "(없으면 기준 거래소 환율로 폴백)"
+            "생략하면 설정 기본값. 환율은 어느 거래소든 통일 환율"
+            "(하나은행 고시 USD/KRW) 하나다"
         ),
         examples=["upbit"],
     ),
@@ -59,11 +59,17 @@ _SHARED_DESC = """
 거래소를 직접 호출하지 않고 **DB 스냅샷만 읽는다.** 데이터가 오래됐으면
 `data_oldest_at` 으로 알 수 있고, `POST /refresh` 로 갱신한다.
 
-환율은 `krw_rates` 에 저장된 국내 거래소별 KRW-USDT **마지막 체결가** 하나다
-(해당 거래소 것이 없으면 기준 거래소 환율로 폴백).
+환율은 `fx_rate` 에 저장된 **하나은행 고시 USD/KRW 매매기준율** 하나다 —
+어느 국내 거래소를 기준으로 하든 같은 환율이 적용된다.
 
 > ⚠️ 거래 수수료·출금 수수료·전송 시간은 반영하지 않은 이론값이다.
 > 실제 금액을 넣었을 때의 수익은 `/arbitrage`, 전 조합은 `/matrix` 로 확인할 것.
+
+테스트 예시 (배포 서버):
+    http://3.34.104.16:8000/premium/fwd?sym=BTC        (김프)
+    http://3.34.104.16:8000/premium/rev?sym=BTC        (역프)
+    http://3.34.104.16:8000/premium?sym=BTC            (양방향)
+    http://3.34.104.16:8000/premium/scan?limit=5       (전종목 스캔)
 """
 
 
@@ -232,8 +238,8 @@ class PremiumSearchResult(BaseModel):
         "`best_direction` 은 두 방향 중 수익률이 높은 쪽이다. "
         "다만 **둘 다 손해일 때는 '덜 나쁜 쪽'** 이므로 해당 방향의 `profitable` 을 "
         "반드시 함께 확인해야 한다.\n\n"
-        "`dom` 으로 국내 거래소를 고르면 그 거래소 기준으로 계산되고, "
-        "환율도 해당 거래소의 `KRW-USDT` 저장값을 쓴다."
+        "`dom` 으로 국내 거래소를 고르면 그 거래소 기준으로 계산된다. "
+        "환율은 어느 거래소든 통일 환율(`fx_rate`) 하나다."
     ),
 )
 async def search_premium(

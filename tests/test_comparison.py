@@ -6,7 +6,7 @@ import pytest
 from conftest import (
     BINANCE_PRICES,
     BITHUMB_PRICES,
-    KRW_RATES,
+    FX_RATE,
     NOW_MS,
     UPBIT_PRICES,
     best_ask,
@@ -21,12 +21,8 @@ from app.core.errors import (
     MarketDataNotFoundError,
     UnsupportedExchangeError,
 )
-from app.db.models import KrwRate, MarketSnapshot
+from app.db.models import MarketSnapshot
 from app.services.comparison_service import ComparisonService, comparison_service
-
-UPBIT_RATE = KrwRate(exchange="upbit", rate=1400.0)
-BITHUMB_RATE = KrwRate(exchange="bithumb", rate=1401.0)
-RATES = {"upbit": UPBIT_RATE, "bithumb": BITHUMB_RATE}
 
 
 def make_snap(
@@ -55,44 +51,37 @@ class TestConversion:
 
     def test_same_currency_is_identity(self) -> None:
         assert self.service._conversion(
-            make_snap("upbit", "KRW"), "KRW", RATES, UPBIT_RATE
+            make_snap("upbit", "KRW"), "KRW", FX_RATE
         ) == (1.0, None)
         assert self.service._conversion(
-            make_snap("binance", "USDT"), "USDT", RATES, UPBIT_RATE
+            make_snap("binance", "USDT"), "USDT", FX_RATE
         ) == (1.0, None)
 
-    def test_usdt_to_krw_multiplies_by_reference_rate(self) -> None:
+    def test_usdt_to_krw_multiplies_by_unified_rate(self) -> None:
         factor, applied = self.service._conversion(
-            make_snap("binance", "USDT"), "KRW", RATES, UPBIT_RATE
+            make_snap("binance", "USDT"), "KRW", FX_RATE
         )
-        assert factor == 1400.0
-        assert applied == 1400.0
+        assert factor == FX_RATE
+        assert applied == FX_RATE
 
-    def test_krw_to_usdt_divides_by_own_rate(self) -> None:
-        """국내 거래소는 자기 KRW-USDT 환율로 나눈다 (빗썸이면 1401)."""
+    def test_krw_to_usdt_divides_by_unified_rate(self) -> None:
+        """어느 국내 거래소든 같은 통일 환율로 나눈다 — 거래소별 환율은 없다."""
         factor, applied = self.service._conversion(
-            make_snap("bithumb", "KRW"), "USDT", RATES, UPBIT_RATE
+            make_snap("bithumb", "KRW"), "USDT", FX_RATE
         )
-        assert factor == pytest.approx(1 / 1401.0)
-        assert applied == 1401.0
-
-    def test_krw_to_usdt_falls_back_to_reference_rate(self) -> None:
-        factor, applied = self.service._conversion(
-            make_snap("bithumb", "KRW"), "USDT", {"upbit": UPBIT_RATE}, UPBIT_RATE
-        )
-        assert factor == pytest.approx(1 / 1400.0)
-        assert applied == 1400.0
+        assert factor == pytest.approx(1 / FX_RATE)
+        assert applied == FX_RATE
 
     def test_missing_rate_raises(self) -> None:
         with pytest.raises(MarketDataNotFoundError):
-            self.service._conversion(make_snap("binance", "USDT"), "KRW", {}, None)
+            self.service._conversion(make_snap("binance", "USDT"), "KRW", None)
 
     def test_round_trip_preserves_price(self) -> None:
         to_krw, _ = self.service._conversion(
-            make_snap("binance", "USDT"), "KRW", RATES, UPBIT_RATE
+            make_snap("binance", "USDT"), "KRW", FX_RATE
         )
         back, _ = self.service._conversion(
-            make_snap("upbit", "KRW"), "USDT", RATES, UPBIT_RATE
+            make_snap("upbit", "KRW"), "USDT", FX_RATE
         )
         assert 100.0 * to_krw * back == pytest.approx(100.0)
 
@@ -169,14 +158,13 @@ class TestCompare:
 
         assert res.sym == "BTC"
         assert res.common_currency == "KRW"
-        assert res.usdt_krw_rate == KRW_RATES["upbit"]  # 기준 거래소 환율
-        assert res.rate_exchange == "upbit"
+        assert res.usd_krw_rate == FX_RATE  # 통일 환율 (하나은행 고시)
 
         # 환산가 오름차순: 바이낸스(99.4M) < 업비트(100M) < 빗썸(100.1M)
         assert [q.exchange for q in res.quotes] == ["binance", "upbit", "bithumb"]
         binance = res.quotes[0]
         assert binance.price == pytest.approx(
-            BINANCE_PRICES["BTC"] * KRW_RATES["upbit"]
+            BINANCE_PRICES["BTC"] * FX_RATE
         )
         # KRW 행은 환산이 없다 — 원래 가격 그대로
         assert res.quotes[1].price == pytest.approx(UPBIT_PRICES["BTC"])
@@ -189,7 +177,7 @@ class TestCompare:
         assert spread is not None
         assert spread.buy_exchange == "binance"
         assert spread.sell_exchange == "bithumb"
-        expected_buy = best_ask(BINANCE_PRICES["BTC"]) * KRW_RATES["upbit"]
+        expected_buy = best_ask(BINANCE_PRICES["BTC"]) * FX_RATE
         expected_sell = best_bid(BITHUMB_PRICES["BTC"])
         assert spread.buy_price == pytest.approx(expected_buy)
         assert spread.sell_price == pytest.approx(expected_sell)
@@ -203,10 +191,10 @@ class TestCompare:
 
         by_exchange = {q.exchange: q for q in res.quotes}
         assert by_exchange["upbit"].price == pytest.approx(
-            UPBIT_PRICES["BTC"] / KRW_RATES["upbit"]
+            UPBIT_PRICES["BTC"] / FX_RATE
         )
         assert by_exchange["bithumb"].price == pytest.approx(
-            BITHUMB_PRICES["BTC"] / KRW_RATES["bithumb"]
+            BITHUMB_PRICES["BTC"] / FX_RATE
         )
         assert by_exchange["binance"].price == BINANCE_PRICES["BTC"]
         assert [q.exchange for q in res.quotes][0] == "binance"  # 가장 싸다
@@ -238,6 +226,5 @@ class TestCompare:
         await seed_rows(db, "upbit", [snapshot_row("upbit", "BTC", 100_000_000.0)])
         res = await comparison_service.compare(db, "BTC")
 
-        assert res.usdt_krw_rate is None
-        assert res.rate_exchange is None
+        assert res.usd_krw_rate is None
         assert len(res.quotes) == 1

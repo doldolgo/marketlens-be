@@ -1,7 +1,7 @@
 """김치 프리미엄 / 역프리미엄 계산 서비스 — DB 스냅샷 기반.
 
 거래소를 직접 호출하지 않는다. ``POST /refresh`` 가 저장해둔
-``market_snapshots`` / ``krw_rates`` 를 읽어서만 계산한다.
+``market_snapshots`` / ``fx_rate`` 를 읽어서만 계산한다.
 
 두 방향은 **서로 다른 거래**다.
 
@@ -15,9 +15,9 @@
 살 때는 매도호가(ask), 팔 때는 매수호가(bid). 방향에 따라 쓰는 호가가
 달라지므로 김프/역김프 값은 서로 독립적이다.
 
-환율은 ``krw_rates`` 에 저장된 **마지막 체결가 하나**뿐이다. 국내 거래소별 자기
-환율을 쓰고, 없으면 기준 거래소(업비트) 환율로 폴백한다. 예전처럼 환율을
-가격 기준별로 따로 뽑는 개념은 없어졌다.
+환율은 ``fx_rate`` 에 저장된 **하나은행 고시 USD/KRW 매매기준율 하나**다.
+예전의 국내 거래소별 KRW-USDT 시세(테더 프리미엄이 섞인 값) 대신, 어느
+국내 거래소를 기준으로 하든 같은 은행 환율을 쓴다.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ from app.core.errors import (
     UnsupportedExchangeError,
 )
 from app.db import repository
-from app.db.models import KrwRate, MarketSnapshot
+from app.db.models import FxRate, MarketSnapshot
 from app.exchanges.registry import domestic_exchange_ids, get_exchange
 from app.models.premium import (
     PremiumDirection,
@@ -61,26 +61,13 @@ def snapshot_price(snap: MarketSnapshot, side: PriceSide) -> float | None:
     return asks[0].price if asks else None
 
 
-async def resolve_krw_rate(session: AsyncSession, domestic_id: str) -> KrwRate:
-    """국내 거래소의 KRW-USDT 환율을 DB 에서 가져온다.
+async def resolve_fx_rate(session: AsyncSession) -> FxRate:
+    """통일 환율(하나은행 고시 USD/KRW 매매기준율)을 DB 에서 가져온다.
 
-    자기 환율이 없으면(수집 실패 등) 기준 거래소(업비트) 환율로 폴백하고,
-    그마저 없으면 404 성격의 도메인 예외를 던진다.
+    거래소별 환율 개념이 없어졌으므로 어떤 계산이든 이 한 값을 쓴다.
+    없으면(수집 전) 404 성격의 도메인 예외를 던진다.
     """
-    rate = await repository.get_krw_rate(session, domestic_id)
-    if (rate is None or rate.rate <= 0) and (
-        domestic_id != settings.krw_reference_exchange
-    ):
-        rate = await repository.get_krw_rate(
-            session, settings.krw_reference_exchange
-        )
-    if rate is None or rate.rate <= 0:
-        raise MarketDataNotFoundError(
-            f"DB 에 {domestic_id} 거래소의 KRW-{settings.fx_stablecoin} 환율이 "
-            "없습니다. POST /refresh 로 데이터를 수집했는지 확인하세요.",
-            detail={"exchange": domestic_id},
-        )
-    return rate
+    return await repository.require_fx_rate(session)
 
 
 def exchange_name(exchange_id: str) -> str:
@@ -165,11 +152,15 @@ class PremiumService:
         snap: MarketSnapshot,
         overseas_price: float,
         domestic_price: float,
-        usdt_krw_rate: float,
+        usd_krw_rate: float,
         direction: PremiumDirection,
     ) -> PremiumEntry:
-        """해외 거래소 하나와의 프리미엄을 계산한다. 계산식은 종전과 동일하다."""
-        overseas_krw = overseas_price * usdt_krw_rate
+        """해외 거래소 하나와의 프리미엄을 계산한다.
+
+        해외 가격은 USDT 표시지만 USDT≈USD 페그를 전제로 은행 USD/KRW
+        환율을 곱해 원화 환산한다 — 김프 사이트들의 표준 계산 방식이다.
+        """
+        overseas_krw = overseas_price * usd_krw_rate
 
         # 방향에 따라 무엇이 매수측이고 무엇이 매도측인지 결정된다.
         if direction is PremiumDirection.FWD:
@@ -230,7 +221,7 @@ class PremiumService:
                 f"{settings.krw_reference_quote} 마켓 스냅샷이 없습니다.",
                 detail={"exchange": domestic_id, "base": base.upper()},
             )
-        rate = await resolve_krw_rate(session, domestic_id)
+        rate = await resolve_fx_rate(session)
 
         failures: list[PremiumFailure] = []
         overseas_snaps = await self._overseas_snapshots(
@@ -288,7 +279,7 @@ class PremiumService:
             direction=direction,
             dom=dom_snap.exchange,
             dom_price=domestic_price,
-            usdt_krw_rate=rate.rate,
+            usd_krw_rate=rate.rate,
             rate_updated_at=_epoch_ms(rate.updated_at),
             premiums=entries,
             failures=failures,

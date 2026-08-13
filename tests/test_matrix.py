@@ -6,11 +6,11 @@ import pytest
 from conftest import (
     BINANCE_PRICES,
     BITHUMB_PRICES,
-    KRW_RATES,
+    FX_RATE,
     UPBIT_PRICES,
     fwd_execution_percent,
     rev_execution_percent,
-    seed_rates,
+    seed_fx_rate,
     seed_rows,
     seed_standard,
     snapshot_row,
@@ -61,13 +61,13 @@ class TestBestCombinationSelection:
 
         # 빗썸 조합은 빗썸 자기 환율(1401)로 계산된다
         expected = fwd_execution_percent(
-            BITHUMB_PRICES["BTC"], BINANCE_PRICES["BTC"], KRW_RATES["bithumb"]
+            BITHUMB_PRICES["BTC"], BINANCE_PRICES["BTC"], FX_RATE
         )
         assert btc.fwd.premium_percent == pytest.approx(expected)
 
         # 확인 사살: 업비트 조합보다 커야 한다
         upbit_combo = fwd_execution_percent(
-            UPBIT_PRICES["BTC"], BINANCE_PRICES["BTC"], KRW_RATES["upbit"]
+            UPBIT_PRICES["BTC"], BINANCE_PRICES["BTC"], FX_RATE
         )
         assert btc.fwd.premium_percent > upbit_combo
 
@@ -82,7 +82,7 @@ class TestBestCombinationSelection:
         assert btc.rev.sell_exchange == "binance"
 
         expected = rev_execution_percent(
-            UPBIT_PRICES["BTC"], BINANCE_PRICES["BTC"], KRW_RATES["upbit"]
+            UPBIT_PRICES["BTC"], BINANCE_PRICES["BTC"], FX_RATE
         )
         assert btc.rev.premium_percent == pytest.approx(expected)
         # 국내가 비싼 시나리오라 역프는 손해다
@@ -160,7 +160,7 @@ class TestWalletFlags:
                 )
             ],
         )
-        await seed_rates(db, {"upbit": 1400.0})
+        await seed_fx_rate(db)
 
         res = await matrix_service.build(db, amount_krw=1_000_000.0)
         btc = res.coins[0]
@@ -201,7 +201,7 @@ class TestWalletFlags:
                 )
             ],
         )
-        await seed_rates(db, {"upbit": 1400.0})
+        await seed_fx_rate(db)
 
         res = await matrix_service.build(db, amount_krw=1_000_000.0)
         btc = res.coins[0]
@@ -228,7 +228,7 @@ class TestEdgeCases:
                 )
             ],
         )
-        await seed_rates(db, {"upbit": 1400.0})
+        await seed_fx_rate(db)
 
         res = await matrix_service.build(db, amount_krw=1_000_000.0)
         assert res.coins == []
@@ -250,7 +250,7 @@ class TestEdgeCases:
             "binance",
             [snapshot_row("binance", "AI", 100.0, quote="USDT", krw_factor=1400)],
         )
-        await seed_rates(db, {"upbit": 1400.0})
+        await seed_fx_rate(db)
 
         res = await matrix_service.build(db, amount_krw=1_000_000.0)
         assert res.coins[0].suspicious is True

@@ -1,7 +1,7 @@
 """금액 기준 차익거래 시뮬레이션 서비스 — DB 스냅샷 기반.
 
 거래소를 직접 호출하지 않는다. ``POST /refresh`` 가 저장해둔
-``market_snapshots`` / ``krw_rates`` 를 읽어서만 계산한다.
+``market_snapshots`` / ``fx_rate`` 를 읽어서만 계산한다.
 
 동작 순서
     1. 대상 코인의 전 거래소 스냅샷과 환율을 DB 에서 읽는다.
@@ -12,8 +12,8 @@
     4. 그 수량을 매도처의 bids 에 훑어 **받을 수 있는 금액**을 구한다.
     5. 두 금액의 차이가 차익이다.
 
-환산 규칙은 다른 조회 API 와 같다 — 국내 거래소는 **자기 KRW-USDT 환율**을 쓰고,
-환율이 없는 거래소(해외 등)는 기준 거래소(업비트) 환율로 폴백한다.
+환산 규칙은 다른 조회 API 와 같다 — 모든 거래소가 **통일 환율**
+(하나은행 고시 USD/KRW) 하나로 환산된다.
 
 `/premium` 과의 차이: 프리미엄은 최우선 호가 한 점만 보지만 여기서는 호가창을
 실제로 소진시킨다. 금액이 커질수록 결과가 프리미엄보다 나빠진다.
@@ -35,7 +35,7 @@ from app.core.errors import (
     UnsupportedExchangeError,
 )
 from app.db import repository
-from app.db.models import KrwRate, MarketSnapshot
+from app.db.models import MarketSnapshot
 from app.exchanges.registry import get_exchange
 from app.models.arbitrage import (
     ArbitrageFailure,
@@ -123,8 +123,8 @@ class ArbitrageService:
     def _factor(self, quote: str, target: str, rate: float) -> float:
         """``quote`` 통화 가격에 곱하면 ``target`` 통화 가격이 되는 계수.
 
-        국내(KRW) ↔ 스테이블코인(USDT) 사이만 환산한다. 어느 환율을 쓸지는
-        호출한 쪽이 거래소별로 고른다 (자기 환율 우선, 기준 환율 폴백).
+        국내(KRW) ↔ 스테이블코인(USDT) 사이만 환산한다. 환율은 통일 환율
+        (하나은행 고시 USD/KRW) 하나다 — USDT≈USD 페그를 전제로 한다.
         """
         if quote == target:
             return 1.0
@@ -135,8 +135,7 @@ class ArbitrageService:
     def _build_venues(
         self,
         snapshots: list[MarketSnapshot],
-        rates: dict[str, KrwRate],
-        fallback: KrwRate,
+        fx_rate: float,
         *,
         currency: str,
         depth: int,
@@ -170,10 +169,9 @@ class ArbitrageService:
                 )
                 continue
 
-            # 자기 환율 우선, 없으면 기준 거래소 환율로 폴백.
-            rate = rates.get(snap.exchange, fallback).rate
-            to_currency = self._factor(snap.quote, currency, rate)
-            to_krw = self._factor(snap.quote, settings.krw_reference_quote, rate)
+            # 모든 거래소가 같은 통일 환율(은행 고시 USD/KRW)을 쓴다.
+            to_currency = self._factor(snap.quote, currency, fx_rate)
+            to_krw = self._factor(snap.quote, settings.krw_reference_quote, fx_rate)
 
             best_bid = book.bids[0].price
             best_ask = book.asks[0].price
@@ -324,13 +322,6 @@ class ArbitrageService:
         )
 
         snapshots = await repository.get_snapshots(session, base=base)
-        # 0 이하 환율은 나눗셈을 무너뜨리므로 없는 것으로 취급한다
-        # (수집기가 저장을 거부하지만 수동 오염 DB 도 방어).
-        rates = {
-            r.exchange: r
-            for r in await repository.get_krw_rates(session)
-            if r.rate > 0
-        }
 
         if not snapshots:
             raise MarketDataNotFoundError(
@@ -338,15 +329,8 @@ class ArbitrageService:
                 "수집했는지, 상장된 코인인지 확인하세요.",
                 detail={"base": base},
             )
-        if not rates:
-            raise MarketDataNotFoundError(
-                "DB 에 KRW-USDT 환율이 없습니다. 먼저 POST /refresh 로 수집하세요.",
-            )
-
-        #: 자기 환율이 없는 거래소에 쓰는 기준 환율 (업비트, 없으면 아무거나).
-        fallback_rate = rates.get(settings.krw_reference_exchange) or next(
-            iter(rates.values())
-        )
+        # 통일 환율 — 없거나 0 이하면 여기서 404 성격의 예외가 난다.
+        fx = await repository.require_fx_rate(session)
 
         # 대상 거래소 필터. 명시적으로 요청했는데 스냅샷이 없으면 실패로 기록한다.
         failures: list[ArbitrageFailure] = []
@@ -381,8 +365,7 @@ class ArbitrageService:
 
         venues = self._build_venues(
             pool,
-            rates,
-            fallback_rate,
+            fx.rate,
             currency=currency,
             depth=depth,
             failures=failures,
@@ -430,7 +413,7 @@ class ArbitrageService:
         input_krw = (
             amount
             if currency == settings.krw_reference_quote
-            else amount * fallback_rate.rate
+            else amount * fx.rate
         )
 
         # --- 경고 ---
@@ -491,7 +474,7 @@ class ArbitrageService:
             sym=base,
             direction=direction,
             input_amount_krw=input_krw,
-            usdt_krw_rate=fallback_rate.rate,
+            usd_krw_rate=fx.rate,
             premium_percent=premium_percent,
             buy=buy_side,
             sell=sell_side,

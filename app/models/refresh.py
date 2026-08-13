@@ -23,11 +23,12 @@ class ExchangeRefreshStat(BaseModel):
     )
 
 
-class KrwRateInfo(BaseModel):
-    """저장한 환율 한 건."""
+class FxRateInfo(BaseModel):
+    """저장한 통일 환율 (하나은행 고시 USD/KRW 매매기준율)."""
 
-    exchange: str = Field(..., description="국내 거래소 ID")
-    rate: float = Field(..., description="USDT 1개당 원화 가격")
+    rate: float = Field(..., description="USD 1달러당 원화 (매매기준율)")
+    source_time: int = Field(..., description="은행 고시 시각 (epoch 초)")
+    round_no: int = Field(..., description="당일 고시 회차")
 
 
 class RefreshFailure(BaseModel):
@@ -45,8 +46,12 @@ class RefreshResult(BaseModel):
     snapshots: list[ExchangeRefreshStat] = Field(
         default_factory=list, description="거래소별 스냅샷 저장 결과"
     )
-    krw_rates: list[KrwRateInfo] = Field(
-        default_factory=list, description="저장한 KRW-USDT 환율"
+    fx: FxRateInfo | None = Field(
+        None,
+        description=(
+            "저장한 통일 환율 (하나은행 USD/KRW 매매기준율). "
+            "이번 수집에 실패했으면 null — 계산은 DB 의 마지막 환율로 계속된다"
+        ),
     )
     total_saved: int = Field(0, description="저장한 전체 행 수")
 

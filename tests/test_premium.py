@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import pytest
 from conftest import (
-    KRW_RATES,
+    FX_RATE,
     NOW_MS,
     best_ask,
     best_bid,
     fwd_execution_percent,
     rev_execution_percent,
-    seed_rates,
+    seed_fx_rate,
     seed_rows,
     seed_standard,
     snapshot_row,
@@ -180,7 +180,7 @@ class TestFetchPremiums:
         await seed_rows(
             db, "upbit", [snapshot_row("upbit", "BTC", 71_000.0, quote="USDT")]
         )
-        await seed_rates(db)
+        await seed_fx_rate(db)
         with pytest.raises(MarketDataNotFoundError):
             await premium_service.fetch_premiums(
                 db, "BTC", direction=PremiumDirection.FWD
@@ -194,7 +194,7 @@ class TestFetchPremiums:
 
         assert res.sym == "BTC"
         assert res.dom == "upbit"
-        assert res.usdt_krw_rate == KRW_RATES["upbit"]
+        assert res.usd_krw_rate == FX_RATE
         # 김프: 국내에서 팔므로 최우선 매수호가(bid)
         assert res.dom_price == pytest.approx(best_bid(100_000_000.0))
 
@@ -228,7 +228,8 @@ class TestFetchPremiums:
         assert rev.dom_price == pytest.approx(best_ask(100_000_000.0))
         assert fwd.premiums[0].usd > rev.premiums[0].usd
 
-    async def test_domestic_selection_uses_own_rate(self, db) -> None:
+    async def test_domestic_selection_uses_unified_rate(self, db) -> None:
+        """어느 국내 거래소를 기준으로 하든 환율은 통일 환율 하나다."""
         await seed_standard(db)
         upbit = await premium_service.fetch_premiums(
             db, "BTC", direction=PremiumDirection.FWD
@@ -242,34 +243,28 @@ class TestFetchPremiums:
 
         assert bithumb.dom == "bithumb"
         assert bithumb.dom_price == pytest.approx(best_bid(100_100_000.0))
-        assert bithumb.usdt_krw_rate == KRW_RATES["bithumb"]
-        assert bithumb.usdt_krw_rate != upbit.usdt_krw_rate
+        assert bithumb.usd_krw_rate == FX_RATE
+        assert bithumb.usd_krw_rate == upbit.usd_krw_rate  # 거래소별 환율은 없다
 
-    async def test_missing_own_rate_falls_back_to_reference(self, db) -> None:
+    async def test_missing_fx_rate_raises(self, db) -> None:
+        """환율이 아직 수집되지 않았으면 계산 불가 — 404 성격의 예외."""
         await seed_rows(
             db, "bithumb", [snapshot_row("bithumb", "BTC", 100_100_000.0)]
         )
-        await seed_rows(
-            db,
-            "binance",
-            [snapshot_row("binance", "BTC", 71_000.0, quote="USDT", krw_factor=1400)],
-        )
-        await seed_rates(db, {"upbit": 1400.0})  # 빗썸 자기 환율은 없다
-
-        res = await premium_service.fetch_premiums(
-            db,
-            "BTC",
-            direction=PremiumDirection.FWD,
-            domestic="bithumb",
-        )
-        assert res.usdt_krw_rate == 1400.0
+        with pytest.raises(MarketDataNotFoundError):
+            await premium_service.fetch_premiums(
+                db,
+                "BTC",
+                direction=PremiumDirection.FWD,
+                domestic="bithumb",
+            )
 
     async def test_explicit_exchange_without_snapshot_is_partial_failure(
         self, db
     ) -> None:
         """명시한 해외 거래소의 스냅샷이 없으면 failures 에 기록하고 계속한다."""
         await seed_rows(db, "upbit", [snapshot_row("upbit", "BTC", 100_000_000.0)])
-        await seed_rates(db, {"upbit": 1400.0})
+        await seed_fx_rate(db)
 
         res = await premium_service.fetch_premiums(
             db,

@@ -10,8 +10,9 @@
     환산이 필요한 계산은 조회 시점에 ``fx_rate`` 를 곱해서 한다.
 
 ``fx_rate`` — 단 한 행
-    하나은행 고시 USD/KRW **매매기준율** (최신 고시). 환율 통일 작업의
-    저장 공간이다 — 아직은 ``krw_rates`` 도 함께 존재한다.
+    하나은행 고시 USD/KRW **매매기준율** (최신 고시).
+    예전에는 국내 거래소별 KRW-USDT 시세를 환율로 썼지만(``krw_rates``),
+    지금은 모든 계산이 이 은행 고시 환율 하나로 통일됐다.
 
 **가격 변동 이력 (히스토리)** — 김프/역프 통계의 원재료.
 
@@ -110,25 +111,6 @@ class FxRate(Base):
     source_time: Mapped[int] = mapped_column(BigInteger, default=0)
     #: 당일 고시 회차 (하루 1,300~2,000회 갱신된다)
     round_no: Mapped[int] = mapped_column(Integer, default=0)
-    #: 이 행을 마지막으로 갱신한 시각
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
-    )
-
-
-class KrwRate(Base):
-    """국내 거래소의 KRW-USDT 환율."""
-
-    __tablename__ = "krw_rates"
-
-    #: 국내 거래소 ID (upbit / bithumb)
-    exchange: Mapped[str] = mapped_column(String(32), primary_key=True)
-    #: USDT 1개당 원화 가격 (마지막 체결가)
-    rate: Mapped[float] = mapped_column(Float)
-    #: 원본 마켓 심볼 (KRW-USDT)
-    native_symbol: Mapped[str] = mapped_column(String(64), default="")
-    #: 거래소가 준 시세 시각 (epoch ms)
-    price_timestamp: Mapped[int] = mapped_column(BigInteger, default=0)
     #: 이 행을 마지막으로 갱신한 시각
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

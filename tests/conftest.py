@@ -6,7 +6,7 @@
 - ``engine`` / ``db``     : in-memory SQLite (StaticPool 로 커넥션 하나를 공유)
 - ``client``              : httpx.ASGITransport + dependency_overrides[get_session]
                             (lifespan 을 돌리지 않으므로 실제 DB 접속 시도가 없다)
-- ``seed_standard``       : 국내 2곳(업비트·빗썸) + 바이낸스 + 환율 표준 시나리오
+- ``seed_standard``       : 국내 2곳(업비트·빗썸) + 바이낸스 + 통일 환율 표준 시나리오
 """
 
 from __future__ import annotations
@@ -45,7 +45,8 @@ def _stable_settings(monkeypatch):
 UPBIT_PRICES = {"BTC": 100_000_000.0, "ETH": 5_000_000.0, "XRP": 1_400.0}
 BITHUMB_PRICES = {"BTC": 100_100_000.0, "XRP": 1_402.0}
 BINANCE_PRICES = {"BTC": 71_000.0, "ETH": 3_550.0, "XRP": 0.99, "SOL": 150.0}
-KRW_RATES = {"upbit": 1400.0, "bithumb": 1401.0}
+#: 통일 환율 (하나은행 고시 USD/KRW 매매기준율) — 모든 계산이 이 하나를 쓴다.
+FX_RATE = 1400.0
 
 #: 호가 한 단계의 체결 가능 금액 (원화 환산). 슬리피지 기대값 계산이 쉽도록 고정.
 LEVEL_AMOUNT_KRW = 3_000_000.0
@@ -108,15 +109,11 @@ async def seed_rows(session, exchange: str, rows: list[SnapshotRow]) -> None:
     await session.commit()
 
 
-async def seed_rates(session, rates: dict[str, float] | None = None) -> None:
-    for eid, rate in (rates or KRW_RATES).items():
-        await repository.upsert_krw_rate(
-            session,
-            exchange=eid,
-            rate=rate,
-            native_symbol="KRW-USDT",
-            price_timestamp=NOW_MS,
-        )
+async def seed_fx_rate(session, rate: float = FX_RATE) -> None:
+    """통일 환율(fx_rate 단일 행)을 심는다."""
+    await repository.upsert_fx_rate(
+        session, rate=rate, source_time=NOW_MS // 1000, round_no=100
+    )
     await session.commit()
 
 
@@ -142,13 +139,11 @@ async def seed_standard(session) -> None:
         session,
         "binance",
         [
-            snapshot_row(
-                "binance", b, p, quote="USDT", krw_factor=KRW_RATES["upbit"]
-            )
+            snapshot_row("binance", b, p, quote="USDT", krw_factor=FX_RATE)
             for b, p in BINANCE_PRICES.items()
         ],
     )
-    await seed_rates(session)
+    await seed_fx_rate(session)
 
 
 # ── 기대값 헬퍼 (테스트가 시드와 같은 상수로 직접 계산한다) ─────────────
