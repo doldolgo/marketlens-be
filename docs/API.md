@@ -2,13 +2,15 @@
 
 거래소 간 가격차(김프·역프)를 계산하는 백엔드. 데이터 흐름은 두 갈래다.
 
-- **수집** — `POST /refresh` 가 거래소 공개 API 를 비동기로 동시 호출해
-  시세·호가·입출금 상태·환율을 **PostgreSQL 에 저장**한다.
-- **조회** — 그 외 모든 API 는 거래소를 직접 부르지 않고 **DB 만 읽어** 계산한다.
+- **수집** — `POST /refresh` 가 시세·호가·입출금 상태·환율(하나은행 고시)을,
+  `POST /history/sync` 가 초 단위 **가격 변동 이력**을 PostgreSQL 에 저장한다.
+  거래소·은행을 실제로 호출하는 경로는 이 둘뿐이다.
+- **조회** — 그 외 모든 API 는 외부를 직접 부르지 않고 **DB 만 읽어** 계산한다.
 
 - Base URL (로컬): `http://localhost:8000`
-- 인증: 조회 API 는 **없음**. `POST /refresh` 만 서버에 `REFRESH_TOKEN` 이
-  설정된 경우 `X-Refresh-Token` 헤더가 필요하다 (로컬처럼 비어 있으면 검사 안 함).
+- 인증: 조회 API 는 **없음**. `POST /refresh` 와 `POST /history/sync` 만 서버에
+  `REFRESH_TOKEN` 이 설정된 경우 `X-Refresh-Token` 헤더가 필요하다
+  (로컬처럼 비어 있으면 검사 안 함).
 - 응답 형식: `application/json`
 - 대화형 문서: `http://localhost:8000/docs` (Swagger UI), `http://localhost:8000/redoc`
 
@@ -34,6 +36,7 @@
    - [GET /slippage/{exchange_id}](#get-slippageexchange_id)
    - [GET /matrix](#get-matrix)
    - [GET /arbitrage](#get-arbitrage)
+   - [GET /history/coin · /history/fx · POST /history/sync](#가격-변동-이력--historycoin--historyfx--historysync)
 6. [에러 응답](#6-에러-응답)
 7. [수집기가 호출하는 원본 거래소 API](#7-수집기가-호출하는-원본-거래소-api)
 8. [API 키 · 입출금 상태 조회](#8-api-키--입출금-상태-조회)
@@ -52,7 +55,10 @@
 속도는 거래소 상태와 무관하고, 조회를 아무리 많이 해도 거래소 rate limit 을
 소비하지 않는다. 대신 **조회 결과는 마지막 수집 시점의 스냅샷**이다.
 
-### 테이블 — 2개뿐이다
+### 테이블
+
+라이브 테이블 2개(아래)와 변동 이력 테이블 5개가 있다. 이력 쪽 구조와 압축
+원리는 **[DB.md](DB.md)** 에 따로 정리돼 있다.
 
 #### `market_snapshots` — 거래소 × 코인 하나당 한 행
 
@@ -67,21 +73,21 @@
 | `price_timestamp` | 거래소가 준 시세 시각 (epoch ms) |
 | `updated_at` | 이 행을 마지막으로 갱신한 시각 (DB 서버 시계) |
 
-#### `krw_rates` — 국내 거래소당 한 행
+#### `fx_rate` — 통일 환율, 항상 1행
 
 | 컬럼 | 설명 |
 |---|---|
-| `exchange` (PK) | 국내 거래소 ID (`upbit` / `bithumb`) |
-| `rate` | 그 거래소 `KRW-USDT` 마켓의 USDT 1개당 원화 (**마지막 체결가**) |
-| `native_symbol` | 원본 마켓 심볼 (`KRW-USDT`) |
-| `price_timestamp` | 거래소가 준 시세 시각 (epoch ms) |
+| `id` (PK) | 항상 1 — 단일 행 강제 |
+| `rate` | USD 1달러당 원화 — **하나은행 고시 매매기준율** |
+| `source_time` | 은행이 고시한 시각 (epoch 초) |
+| `round_no` | 당일 고시 회차 (하루 1,300~2,000회) |
 | `updated_at` | 이 행을 마지막으로 갱신한 시각 |
 
 ### 저장 원칙
 
 - **환산 없이 저장** — 가격·호가는 그 거래소 통화 그대로 저장한다
-  (업비트·빗썸 = KRW, 바이낸스 = USDT). 원화 환산은 조회 시점에 `krw_rates`
-  를 곱해서 한다.
+  (업비트·빗썸 = KRW, 바이낸스 = USDT). 원화 환산은 조회 시점에 통일 환율
+  (`fx_rate`)을 곱해서 한다.
 - **호가는 금액 한도까지만** — 누적 체결 가능액이 서버 설정
   `ORDERBOOK_MAX_AMOUNT_KRW`(기본 10억원)에 도달하는 깊이까지만 저장한다.
   그보다 큰 금액의 슬리피지는 계산할 수 없고, 응답에 `depth_exhausted` 로
@@ -97,7 +103,7 @@
 |---|---|---|
 | `data_updated_at` | 단일 스냅샷 기반 응답 (`/slippage` 등) | 그 스냅샷의 DB 갱신 시각 (epoch ms) |
 | `data_oldest_at` / `data_newest_at` | 여러 스냅샷을 쓰는 응답 | 사용한 스냅샷 중 가장 오래된 / 최근 갱신 시각 |
-| `updated_at` | `/fx` | 환율의 DB 갱신 시각 |
+| `updated_at` | `/rate` | 환율의 DB 갱신 시각 |
 
 지금과의 차이가 크면 `POST /refresh` 로 갱신한다. 갱신 주기는 클라이언트
 (또는 스케줄러)가 정한다 — 서버가 알아서 갱신하지 않는다.
@@ -124,7 +130,7 @@
 | 엔드포인트 | 라우트 | 계산 로직 | 응답 모델 |
 |---|---|---|---|
 | `POST /refresh` | `app/api/routes/refresh.py` | `app/services/collector_service.py` | `app/models/refresh.py` |
-| `GET /rate` | `app/api/routes/fx.py` | (라우트가 직접 DB 조회) | 같은 파일 안 |
+| `GET /rate` | `app/api/routes/rate.py` | (라우트가 직접 DB 조회) | 같은 파일 안 |
 | `GET /orderbook/{id}` | `app/api/routes/orderbook.py` | `repository.orderbook_from_snapshot` | `app/models/orderbook.py` |
 | `GET /compare` | `app/api/routes/compare.py` | `app/services/comparison_service.py` | `app/models/comparison.py` |
 | `GET /premium*` | `app/api/routes/premium.py` | `app/services/premium_service.py` | `app/models/premium.py` |
@@ -133,6 +139,7 @@
 | `GET /slippage/{id}` | `app/api/routes/slippage.py` | `app/services/slippage_service.py` | `app/models/slippage.py` |
 | `GET /matrix` | `app/api/routes/matrix.py` | `app/services/matrix_service.py` | `app/models/matrix.py` |
 | `GET /arbitrage` | `app/api/routes/arbitrage.py` | `app/services/arbitrage_service.py` | `app/models/arbitrage.py` |
+| `GET /history/*` · `POST /history/sync` | `app/api/routes/history.py` | `app/history/service.py` | 라우트 파일 안 |
 
 ---
 
@@ -181,7 +188,7 @@ Adminer (http://localhost:8080): 시스템 `PostgreSQL`, 서버 `db`,
 | `POST /refresh` | **DB 갱신** — 거래소에서 수집해 저장 | 없음 | 거래소별 저장/삭제 수, 환율, 실패·경고 |
 | `GET /health` | 서비스 생존 여부 | 없음 | `status`, `version` |
 | `GET /exchanges` | 지원 거래소 목록 | 없음 | 거래소 ID, 이름, 결제 통화 |
-| `GET /rate` | **USDT/KRW 환율 (저장값)** | 국내 거래소 | 거래소별 환율 + 갱신 시각 |
+| `GET /rate` | **USD/KRW 통일 환율 (저장값)** | 없음 | 하나은행 고시 매매기준율 + 고시 시각 |
 | `GET /orderbook/{id}` | 거래소 한 곳의 호가창 (DB 스냅샷) | 거래소, 심볼, 깊이 | 매수/매도 호가 배열 |
 | `GET /compare` | 여러 거래소 가격을 한 통화로 환산해 비교 | 코인, 거래소들, 기준통화 | 거래소별 시세 + 스프레드 |
 | `GET /premium` | **코인 검색 — 김프+역김프 동시** | 코인, 국내 거래소, 가격기준, 금액 | 두 방향 결과 + 더 나은 방향 |
@@ -192,6 +199,9 @@ Adminer (http://localhost:8080): 시스템 `PostgreSQL`, 서버 `db`,
 | `GET /slippage/{id}` | **슬리피지** — 시장가 거래 시 평균 체결가 악화 | 거래소, 심볼, 방향, 금액/수량 | 평균 체결가, 슬리피지 %, 단계별 체결 |
 | `GET /matrix` | **전 코인 매트릭스** — 코인별 최대 김프·최대 역프 | 금액 1개 | 코인별 최적 조합 + 실현 수익률 + 입출금 가능 여부 |
 | `GET /arbitrage` | **N원 넣으면 실제로 얼마 남나** | 코인, 금액, 통화, 방향 | 매수/매도처, 슬리피지, 실수익 |
+| `GET /history/coin` | **가격 변동 로그** — 몇 초 뒤에 얼마로 변했나 | 거래소, 코인, 주/월 | dt·price·diff 이벤트 열 |
+| `GET /history/fx` | **환율 변동 로그** | 주/월 | dt·환율 이벤트 열 |
+| `POST /history/sync` | **이력 증분 수집 + 팩킹** (cron 용) | 없음 | 시리즈별 신규 이벤트 수 |
 
 ### 조회 가능한 데이터 범위
 
@@ -199,7 +209,7 @@ Adminer (http://localhost:8080): 시스템 `PostgreSQL`, 서버 `db`,
 |---|:---:|---|
 | 호가 (매수·매도 다단계) | ✅ | 저장된 깊이 안에서 — 국내 30단계, 바이낸스 기본 100단계, `ORDERBOOK_MAX_AMOUNT_KRW` 커버분까지 |
 | 마지막 체결가 (현재가) | ✅ | 수집 시점의 값 |
-| USDT/KRW 환율 | ✅ | `krw_rates` 저장값 — 국내 거래소별 마지막 체결가 **하나** |
+| USD/KRW 환율 | ✅ | `fx_rate` 저장값 — 하나은행 고시 매매기준율 **하나로 통일** |
 | 국내 거래소 선택 (업비트/빗썸) | ✅ | `dom` 파라미터 |
 | 김치 프리미엄 / 역김프 | ✅ | `/premium/fwd` · `/premium/rev` |
 | 전종목 스캔 · 전 코인 매트릭스 | ✅ | DB 만 읽으므로 거래소 호출 0 |
@@ -208,7 +218,8 @@ Adminer (http://localhost:8080): 시스템 `PostgreSQL`, 서버 `db`,
 | **입금/출금 가능 여부** | ✅ | 수집 시 저장. 업비트·바이낸스는 API 키 필요, 없으면 null |
 | 선물 시세 | ❌ | DB 는 **현물만** 저장한다 |
 | 시가·고가·저가·등락률·거래량 | ❌ | 저장하지 않음 |
-| 개별 체결 내역 / 캔들 | ❌ | 미구현 |
+| 초 단위 가격·환율 변동 이력 | ✅ | `/history/coin` · `/history/fx` — 변동 순간만 저장 ([HISTORY.md](HISTORY.md)) |
+| 개별 체결 내역 / 캔들 | ❌ | 원본 캔들은 저장하지 않는다 (변동 이벤트로 축약) |
 | 거래·출금 수수료 반영 | ❌ | 모든 수익 계산이 **수수료 미반영 이론값** |
 | 잔고 · 주문 · 입출금 실행 | ❌ | 미구현 |
 
@@ -263,18 +274,18 @@ DB 는 거래소당 한 마켓(국내 = KRW, 바이낸스 = USDT)만 저장하�
 ### 환율
 
 업비트·빗썸은 KRW, 바이낸스는 USDT 로 가격을 매기므로 그대로는 비교할 수 없다.
-환율은 **`krw_rates` 에 저장된 국내 거래소별 `KRW-USDT` 마켓 마지막 체결가**를
-쓴다. 은행 고시 USD/KRW 가 아니라 실제 국내 시장에서 거래되는 테더 가격이다 —
-은행 환율과의 차이가 곧 **테더 프리미엄**이다.
+환율은 **`fx_rate` 에 저장된 하나은행 고시 USD/KRW 매매기준율 하나**를 쓴다 —
+어느 국내 거래소를 기준으로 하든 같은 환율이다.
 
-- **거래소마다 값이 다르다.** 업비트 `KRW-USDT` 와 빗썸 `KRW-USDT` 는 서로 다른
-  시장이다. 그래서 국내 거래소별로 한 행씩 저장하고, 원화 환산이 필요한 계산은
-  **해당 국내 거래소의 환율**을 쓴다. 그 거래소의 환율이 DB 에 없으면 기준
-  거래소(`upbit`, 설정 `KRW_REFERENCE_EXCHANGE`) 환율로 폴백한다.
-- **저장값은 마지막 체결가 하나뿐이다.** 코인 가격은 호가에서 뽑지만 환율은
-  저장된 체결가 하나를 쓴다.
-- 캐시가 아니라 저장값이므로 `POST /refresh` 전에는 바뀌지 않는다.
-  각 응답의 `rate_updated_at` (또는 `/fx` 의 `updated_at`)으로 신선도를 확인한다.
+- **왜 은행 고시인가.** 예전에는 국내 거래소의 `KRW-USDT` 시세를 환율로 썼지만,
+  그 값에는 **테더 프리미엄**이 섞여 있어 거래소마다 다르고 "은행 환율 기준
+  김프"(김프 사이트들의 표준)와 어긋난다. 지금은 실환율로 통일했다.
+- **USDT≈USD 페그 전제.** 해외 가격은 USDT 표시지만 은행 USD/KRW 를 곱해
+  환산한다 — 김프 계산의 업계 표준 방식이다.
+- 은행은 하루 1,300~2,000회(평균 ~44초 간격) 고시하며, `POST /refresh` 와
+  `POST /history/sync` 가 최신 고시를 저장한다. 각 응답의 `rate_updated_at`
+  (또는 `/rate` 의 `updated_at`)으로 신선도를 확인한다.
+- 과거 환율의 변동 이력은 `GET /history/fx` 로 조회한다.
 
 ---
 
@@ -292,11 +303,11 @@ DB 는 거래소당 한 마켓(국내 = KRW, 바이낸스 = USDT)만 저장하�
 | KRW 전종목 현재가 + 호가 | 업비트 · 빗썸 (전종목 일괄 조회) | `market_snapshots` |
 | USDT 마켓 현재가 + 호가 | 바이낸스 (국내 상장 코인만, 심볼별 depth) | `market_snapshots` |
 | 입출금 가능 여부 | 업비트 · 바이낸스 (API 키 필요) · 빗썸 (public) | `market_snapshots` |
-| KRW-USDT 환율 (마지막 체결가) | 업비트 · 빗썸 | `krw_rates` |
+| USD/KRW 환율 (하나은행 고시 매매기준율) | 하나은행 | `fx_rate` + 이력 `fx_points` |
 
 - 가격·호가는 **환산 없이 그 거래소 통화 그대로** 저장된다.
 - 호가는 `ORDERBOOK_MAX_AMOUNT_KRW`(기본 10억원)의 체결을 커버하는 깊이까지만
-  저장된다. 바이낸스 호가는 USDT 기준이므로 업비트 환율로 환산한 금액을 쓴다.
+  저장된다. 바이낸스 호가는 USDT 기준이므로 통일 환율로 환산한 금액을 쓴다.
 - 이번 수집에 없는 코인은 지워진다 (응답의 `deleted`).
 - API 키가 없으면 입출금 가능 여부만 null 로 저장되고 나머지는 정상 수집된다
   (`warnings` 에 표시).
@@ -332,10 +343,7 @@ curl -X POST "http://localhost:8000/refresh" -H "X-Refresh-Token: <토큰>"
     { "exchange": "binance", "saved": 202, "deleted": 0,
       "wallet_status_available": false, "mode": "per_symbol" }
   ],
-  "krw_rates": [
-    { "exchange": "bithumb", "rate": 1407.0 },
-    { "exchange": "upbit", "rate": 1406.0 }
-  ],
+  "fx": { "rate": 1418.4, "source_time": 1786627013, "round_no": 732 },
   "total_saved": 704,
   "failures": [],
   "warnings": [
@@ -352,7 +360,7 @@ curl -X POST "http://localhost:8000/refresh" -H "X-Refresh-Token: <토큰>"
 | `snapshots[].saved` / `deleted` | 저장(UPSERT)한 코인 수 / 이번 수집에 없어서 지운 코인 수 |
 | `snapshots[].wallet_status_available` | 입출금 가능 여부를 채웠는지. false 면 키가 없거나 조회 실패 → null 저장 |
 | `snapshots[].mode` | `bulk`=전종목 일괄 조회 (업비트·빗썸), `per_symbol`=심볼별 조회 (바이낸스) |
-| `krw_rates` | 저장한 국내 거래소별 KRW-USDT 환율 |
+| `fx` | 저장한 통일 환율 (하나은행 고시). 이번 수집 실패 시 null — 계산은 DB 의 마지막 환율로 계속 |
 | `failures` | 수집하지 못한 항목 (`exchange`, `sym`, `error_code`, `message`) |
 | `warnings` | 키 없음, 환율 조회 실패 등 주의 사항 |
 | `total_calls` | 이번 갱신에서 나간 **거래소 HTTP 호출 수** (실측) |
@@ -426,42 +434,36 @@ curl "http://localhost:8000/exchanges"
 
 ### GET /rate
 
-**USDT/KRW 환율 조회 — DB 저장값.**
+**USD/KRW 통일 환율 조회 — DB 저장값.**
 
-거래소를 직접 호출하지 않는다. 반환값은 `POST /refresh` 가 `krw_rates` 에
-저장해둔 **국내 거래소별 `KRW-USDT` 마켓 마지막 체결가**다.
-
-#### 요청
-
-| 파라미터 | 타입 | 기본값 | 설명 |
-|---|---|---|---|
-| `exchange` | string | (전체) | 환율을 조회할 **국내 거래소** ID (`upbit` \| `bithumb`). 생략하면 저장된 전체. 등록되지 않은 ID 면 `404 unsupported_exchange`, 등록됐지만 환율이 아직 없으면 `404 market_data_not_found` |
+값은 **하나은행 고시 매매기준율**이다. `POST /refresh` 와 `POST /history/sync`
+가 최신 고시를 저장한다. 파라미터는 없다 (거래소별 환율 개념이 없어졌다).
 
 ```bash
 curl "http://localhost:8000/rate"
-curl "http://localhost:8000/rate?exchange=bithumb"
 ```
 
 #### 응답 `200 OK`
 
 ```json
 {
-  "rates": [
-    { "exchange": "bithumb", "rate": 1407.0, "updated_at": 1786370137012 },
-    { "exchange": "upbit", "rate": 1406.0, "updated_at": 1786370137012 }
-  ],
-  "fetched_at": 1786370950000
+  "rate": 1418.4,
+  "source": "hana",
+  "source_time": 1786627013,
+  "round_no": 732,
+  "updated_at": 1786627016621,
+  "fetched_at": 1786632581400
 }
 ```
 
 | 필드 | 설명 |
 |---|---|
-| `rate` | USDT 1개의 원화 가격 (마지막 체결가) |
-| `updated_at` | 이 환율을 DB 에 저장한 시각 (epoch ms) — **데이터 신선도 기준** |
+| `rate` | USD 1달러당 원화 (매매기준율) |
+| `source_time` | 은행이 이 환율을 **고시한** 시각 (epoch 초) |
+| `round_no` | 당일 고시 회차 |
+| `updated_at` | DB 저장 시각 (epoch ms) — **데이터 신선도 기준** |
 
-빗썸과 업비트의 `KRW-USDT` 는 서로 다른 시장이라 값이 다르다. 원화 환산이
-필요한 조회 API 들은 해당 국내 거래소의 환율을 쓰되, 없으면 기준 거래소
-(`upbit`) 환율로 폴백한다.
+아직 수집 전이면 `404 market_data_not_found`. 과거 환율은 `GET /history/fx`.
 
 ---
 
@@ -520,8 +522,8 @@ curl "http://localhost:8000/orderbook/binance?symbol=BTC/USDT&depth=3"
 여러 거래소의 같은 코인 가격(마지막 체결가)을 하나의 통화로 환산해 비교하고,
 **차익 스프레드**를 계산한다. DB 스냅샷만 읽는다.
 
-환율은 DB 의 `krw_rates` 를 사용한다 — KRW 환산은 기준 국내 거래소(업비트)
-환율을 곱하고, USDT 환산은 그 국내 거래소 자기 환율로 나눈다 (없으면 기준 환율).
+환율은 DB 의 통일 환율(`fx_rate`, 하나은행 고시 USD/KRW) 하나다 — KRW 환산은
+이 환율을 곱하고, USDT 환산은 이 환율로 나눈다.
 응답의 가격은 전부 `common_currency` 로 환산된 최종값이다.
 
 #### 요청
@@ -543,8 +545,7 @@ curl "http://localhost:8000/compare?sym=ETH&common_currency=USDT"
 {
   "sym": "BTC",
   "common_currency": "KRW",
-  "usdt_krw_rate": 1406.0,
-  "rate_exchange": "upbit",
+  "usd_krw_rate": 1406.0,
   "quotes": [
     {
       "exchange": "binance",
@@ -581,7 +582,7 @@ curl "http://localhost:8000/compare?sym=ETH&common_currency=USDT"
 
 | 필드 | 설명 |
 |---|---|
-| `usdt_krw_rate` / `rate_exchange` | 기준 환율과 그 출처 국내 거래소. 저장된 환율이 없으면 null |
+| `usd_krw_rate` | 적용한 통일 환율 (하나은행 고시 USD/KRW). 아직 수집 전이면 null |
 | `quotes` | 거래소별 시세 (**전부 `common_currency` 로 환산된 값**). `price` 오름차순(= 싼 거래소가 먼저) 정렬 |
 | `quotes[].price` / `best_bid` / `best_ask` | 마지막 체결가 · 최우선 매수/매도호가 (공통 통화 환산) |
 | `quotes[].quote_currency` | 원래 결제 통화 (KRW / USDT) — 환산 전 단위 표시용 |
@@ -682,7 +683,7 @@ curl "http://localhost:8000/premium?sym=XRP"
 | 파라미터 | 타입 | 필수 | 기본값 | 설명 |
 |---|---|:---:|---|---|
 | `sym` | string | ✅ | — | 조회할 코인 심볼 |
-| `dom` | string | | `upbit` | 국내 거래소. 환율도 이 거래소의 `krw_rates` 저장값 (없으면 기준 거래소로 폴백) |
+| `dom` | string | | `upbit` | 국내 거래소. 환율은 어느 거래소든 통일 환율(`fx_rate`) 하나다 |
 | `fx` | string[] | | 전체 | 비교할 **해외** 거래소 ID. 반복 지정 가능. 생략하면 DB 에 USDT 스냅샷이 있는 전체 (국내 기준 거래소 제외) |
 
 ```bash
@@ -701,7 +702,7 @@ curl "http://localhost:8000/premium/rev?sym=BTC"
   "direction": "fwd",
   "dom": "upbit",
   "dom_price": 91352000.0,
-  "usdt_krw_rate": 1406.0,
+  "usd_krw_rate": 1406.0,
   "rate_updated_at": 1786370137012,
   "premiums": [
     {
@@ -728,7 +729,7 @@ curl "http://localhost:8000/premium/rev?sym=BTC"
 |---|---|
 | `direction` | `fwd` \| `rev` |
 | `dom` / `dom_price` | 국내 거래소와 그 가격 (KRW). 김프면 bid, 역김프면 ask 기준 |
-| `usdt_krw_rate` / `rate_updated_at` | 적용 환율 — `krw_rates` 저장값 (마지막 체결가 하나) 과 그 DB 저장 시각 |
+| `usd_krw_rate` / `rate_updated_at` | 적용 환율 — 통일 환율(하나은행 고시)과 그 DB 저장 시각 |
 | `premiums` | 해외 거래소별 결과. **수익률 내림차순** |
 | `failures` | 스냅샷이 없거나 가격을 뽑지 못한 거래소 (부분 실패 허용) |
 | `data_oldest_at` / `data_newest_at` | 사용한 스냅샷의 갱신 시각 범위 |
@@ -737,7 +738,7 @@ curl "http://localhost:8000/premium/rev?sym=BTC"
 
 | 필드 | 설명 |
 |---|---|
-| `usd` | 해외 가격 (USDT). 김프면 ask, 역김프면 bid 기준. 원화 환산은 `usdt_krw_rate` 를 곱하면 된다 |
+| `usd` | 해외 가격 (USDT). 김프면 ask, 역김프면 bid 기준. 원화 환산은 `usd_krw_rate` 를 곱하면 된다 |
 | `premium_percent` | **이 방향의 수익률 (%)**. 양수=이득, 음수=손해 |
 | `premium_krw` | 코인 1개당 원화 차익 |
 | `profitable` | `premium_percent > 0` |
@@ -822,7 +823,7 @@ SCAN_EXCLUDED_BASES='["AI","PROS"]' uvicorn app.main:app
   "order": "asc",
   "dom": "upbit",
   "fx_list": ["binance"],
-  "usdt_krw_rate": 1406.0,
+  "usd_krw_rate": 1406.0,
   "rate_updated_at": 1786370137012,
   "scanned_coins": 198,
   "scanned_pairs": 198,
@@ -1161,7 +1162,7 @@ curl "http://localhost:8000/matrix?amount_krw=100000000"
 
 ```
 1. 대상 코인의 저장된 호가를 모두 currency 통화로 환산
-   (국내 거래소는 자기 KRW-USDT 환율, 그 외는 기준 환율)
+   (통일 환율 — 하나은행 고시 USD/KRW — 하나로)
 2. 최우선 매도호가가 가장 싼 곳   → 매수처
    최우선 매수호가가 가장 비싼 곳 → 매도처
 3. 투입 금액만큼 매수처의 asks 를 시장가로 훑음 → 코인 수량
@@ -1198,7 +1199,7 @@ curl "http://localhost:8000/arbitrage?sym=XRP&amount=5000&currency=USDT&exchange
   "sym": "XRP",
   "direction": null,
   "input_amount_krw": 7030000.0,
-  "usdt_krw_rate": 1406.0,
+  "usd_krw_rate": 1406.0,
   "premium_percent": 0.1234,
   "buy": {
     "exchange": "upbit", "name": "업비트",
@@ -1234,7 +1235,7 @@ curl "http://localhost:8000/arbitrage?sym=XRP&amount=5000&currency=USDT&exchange
 |---|---|
 | `direction` | 고정한 방향. `null` 이면 자동 선택 — 실제 경로는 `buy.exchange` → `sell.exchange` |
 | `input_amount_krw` | 투입 금액의 원화 환산 (기준 환율 적용) |
-| `usdt_krw_rate` | 기준 환율. 국내 거래소 호가에는 각 거래소 자기 환율을 우선 쓰고 없으면 이 값으로 폴백 |
+| `usd_krw_rate` | 적용한 통일 환율 (모든 거래소 공통) |
 | `premium_percent` | **표면 프리미엄** — 최우선 호가만 본 가격차 (슬리피지 미반영) |
 | `buy` / `sell` | 매수처 / 매도처 체결 시뮬레이션 (전부 원화 환산) |
 | `quantity` | 매수처에서 매수된 코인 개수 |
@@ -1293,6 +1294,29 @@ curl "http://localhost:8000/arbitrage?sym=XRP&amount=5000&currency=USDT&exchange
 
 ---
 
+### 가격 변동 이력 — /history/coin · /history/fx · /history/sync
+
+김프/역프 통계의 재료인 **초 단위 가격·환율 변동 로그**다. 사용법·백필·운영은
+**[HISTORY.md](HISTORY.md)**, 저장 구조는 **[DB.md](DB.md)** 에 정리돼 있다.
+
+| 엔드포인트 | 무엇을 하나 |
+|---|---|
+| `GET /history/coin?exchange=&base=&unit=week\|month&date=&offset=&limit=` | 코인 가격 변동 로그 — 각 이벤트는 `dt`(직전 변동에서 몇 초 뒤)·`price`·`diff` |
+| `GET /history/fx?unit=&date=&offset=&limit=` | 환율(USD/KRW) 변동 로그 — 같은 형식, 거래소·코인 개념 없음 |
+| `POST /history/sync` | 증분 수집 + 완결된 날 팩킹. 1분 cron 용, `X-Refresh-Token` 적용 |
+
+```bash
+curl "http://localhost:8000/history/coin?exchange=binance&base=BTC&unit=week&limit=20"
+curl "http://localhost:8000/history/fx?unit=month&date=2026-08-01&limit=20"
+```
+
+- DB 는 절대 시각(epoch 초)으로 저장하고, 응답은 상대 시간 차(`dt`)로 준다 —
+  `first_ts` 에 dt 를 누적하면 절대 타임라인이 복원된다.
+- 이력은 업비트·바이낸스만 지원한다 (빗썸 초봉 API 미확인).
+- 과거 3개월 백필: `python -m scripts.backfill_history --bases BTC`
+
+---
+
 ## 6. 에러 응답
 
 모든 에러는 동일한 형태를 갖는다.
@@ -1324,11 +1348,11 @@ curl "http://localhost:8000/arbitrage?sym=XRP&amount=5000&currency=USDT&exchange
 
 ---
 
-## 7. 수집기가 호출하는 원본 거래소 API
+## 7. 수집기가 호출하는 원본 API
 
-`POST /refresh` 한 번에 나가는 호출들이다. 시세·호가는 **모두 인증이 필요 없는
-public API** 이고, 입출금 상태만 거래소에 따라 키가 필요하다
-([8장](#8-api-키--입출금-상태-조회)).
+`POST /refresh` 와 `POST /history/sync` 가 부르는 외부 API 들이다. 시세·호가·
+환율·이력은 **모두 인증이 필요 없는 public API** 이고, 입출금 상태만 거래소에
+따라 키가 필요하다 ([8장](#8-api-키--입출금-상태-조회)).
 
 ### 업비트 · 빗썸 (v1 API 형태가 같다)
 
@@ -1337,7 +1361,6 @@ public API** 이고, 입출금 상태만 거래소에 따라 키가 필요하다
 | KRW 마켓 목록 | `GET /v1/market/all` | 전종목 목록 |
 | 전종목 호가 | `GET /v1/orderbook?markets=A,B,C,...` | 마켓을 나눠 몇 번에 걸쳐 호출. **마켓당 30단계 전부**를 준다 |
 | 전종목 현재가 | `GET /v1/ticker?markets=...` | 마지막 체결가 (`trade_price`) |
-| KRW-USDT 환율 | `GET /v1/ticker?markets=KRW-USDT` | 마지막 체결가를 `krw_rates` 에 저장 |
 
 - Base URL: `https://api.upbit.com` / `https://api.bithumb.com`
   (설정 `UPBIT_BASE_URL` / `BITHUMB_BASE_URL` 로 교체 가능)
@@ -1361,6 +1384,23 @@ public API** 이고, 입출금 상태만 거래소에 따라 키가 필요하다
 - rate limit: **분당 6,000 weight** (IP 기준). `depth limit=100` 은 호출당
   weight 5 — 교집합 200종목이면 refresh 1회에 약 1,000 weight 를 쓴다.
   refresh 를 분당 수 회 이상 돌리지 않는 것이 안전하다.
+
+### 하나은행 (환율 — USD/KRW 고시 매매기준율)
+
+| 용도 | 엔드포인트 | 비고 |
+|---|---|---|
+| 최신/특정 회차 고시 | `POST /cms/rate/wpfxd651_01i_01.do` | HTML 조각 응답 — 고시일시(초 단위)·회차·매매기준율을 파싱. 하루 1,300~2,000회 고시, 15개월+ 과거 조회 가능. 키 불필요 |
+
+- Base URL: `https://www.kebhana.com` (설정 `HANA_FX_BASE_URL`)
+- 파라미터·파싱 상세는 `app/history/hana.py` 모듈 docstring 참고.
+
+### 변동 이력 수집 (`POST /history/sync` · 백필)
+
+| 원천 | 엔드포인트 | 비고 |
+|---|---|---|
+| 업비트 초봉 | `GET /v1/candles/seconds?market=KRW-BTC&count=200&to=...` | 체결 있던 초만 캔들 존재. **보관 3개월 롤링**, 요청당 200개, candles 그룹 10 req/s |
+| 바이낸스 1초봉 | `GET /api/v3/klines?symbol=BTCUSDT&interval=1s&limit=1000&startTime=...` | 전체 이력, 요청당 1000개, weight 2/호출 |
+| 하나은행 고시 | 위와 동일 | sync 는 최신 1건 폴링, 백필은 회차 루프 |
 
 ### 입출금 상태
 
@@ -1491,8 +1531,8 @@ inspect.getmembers()       모듈 안의 클래스를 훑음
 조건은 따로 있다.**
 
 - **국내 거래소** — `is_domestic = True` 여야 한다. 수집기가 KRW 전종목
-  일괄 조회(`fetch_bulk_orderbooks` / `fetch_bulk_quotes`)와 KRW-USDT 환율
-  수집 대상에 자동으로 포함한다.
+  일괄 조회(`fetch_bulk_orderbooks` / `fetch_bulk_quotes`) 대상에 자동으로
+  포함한다. (환율은 거래소가 아니라 하나은행에서 온다)
 - **해외 거래소** — 현재 수집기는 바이낸스만 해외 수집 경로로 다룬다. 새 해외
   거래소를 수집하려면 `collector_service` 의 해외 수집 단계 확장이 필요하다.
 - 입출금 상태를 채우려면 `wallet_status.py` 에 조회 함수를 추가하고
