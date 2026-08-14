@@ -1,4 +1,8 @@
-"""슬리피지 라우터 — DB 스냅샷 호가 기반."""
+"""슬리피지 라우터 — DB 스냅샷 호가 기반.
+
+테스트 예시 (업비트 BTC 1천만원 매수 시 슬리피지):
+    http://3.34.104.16:8000/slippage/upbit?symbol=BTC/KRW&amount=10000000
+"""
 
 from __future__ import annotations
 

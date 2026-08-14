@@ -1,4 +1,8 @@
-"""거래소 메타데이터 라우터."""
+"""거래소 메타데이터 라우터.
+
+테스트 예시:
+    http://3.34.104.16:8000/exchanges
+"""
 
 from __future__ import annotations
 
