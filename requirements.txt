@@ -6,3 +6,5 @@ pydantic-settings>=2.5.0
 sqlalchemy[asyncio]>=2.0.36
 asyncpg>=0.30.0
 PyJWT>=2.9.0
+# 가격 변동 이력 압축 (app/history/codec.py)
+zstandard>=0.23.0

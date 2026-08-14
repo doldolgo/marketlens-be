@@ -14,7 +14,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import MarketDataNotFoundError
-from app.db.models import KrwRate, MarketSnapshot
+from app.db.models import FxRate, KrwRate, MarketSnapshot
 from app.models.orderbook import MarketType, OrderBook, OrderBookLevel
 
 
@@ -93,28 +93,43 @@ async def replace_exchange_snapshots(
     return len(rows), result.rowcount or 0
 
 
-async def upsert_krw_rate(
+async def upsert_fx_rate(
     session: AsyncSession,
     *,
-    exchange: str,
     rate: float,
-    native_symbol: str,
-    price_timestamp: int,
+    source_time: int,
+    round_no: int,
 ) -> None:
-    """국내 거래소 하나의 KRW-USDT 환율을 저장한다."""
+    """통일 환율(하나은행 USD/KRW 매매기준율) 단일 행을 갱신한다.
+
+    예전의 거래소별 KRW-USDT 환율(``krw_rates``)을 대체한다 — 이제 모든
+    원화 환산 계산이 이 한 행을 쓴다.
+
+    UPSERT 의 WHERE 절로 **더 오래된 고시가 최신 값을 덮어쓰는 것을 막는다**
+    (refresh 와 /history/sync 가 동시에 돌 때의 역전 방지). 같은 고시 시각의
+    재수신은 허용해 값이 항상 최소한 갱신 가능 상태를 유지한다.
+    """
+    dialect = session.get_bind().dialect.name
+    stmt = (pg_insert if dialect == "postgresql" else sqlite_insert)(FxRate).values(
+        [
+            {
+                "id": 1,
+                "rate": rate,
+                "source_time": source_time,
+                "round_no": round_no,
+            }
+        ]
+    )
     await session.execute(
-        _upsert(
-            session,
-            KrwRate,
-            [
-                {
-                    "exchange": exchange,
-                    "rate": rate,
-                    "native_symbol": native_symbol,
-                    "price_timestamp": price_timestamp,
-                }
-            ],
-            ["exchange"],
+        stmt.on_conflict_do_update(
+            index_elements=["id"],
+            set_={
+                "rate": stmt.excluded.rate,
+                "source_time": stmt.excluded.source_time,
+                "round_no": stmt.excluded.round_no,
+                "updated_at": func.now(),
+            },
+            where=FxRate.source_time <= stmt.excluded.source_time,
         )
     )
 
@@ -160,6 +175,48 @@ async def require_snapshot(
             detail={"exchange": exchange, "base": base.upper()},
         )
     return snap
+
+
+async def get_fx_rate(session: AsyncSession) -> FxRate | None:
+    """통일 환율(USD/KRW 매매기준율). 아직 수집 전이면 None."""
+    return await session.get(FxRate, 1)
+
+
+async def require_fx_rate(session: AsyncSession) -> FxRate:
+    """통일 환율을 가져오되, 없거나 0 이하면 도메인 예외를 던진다."""
+    rate = await get_fx_rate(session)
+    if rate is None or rate.rate <= 0:
+        raise MarketDataNotFoundError(
+            "DB 에 USD/KRW 환율이 없습니다. "
+            "POST /refresh 또는 POST /history/sync 로 수집했는지 확인하세요.",
+        )
+    return rate
+
+
+async def upsert_krw_rate(
+    session: AsyncSession,
+    *,
+    exchange: str,
+    rate: float,
+    native_symbol: str,
+    price_timestamp: int,
+) -> None:
+    """국내 거래소 하나의 KRW-USDT 환율을 저장한다."""
+    await session.execute(
+        _upsert(
+            session,
+            KrwRate,
+            [
+                {
+                    "exchange": exchange,
+                    "rate": rate,
+                    "native_symbol": native_symbol,
+                    "price_timestamp": price_timestamp,
+                }
+            ],
+            ["exchange"],
+        )
+    )
 
 
 async def get_krw_rates(session: AsyncSession) -> list[KrwRate]:
