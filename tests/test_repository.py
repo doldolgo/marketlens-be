@@ -11,9 +11,9 @@ from app.db.models import MarketSnapshot
 from app.models.orderbook import MarketType
 
 
-class TestReplaceExchangeSnapshots:
+class TestUpsertExchangeSnapshots:
     async def test_inserts_rows(self, db) -> None:
-        saved, deleted = await repository.replace_exchange_snapshots(
+        saved = await repository.upsert_exchange_snapshots(
             db,
             "upbit",
             [
@@ -23,13 +23,13 @@ class TestReplaceExchangeSnapshots:
         )
         await db.commit()
 
-        assert (saved, deleted) == (2, 0)
+        assert saved == 2
         snaps = await repository.get_snapshots(db, exchange="upbit")
         assert {s.base for s in snaps} == {"BTC", "ETH"}
 
-    async def test_upserts_existing_and_deletes_missing(self, db) -> None:
-        """있던 코인은 갱신되고, 이번 수집에 없는 코인(상장폐지)은 지워진다."""
-        await repository.replace_exchange_snapshots(
+    async def test_updates_in_place_and_keeps_missing(self, db) -> None:
+        """코인을 찾아 갱신만 한다 — 이번 수집에 없는 코인도 지우지 않는다."""
+        await repository.upsert_exchange_snapshots(
             db,
             "upbit",
             [
@@ -39,37 +39,33 @@ class TestReplaceExchangeSnapshots:
         )
         await db.commit()
 
-        saved, deleted = await repository.replace_exchange_snapshots(
+        saved = await repository.upsert_exchange_snapshots(
             db,
             "upbit",
             [snapshot_row("upbit", "BTC", 101_000_000.0, deposit=False)],
         )
         await db.commit()
 
-        assert (saved, deleted) == (1, 1)
-        snaps = await repository.get_snapshots(db, exchange="upbit")
-        assert [s.base for s in snaps] == ["BTC"]
-        assert snaps[0].price == 101_000_000.0  # UPSERT 로 가격이 갱신됐다
-        assert snaps[0].deposit_enabled is False  # 입출금 플래그도 갱신됐다
+        assert saved == 1
+        snaps = {
+            s.base: s for s in await repository.get_snapshots(db, exchange="upbit")
+        }
+        assert set(snaps) == {"BTC", "DOGE"}  # DOGE 는 남아 있다 (삭제 없음)
+        assert snaps["BTC"].price == 101_000_000.0  # UPSERT 로 가격이 갱신됐다
+        assert snaps["BTC"].deposit_enabled is False  # 입출금 플래그도 갱신됐다
 
-    async def test_empty_rows_deletes_whole_exchange_only(self, db) -> None:
-        """빈 수집 결과는 그 거래소 행 전체를 지우되 다른 거래소는 건드리지 않는다."""
-        await repository.replace_exchange_snapshots(
+    async def test_empty_rows_touch_nothing(self, db) -> None:
+        """빈 수집 결과는 아무것도 저장하지도, 지우지도 않는다."""
+        await repository.upsert_exchange_snapshots(
             db, "upbit", [snapshot_row("upbit", "BTC", 100_000_000.0)]
         )
-        await repository.replace_exchange_snapshots(
-            db,
-            "binance",
-            [snapshot_row("binance", "BTC", 71_000.0, quote="USDT")],
-        )
         await db.commit()
 
-        saved, deleted = await repository.replace_exchange_snapshots(db, "upbit", [])
+        saved = await repository.upsert_exchange_snapshots(db, "upbit", [])
         await db.commit()
 
-        assert (saved, deleted) == (0, 1)
-        assert await repository.get_snapshots(db, exchange="upbit") == []
-        assert len(await repository.get_snapshots(db, exchange="binance")) == 1
+        assert saved == 0
+        assert len(await repository.get_snapshots(db, exchange="upbit")) == 1
 
 
 class TestFxRate:
@@ -106,7 +102,7 @@ class TestFxRate:
 
 class TestQueries:
     async def _seed(self, db) -> None:
-        await repository.replace_exchange_snapshots(
+        await repository.upsert_exchange_snapshots(
             db,
             "upbit",
             [
@@ -114,7 +110,7 @@ class TestQueries:
                 snapshot_row("upbit", "ETH", 5_000_000.0),
             ],
         )
-        await repository.replace_exchange_snapshots(
+        await repository.upsert_exchange_snapshots(
             db,
             "binance",
             [snapshot_row("binance", "BTC", 71_000.0, quote="USDT")],

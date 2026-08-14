@@ -10,24 +10,23 @@
 수집 엔드포인트 두 개뿐이고, 나머지 모든 API 는 DB 만 읽어 계산한다.
 
 ```
- ┌────────────── 수집 (거래소를 부르는 유일한 경로들) ──────────────┐
- │                                                                 │
- │  POST /refresh ──▶ 업비트·빗썸·바이낸스 시세/호가 + 하나은행 환율  │
- │       │                                                          │
- │       ▼            라이브 (현재 상태 — 매번 덮어씀)               │
- │  PostgreSQL ── market_snapshots  거래소×코인: 현재가·호가·입출금  │
- │             └─ fx_rate           통일 환율 (하나은행 USD/KRW) 1행 │
- │                                                                  │
- │  POST /history/sync ──▶ 초 단위 가격·환율 "변동 이벤트" 수집       │
- │       │                                                          │
- │       ▼            이력 (변동 로그 — 계속 쌓임)                   │
- │  PostgreSQL ── price_points/chunks  코인 가격 변동 (압축 저장)    │
- │             └─ fx_points/chunks     환율 변동                     │
- └──────────────────────────────────────────────────────────────────┘
+ ┌────────────── 수집 (외부를 부르는 유일한 경로) ────────────────────┐
+ │                                                                   │
+ │  POST /refresh ──▶ 업비트·빗썸·바이낸스 시세/호가 + 하나은행 환율   │
+ │       │                                                           │
+ │       ├─▶ market_snapshots  거래소×코인: 현재가·호가·입출금 (UPSERT)│
+ │       ├─▶ fx_rate           통일 환율 (하나은행 USD/KRW) 1행       │
+ │       ├─▶ premium_archive   갱신 직후 김프/역프 계산해 기록 추가    │
+ │       └─▶ platform_status   플랫폼당 1행 — 수신 시각·실패율 카운터  │
+ │                                                                   │
+ │  scripts/bulk_archive.py ──▶ 아카이브 밖 과거 구간을 거래소         │
+ │                              캔들(초 단위)로 계산해 대량 채움       │
+ └───────────────────────────────────────────────────────────────────┘
         ▲
-        └────────── 조회 (거래소 호출 없음, DB 만 읽음) ──────────────
-   GET /rate /orderbook /compare /premium* /spreads /slippage /matrix
-       /arbitrage /history/coin /history/fx
+        └────────── 조회 (외부 호출 없음, DB 만 읽음) ─────────────────
+   실시간 스프레드 창: GET /spreads /rate /orderbook /compare /premium*
+                       /slippage /matrix /arbitrage
+   기록/통계 창:       GET /history/premium /history/status
 ```
 
 원칙 세 가지:
@@ -37,8 +36,9 @@
   하나은행 고시 USD/KRW)을 곱해서 한다.
 - **신선도는 응답이 알려준다** — 조회 API 는 데이터가 오래돼도 그대로 계산하고,
   `data_oldest_at` / `updated_at` 계열 필드로 언제 데이터인지 표시한다.
-- **이력은 변동만, 무손실 압축으로** — 가격이 변한 순간만 저장하고 완결된
-  하루는 압축 청크로 굳힌다 (건당 ~1바이트, 100% 복원 검증됨).
+- **스냅샷은 갱신, 기록은 누적** — market_snapshots 는 코인을 찾아 UPSERT 만
+  하고(삭제 없음), 김프/역프 기록(premium_archive)은 계속 쌓인다
+  (압축 없이 일반 행 — 용량이 문제가 되면 그때 재검토).
 
 테이블은 앱 기동 시 자동 생성된다 (별도 마이그레이션 불필요).
 
@@ -67,8 +67,8 @@ Swagger UI: http://localhost:8000/docs — 전 엔드포인트를 화면에서 �
 | 문서 | 내용 |
 |---|---|
 | **[docs/API.md](docs/API.md)** | 전체 API 명세 — 엔드포인트, 파라미터, 응답, 에러, 거래소 추가법 |
-| **[docs/DB.md](docs/DB.md)** | DB 구조 — 테이블·컬럼·단위, 압축 원리와 검증, 읽기 뷰 |
-| **[docs/HISTORY.md](docs/HISTORY.md)** | 변동 이력 시스템 — 조회 API 사용법, 백필, 운영 |
+| **[docs/DB.md](docs/DB.md)** | DB 구조 — 테이블·컬럼·단위, 읽기 뷰 |
+| **[docs/HISTORY.md](docs/HISTORY.md)** | 김프/역프 기록 시스템 — 조회 API, 대량 채우기, 운영 |
 | **[docs/DEPLOY.md](docs/DEPLOY.md)** | 배포 — EC2+RDS 초기 설정, crontab, 마이그레이션 |
 | **[docs/ROADMAP.md](docs/ROADMAP.md)** | 단계별 구현 계획 |
 
@@ -79,17 +79,15 @@ app/
 ├── main.py                 # FastAPI 앱 · lifespan(HTTP 풀 + DB 엔진) · 예외 핸들러
 ├── core/                   # 설정 · 공용 HTTP 클라이언트 · 도메인 예외
 ├── db/
-│   ├── models.py           # 테이블 정의 (라이브 2개 + 이력 5개)
+│   ├── models.py           # 테이블 정의 (스냅샷·환율·김프 기록·플랫폼 상태)
 │   ├── views.py            # 사람이 읽는 DB 뷰 (연도 포함 KST 시각)
 │   ├── database.py         # 비동기 엔진·세션, 기동 시 테이블·뷰 생성
 │   └── repository.py       # 라이브 테이블 읽기·쓰기의 단일 창구
-├── history/                # ★ 가격 변동 이력 서브시스템
-│   ├── codec.py            #   무손실 압축 코덱 (델타+varint+zstd)
-│   ├── upbit.py            #   업비트 초봉 수집기
+├── history/                # ★ 김프/역프 기록(아카이브) 서브시스템
+│   ├── upbit.py            #   업비트 초봉 수집기 (대량 채우기용)
 │   ├── binance.py          #   바이낸스 1초봉 수집기
 │   ├── hana.py             #   하나은행 고시환율 수집기
-│   ├── store.py            #   이력 테이블 읽기·쓰기 창구
-│   └── service.py          #   변동 축약 · 팩킹 · 증분 sync
+│   └── service.py          #   김프 계산식 · 대량 채우기 로직
 ├── models/                 # 응답 도메인 모델 (pydantic)
 ├── exchanges/
 │   ├── registry.py         # connectors/ 자동 스캔 → ID: 인스턴스 매핑
@@ -98,7 +96,7 @@ app/
 ├── services/               # 계산 로직 (수집기 · 김프 · 스캔 · 슬리피지 · 차익 ...)
 └── api/routes/             # HTTP 라우터 (모듈 docstring 에 테스트 URL 예시)
 scripts/
-└── backfill_history.py     # 변동 이력 3개월 백필 (재개 가능)
+└── bulk_archive.py         # 김프 기록 대량 채우기 (아카이브 밖 구간, 재개 가능)
 ```
 
 **새 거래소 추가는 `connectors/` 에 파일 하나만 만들면 끝.** 레지스트리가

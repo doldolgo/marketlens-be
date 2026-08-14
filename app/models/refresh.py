@@ -9,8 +9,13 @@ class ExchangeRefreshStat(BaseModel):
     """거래소 하나의 갱신 결과."""
 
     exchange: str = Field(..., description="거래소 ID")
-    saved: int = Field(..., description="저장(UPSERT)한 코인 수")
-    deleted: int = Field(..., description="이번 수집에 없어서 지운 코인 수")
+    saved: int = Field(
+        ...,
+        description=(
+            "저장(UPSERT)한 코인 수. 이번 수집에 빠진 코인도 지우지 않는다 — "
+            "코인을 찾아 갱신만 하며, 낡은 행은 updated_at 으로 판별한다"
+        ),
+    )
     wallet_status_available: bool = Field(
         ...,
         description=(
@@ -54,6 +59,13 @@ class RefreshResult(BaseModel):
         ),
     )
     total_saved: int = Field(0, description="저장한 전체 행 수")
+    archived: int = Field(
+        0,
+        description=(
+            "이번 회차에 김프/역프 기록(premium_archive)으로 남긴 행 수 — "
+            "(국내 거래소 × 코인) 조합마다 한 줄"
+        ),
+    )
 
     failures: list[RefreshFailure] = Field(
         default_factory=list, description="수집 실패 항목"

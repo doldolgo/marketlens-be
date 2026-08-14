@@ -1,20 +1,13 @@
 """사람이 읽는 DB 뷰 — GUI 뷰어(Beekeeper/Adminer/psql)용.
 
-이력 테이블의 시각은 epoch 초(BIGINT)로 저장된다 — 연도까지 담긴 완전한
-시각이지만 숫자 그대로는 읽기 어렵다. 그래서 **저장은 epoch 그대로 두고**,
-연도가 포함된 KST 시각과 스케일이 풀린 실제 가격을 보여주는 읽기 전용 뷰를
-같이 만들어 둔다. 뷰는 저장 공간을 차지하지 않고 원본 테이블을 실시간으로
-비춰줄 뿐이다.
+시각은 epoch 초(BIGINT)로 저장된다 — 연도까지 담긴 완전한 시각이지만 숫자
+그대로는 읽기 어렵다. 그래서 **저장은 epoch 그대로 두고**, 연도가 포함된
+KST 시각으로 보여주는 읽기 전용 뷰를 같이 만들어 둔다. 뷰는 저장 공간을
+차지하지 않고 원본 테이블을 실시간으로 비춰줄 뿐이다.
 
-    v_price_points    스테이징 이벤트 — time_kst 로 "2026-08-12 09:00:00+09" 표기
-    v_fx_points       환율 스테이징 이벤트
-    v_price_chunks    청크 요약 — 시각·시/종/저/고가를 실제 단위로 풀어서
-    v_fx_chunks       환율 청크 요약
-    v_history_cursors 수집 커서
-    v_fx_rate         라이브 환율 (고시 시각 포함)
-
-가격 단위 규칙 (points/chunks 공통): ``exchange`` 가 단위를 결정한다 —
-upbit 행은 KRW, binance 행은 USDT, 환율(fx_*)은 원/달러.
+    v_premium_archive   김프/역프 기록 — time_kst 로 "2026-08-14 09:00:00" 표기
+    v_platform_status   플랫폼 상태 — 마지막 수신 시각(KST) + 입출금 실패율
+    v_fx_rate           라이브 환율 (고시 시각 포함)
 
 PostgreSQL 전용이다 (테스트용 SQLite 에서는 만들지 않는다).
 """
@@ -24,65 +17,31 @@ from __future__ import annotations
 #: 앱 기동 시 CREATE OR REPLACE 되는 뷰 정의 목록.
 #: 원본 테이블 스키마가 바뀌면 여기도 같이 고친다.
 VIEW_DDL: list[str] = [
-    # 스테이징 이벤트 — 변동 시각을 연도 포함 KST 로
     """
-    CREATE OR REPLACE VIEW v_price_points AS
-    SELECT exchange,
+    CREATE OR REPLACE VIEW v_premium_archive AS
+    SELECT dom,
+           fx,
            base,
            to_timestamp(ts) AT TIME ZONE 'Asia/Seoul' AS time_kst,
            ts,
-           price
-    FROM price_points
+           round(fwd::numeric, 4) AS fwd_percent,
+           round(rev::numeric, 4) AS rev_percent
+    FROM premium_archive
     """,
     """
-    CREATE OR REPLACE VIEW v_fx_points AS
-    SELECT to_timestamp(ts) AT TIME ZONE 'Asia/Seoul' AS time_kst,
-           ts,
-           price AS usd_krw
-    FROM fx_points
-    """,
-    # 청크 요약 — 압축 blob 은 빼고, 시각과 가격을 사람 단위로 풀어서
-    """
-    CREATE OR REPLACE VIEW v_price_chunks AS
+    CREATE OR REPLACE VIEW v_platform_status AS
     SELECT exchange,
-           base,
-           day,
-           n_points,
-           to_timestamp(first_ts) AT TIME ZONE 'Asia/Seoul' AS first_time_kst,
-           to_timestamp(last_ts)  AT TIME ZONE 'Asia/Seoul' AS last_time_kst,
-           round(first_price / power(10::numeric, price_scale), price_scale) AS open_price,
-           round(last_price  / power(10::numeric, price_scale), price_scale) AS close_price,
-           round(min_price   / power(10::numeric, price_scale), price_scale) AS low_price,
-           round(max_price   / power(10::numeric, price_scale), price_scale) AS high_price,
-           length(data) AS blob_bytes,
-           codec,
-           price_scale
-    FROM price_chunks
-    """,
-    """
-    CREATE OR REPLACE VIEW v_fx_chunks AS
-    SELECT day,
-           n_points,
-           to_timestamp(first_ts) AT TIME ZONE 'Asia/Seoul' AS first_time_kst,
-           to_timestamp(last_ts)  AT TIME ZONE 'Asia/Seoul' AS last_time_kst,
-           round(first_price / power(10::numeric, price_scale), price_scale) AS open_rate,
-           round(last_price  / power(10::numeric, price_scale), price_scale) AS close_rate,
-           round(min_price   / power(10::numeric, price_scale), price_scale) AS low_rate,
-           round(max_price   / power(10::numeric, price_scale), price_scale) AS high_rate,
-           length(data) AS blob_bytes,
-           codec,
-           price_scale
-    FROM fx_chunks
-    """,
-    """
-    CREATE OR REPLACE VIEW v_history_cursors AS
-    SELECT exchange,
-           base,
-           to_timestamp(last_ts) AT TIME ZONE 'Asia/Seoul' AS last_time_kst,
-           last_ts,
-           last_price,
+           to_timestamp(last_received_ts) AT TIME ZONE 'Asia/Seoul'
+               AS last_received_kst,
+           spot_market_count,
+           futures_market_count,
+           dw_fail_count,
+           update_count,
+           CASE WHEN update_count > 0
+                THEN round(dw_fail_count::numeric / update_count, 4)
+                ELSE 0 END AS dw_fail_rate,
            updated_at
-    FROM history_cursors
+    FROM platform_status
     """,
     """
     CREATE OR REPLACE VIEW v_fx_rate AS
@@ -92,4 +51,20 @@ VIEW_DDL: list[str] = [
            updated_at
     FROM fx_rate
     """,
+]
+
+#: 이전 구조(압축 이력)의 뷰·테이블 — 앱 기동 시 있으면 정리한다.
+#: (테이블 자동 생성은 "없는 것만 만들기"라 옛것을 지워주지 않는다)
+CLEANUP_DDL: list[str] = [
+    "DROP VIEW IF EXISTS v_price_points",
+    "DROP VIEW IF EXISTS v_fx_points",
+    "DROP VIEW IF EXISTS v_price_chunks",
+    "DROP VIEW IF EXISTS v_fx_chunks",
+    "DROP VIEW IF EXISTS v_history_cursors",
+    "DROP TABLE IF EXISTS price_points",
+    "DROP TABLE IF EXISTS price_chunks",
+    "DROP TABLE IF EXISTS fx_points",
+    "DROP TABLE IF EXISTS fx_chunks",
+    "DROP TABLE IF EXISTS history_cursors",
+    "DROP TABLE IF EXISTS krw_rates",
 ]

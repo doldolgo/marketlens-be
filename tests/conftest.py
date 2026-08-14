@@ -105,7 +105,7 @@ def snapshot_row(
 
 
 async def seed_rows(session, exchange: str, rows: list[SnapshotRow]) -> None:
-    await repository.replace_exchange_snapshots(session, exchange, rows)
+    await repository.upsert_exchange_snapshots(session, exchange, rows)
     await session.commit()
 
 

@@ -2,7 +2,7 @@
 
 이 백엔드에서 거래소 API 를 실제로 호출하는 엔드포인트는 이것 하나다.
 나머지 모든 조회 API 는 여기서 저장한 DB 를 읽는다.
-(가격 "변동 이력" 의 증분 수집은 별도의 POST /history/sync 가 담당한다)
+김프/역프 기록(premium_archive)과 플랫폼 상태(platform_status)도 이때 함께 갱신된다.
 
 테스트 예시:
     curl -X POST -H "X-Refresh-Token: <토큰>" http://3.34.104.16:8000/refresh
@@ -56,7 +56,7 @@ def _check_refresh_token(
         "| KRW 전종목 현재가 + 호가 | 업비트 · 빗썸 (일괄 조회) | `market_snapshots` |\n"
         "| USDT 마켓 현재가 + 호가 | 바이낸스 (국내 상장 코인만, 심볼별) | `market_snapshots` |\n"
         "| 입출금 가능 여부 | 업비트 · 바이낸스 (API 키 필요) · 빗썸 (public) | `market_snapshots` |\n"
-        "| USD/KRW 환율 | 하나은행 고시 (매매기준율) | `fx_rate` + `fx_points` |\n\n"
+        "| USD/KRW 환율 | 하나은행 고시 (매매기준율) | `fx_rate` |\n\n"
         "가격과 호가는 **환산 없이 그 거래소 통화 그대로** 저장된다 "
         "(업비트·빗썸 = KRW, 바이낸스 = USDT). 원화 환산은 조회 시점에 "
         "`fx_rate` (하나은행 고시 USD/KRW) 를 곱해서 한다. 수집한 최신 고시는 "

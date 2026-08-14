@@ -1,13 +1,12 @@
 """환율 라우터 — DB 에 저장된 통일 환율(USD/KRW) 조회.
 
-거래소를 직접 호출하지 않는다. ``POST /refresh`` (또는 ``POST /history/sync``)
-가 ``fx_rate`` 테이블에 저장해둔 **하나은행 고시 매매기준율**을 읽어서
+거래소를 직접 호출하지 않는다. ``POST /refresh`` 가 ``fx_rate`` 테이블에 저장해둔 **하나은행 고시 매매기준율**을 읽어서
 반환할 뿐이다.
 
 예전에는 국내 거래소별 KRW-USDT 마켓 시세를 환율로 썼지만, 그 값에는
 테더 프리미엄이 섞여 있어 "은행 환율 기준 김프" 와 어긋난다. 지금은 모든
 계산이 이 은행 고시 환율 하나로 통일됐다. 과거 환율이 필요하면
-``GET /history/fx`` 를 쓴다.
+``GET /history/premium``(김프 기록)을 쓴다.
 
 테스트 예시:
     http://3.34.104.16:8000/rate        (배포 서버)
@@ -58,7 +57,7 @@ class RateResponse(BaseModel):
     description=(
         "원화 환산에 쓰는 **통일 환율**을 DB 에서 조회한다.\n\n"
         "값은 **하나은행 고시 USD/KRW 매매기준율**이다. 은행은 하루 "
-        "1,300~2,000회 고시하며, `POST /refresh` 와 `POST /history/sync` 가 "
+        "1,300~2,000회 고시하며, `POST /refresh` 가 "
         "최신 고시를 저장한다. `source_time` 이 은행 고시 시각, `updated_at` "
         "이 저장 시각이다.\n\n"
         "### 예전과 달라진 점\n\n"
@@ -66,7 +65,7 @@ class RateResponse(BaseModel):
         "그 값에는 **테더 프리미엄**이 섞여 있어 거래소마다 다르고, 은행 환율 "
         "기준의 김프와 어긋난다. 지금은 은행 고시 환율 하나로 통일됐고 "
         "`exchange` 파라미터도 없어졌다.\n\n"
-        "과거 환율의 변동 이력은 `GET /history/fx` 로 조회한다."
+        "과거 김프/역프 기록은 `GET /history/premium` 으로 조회한다."
     ),
 )
 async def get_rate(
