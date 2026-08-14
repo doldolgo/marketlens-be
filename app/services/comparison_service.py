@@ -1,13 +1,13 @@
 """거래소 간 가격 비교 서비스 — DB 스냅샷 기반.
 
 거래소를 직접 호출하지 않는다. ``POST /refresh`` 가 저장해둔
-``market_snapshots`` / ``krw_rates`` 를 읽어서만 계산한다.
+``market_snapshots`` / ``fx_rate`` 를 읽어서만 계산한다.
 
 동작 순서
     1. 요청받은 코인의 스냅샷을 DB 에서 전부 읽는다 (거래소 필터 적용).
     2. 각 행의 가격(마지막 체결가)을 공통 통화로 환산한다.
-       - KRW 기준: USDT 행에 기준 국내 거래소(업비트) 환율을 곱한다.
-       - USDT 기준: KRW 행을 그 국내 거래소 자기 환율로 나눈다 (없으면 기준 환율).
+       - KRW 기준: USDT 행에 통일 환율(하나은행 고시 USD/KRW)을 곱한다.
+       - USDT 기준: KRW 행을 같은 통일 환율로 나눈다.
     3. 최저 매수처 / 최고 매도처를 찾아 스프레드를 계산한다.
 """
 
@@ -18,10 +18,9 @@ from datetime import datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
 from app.core.errors import InvalidRequestError, MarketDataNotFoundError
 from app.db import repository
-from app.db.models import KrwRate, MarketSnapshot
+from app.db.models import MarketSnapshot
 from app.exchanges.registry import get_exchange
 from app.models.comparison import ArbitrageSpread, ComparisonResult, ExchangeQuote
 
@@ -40,36 +39,29 @@ class ComparisonService:
         self,
         snap: MarketSnapshot,
         currency: str,
-        rates: dict[str, KrwRate],
-        reference_rate: KrwRate | None,
+        fx_rate: float | None,
     ) -> tuple[float, float | None]:
         """(환산 계수, 적용 환율) 을 구한다.
 
         계수를 원래 통화 가격에 곱하면 공통 통화 가격이 된다.
+        환율은 통일 환율(하나은행 고시 USD/KRW) 하나다.
 
         Raises:
-            MarketDataNotFoundError: 환산이 필요한데 DB 에 환율이 없는 경우.
+            MarketDataNotFoundError: 환산이 필요한데 DB 에 유효한 환율이 없는 경우.
         """
         if snap.quote == currency:
             return 1.0, None
 
-        if currency == "KRW":
-            # USDT 행 → KRW: 기준 국내 거래소 환율을 곱한다.
-            rate = reference_rate
-        else:
-            # KRW 행 → USDT: 그 국내 거래소 자기 환율로 나눈다. 없으면 기준 환율.
-            rate = rates.get(snap.exchange) or reference_rate
-
         # 수집기가 0 이하 환율을 저장하지 않지만, 수동으로 오염된 DB 에서도
         # ZeroDivisionError 500 대신 명확한 404 가 나가도록 방어한다.
-        if rate is None or rate.rate <= 0:
+        if fx_rate is None or fx_rate <= 0:
             raise MarketDataNotFoundError(
-                "DB 에 유효한 KRW-USDT 환율이 없어 통화를 환산할 수 없습니다. "
+                "DB 에 유효한 USD/KRW 환율이 없어 통화를 환산할 수 없습니다. "
                 "먼저 POST /refresh 로 수집하세요.",
                 detail={"exchange": snap.exchange, "quote": snap.quote},
             )
-        factor = rate.rate if currency == "KRW" else 1.0 / rate.rate
-        return factor, rate.rate
+        factor = fx_rate if currency == "KRW" else 1.0 / fx_rate
+        return factor, fx_rate
 
     def _to_quote(self, snap: MarketSnapshot, factor: float) -> ExchangeQuote:
         """스냅샷 한 행을 공통 통화로 환산한 ExchangeQuote 로 변환한다."""
@@ -161,10 +153,9 @@ class ComparisonService:
                 detail={"base": base.upper(), "missing_exchanges": missing},
             )
 
-        rates = {r.exchange: r for r in await repository.get_krw_rates(session)}
-        reference_rate = rates.get(settings.krw_reference_exchange) or (
-            next(iter(rates.values())) if rates else None
-        )
+        # 통일 환율 — 아직 수집 전이면 None (환산이 필요할 때만 예외가 난다).
+        fx_row = await repository.get_fx_rate(session)
+        fx_rate = fx_row.rate if fx_row is not None else None
 
         quotes: list[ExchangeQuote] = []
         oldest: datetime | None = None
@@ -174,7 +165,7 @@ class ComparisonService:
             if snap.quote not in _CONVERTIBLE:
                 continue  # BTC 마켓 등 — 현재 수집기는 저장하지 않는다
 
-            factor, _ = self._conversion(snap, currency, rates, reference_rate)
+            factor, _ = self._conversion(snap, currency, fx_rate)
             quotes.append(self._to_quote(snap, factor))
 
             if snap.updated_at is None:
@@ -189,8 +180,7 @@ class ComparisonService:
         return ComparisonResult(
             sym=base.upper(),
             common_currency=currency,
-            usdt_krw_rate=reference_rate.rate if reference_rate else None,
-            rate_exchange=reference_rate.exchange if reference_rate else None,
+            usd_krw_rate=fx_rate,
             quotes=quotes,
             missing_exchanges=missing,
             spread=self._build_spread(quotes),

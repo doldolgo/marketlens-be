@@ -4,7 +4,8 @@
 
 거래소를 직접 호출하지 않는다. ``POST /refresh`` 가 저장해둔
 ``market_snapshots`` 에서 **국내(KRW) 전종목 × 해외(USDT) 스냅샷의 교집합**을
-돌며 두 방향의 수익률을 조합마다 계산한다. 환율도 ``krw_rates`` 저장값이다.
+돌며 두 방향의 수익률을 조합마다 계산한다. 환율은 통일 환율(``fx_rate``,
+하나은행 고시 USD/KRW 매매기준율) 하나다.
 
 수익률 계산식은 `/premium/fwd` · `/premium/rev` 와 **완전히 동일**하다.
 가격은 체결되는 쪽 호가를 쓴다 — 살 때 매도호가(ask), 팔 때 매수호가(bid).
@@ -29,7 +30,7 @@ from app.models.ticker import PriceSide
 from app.services.premium_service import (
     exchange_name,
     premium_service,
-    resolve_krw_rate,
+    resolve_fx_rate,
     resolve_side,
 )
 
@@ -71,7 +72,7 @@ class ScanService:
         domestic_side: PriceSide,
         ovs_snap: MarketSnapshot,
         overseas_side: PriceSide,
-        usdt_krw_rate: float,
+        usd_krw_rate: float,
     ) -> ScanEntry | None:
         """한 조합의 프리미엄을 계산한다. 값이 부족하면 None."""
         dom = _pick(dom_snap, domestic_side)
@@ -81,7 +82,7 @@ class ScanService:
 
         domestic_price, domestic_size = dom
         overseas_price, overseas_size = ovs
-        overseas_krw = overseas_price * usdt_krw_rate
+        overseas_krw = overseas_price * usd_krw_rate
 
         # /premium 과 동일한 공식
         if direction is PremiumDirection.FWD:
@@ -149,7 +150,7 @@ class ScanService:
         started = time.perf_counter()
 
         domestic_id = premium_service.resolve_domestic(domestic)
-        rate = await resolve_krw_rate(session, domestic_id)
+        rate = await resolve_fx_rate(session)
 
         # 스냅샷 전체를 한 번에 읽어 국내(KRW)와 해외(USDT)로 나눈다.
         snapshots = await repository.get_snapshots(session)
@@ -302,7 +303,7 @@ class ScanService:
             order=order,
             dom=domestic_id,
             fx_list=overseas_ids,
-            usdt_krw_rate=rate.rate,
+            usd_krw_rate=rate.rate,
             rate_updated_at=_epoch_ms(rate.updated_at),
             scanned_coins=len(coins),
             scanned_pairs=pairs,

@@ -1,6 +1,6 @@
 """거래소 간 가격 비교 결과 모델.
 
-데이터는 전부 DB 스냅샷(``market_snapshots`` / ``krw_rates``)에서 나온다.
+데이터는 전부 DB 스냅샷(``market_snapshots`` / ``fx_rate``)에서 나온다.
 거래소 직접 호출은 없다.
 """
 
@@ -57,15 +57,12 @@ class ComparisonResult(BaseModel):
 
     sym: str = Field(..., description="비교 대상 코인 심볼 (예: BTC)")
     common_currency: str = Field(..., description="비교 기준 통화 (환산 기준)")
-    usdt_krw_rate: float | None = Field(
+    usd_krw_rate: float | None = Field(
         None,
         description=(
-            "기준 국내 거래소의 KRW-USDT 환율 (DB `krw_rates`). "
-            "저장된 환율이 하나도 없으면 null"
+            "적용한 통일 환율 — 하나은행 고시 USD/KRW 매매기준율 (DB `fx_rate`). "
+            "아직 수집 전이면 null"
         ),
-    )
-    rate_exchange: str | None = Field(
-        None, description="usdt_krw_rate 를 가져온 국내 거래소 ID"
     )
 
     quotes: list[ExchangeQuote] = Field(

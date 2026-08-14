@@ -14,7 +14,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import MarketDataNotFoundError
-from app.db.models import FxRate, KrwRate, MarketSnapshot
+from app.db.models import FxRate, MarketSnapshot
 from app.models.orderbook import MarketType, OrderBook, OrderBookLevel
 
 
@@ -189,55 +189,6 @@ async def require_fx_rate(session: AsyncSession) -> FxRate:
         raise MarketDataNotFoundError(
             "DB 에 USD/KRW 환율이 없습니다. "
             "POST /refresh 또는 POST /history/sync 로 수집했는지 확인하세요.",
-        )
-    return rate
-
-
-async def upsert_krw_rate(
-    session: AsyncSession,
-    *,
-    exchange: str,
-    rate: float,
-    native_symbol: str,
-    price_timestamp: int,
-) -> None:
-    """국내 거래소 하나의 KRW-USDT 환율을 저장한다."""
-    await session.execute(
-        _upsert(
-            session,
-            KrwRate,
-            [
-                {
-                    "exchange": exchange,
-                    "rate": rate,
-                    "native_symbol": native_symbol,
-                    "price_timestamp": price_timestamp,
-                }
-            ],
-            ["exchange"],
-        )
-    )
-
-
-async def get_krw_rates(session: AsyncSession) -> list[KrwRate]:
-    """저장된 모든 국내 거래소 환율."""
-    result = await session.execute(select(KrwRate))
-    return list(result.scalars())
-
-
-async def get_krw_rate(session: AsyncSession, exchange: str) -> KrwRate | None:
-    """국내 거래소 하나의 환율."""
-    return await session.get(KrwRate, exchange)
-
-
-async def require_krw_rate(session: AsyncSession, exchange: str) -> KrwRate:
-    """환율을 가져오되, 없으면 도메인 예외를 던진다."""
-    rate = await get_krw_rate(session, exchange)
-    if rate is None:
-        raise MarketDataNotFoundError(
-            f"DB 에 {exchange} 거래소의 KRW-USDT 환율이 없습니다. "
-            "POST /refresh 로 데이터를 수집했는지 확인하세요.",
-            detail={"exchange": exchange},
         )
     return rate
 

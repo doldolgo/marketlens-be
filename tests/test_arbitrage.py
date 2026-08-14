@@ -6,10 +6,10 @@ import pytest
 from conftest import (
     BINANCE_PRICES,
     BITHUMB_PRICES,
-    KRW_RATES,
+    FX_RATE,
     best_ask,
     best_bid,
-    seed_rates,
+    seed_fx_rate,
     seed_rows,
     seed_standard,
     snapshot_row,
@@ -51,7 +51,7 @@ class TestValidation:
 
     async def test_single_venue_is_409_style(self, db) -> None:
         await seed_rows(db, "upbit", [snapshot_row("upbit", "BTC", 100_000_000.0)])
-        await seed_rates(db, {"upbit": 1400.0})
+        await seed_fx_rate(db)
         with pytest.raises(NoArbitrageOpportunityError):
             await arbitrage_service.simulate(db, "BTC", amount=1_000_000.0)
 
@@ -75,7 +75,7 @@ class TestAutoDirection:
         await seed_standard(db)
         res = await arbitrage_service.simulate(db, "BTC", amount=1_000_000.0)
 
-        buy_krw = best_ask(BINANCE_PRICES["BTC"]) * KRW_RATES["upbit"]
+        buy_krw = best_ask(BINANCE_PRICES["BTC"]) * FX_RATE
         sell_krw = best_bid(BITHUMB_PRICES["BTC"])
         assert res.premium_percent == pytest.approx((sell_krw / buy_krw - 1) * 100)
         # 소액이라 1단계 안에서 끝난다 → 슬리피지 0, 프리미엄을 그대로 다 먹는다
@@ -121,7 +121,7 @@ class TestAutoDirection:
             "binance",
             [snapshot_row("binance", "BTC", 71_000.0, quote="USDT", krw_factor=1400)],
         )
-        await seed_rates(db, {"upbit": 1400.0})
+        await seed_fx_rate(db)
 
         with pytest.raises(NoArbitrageOpportunityError):
             await arbitrage_service.simulate(db, "BTC", amount=1_000_000.0)
@@ -182,7 +182,7 @@ class TestFixedDirection:
         )
         # 해외 하나 + KRW 스냅샷 없음 → 방향 고정 계산 불가. 다만 후보 2곳 미만
         # 검사가 먼저라 NoArbitrageOpportunityError 로 걸린다.
-        await seed_rates(db, {"upbit": 1400.0})
+        await seed_fx_rate(db)
         with pytest.raises(NoArbitrageOpportunityError):
             await arbitrage_service.simulate(
                 db, "BTC", amount=1_000_000.0, direction=PremiumDirection.FWD
@@ -198,7 +198,7 @@ class TestCurrencyConversion:
         )
 
         # 원화 환산은 기준(업비트) 환율
-        assert res.input_amount_krw == pytest.approx(1_000.0 * KRW_RATES["upbit"])
+        assert res.input_amount_krw == pytest.approx(1_000.0 * FX_RATE)
         assert res.buy.exchange == "binance"
         assert res.profit_percent > 0
 

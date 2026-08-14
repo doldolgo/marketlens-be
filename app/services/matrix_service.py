@@ -1,7 +1,7 @@
 """매트릭스 서비스 — DB 스냅샷으로 코인별 최대 김프·역프를 계산한다.
 
 거래소를 직접 호출하지 않는다. ``POST /refresh`` 가 저장해둔
-``market_snapshots`` / ``krw_rates`` 를 읽어서만 계산한다.
+``market_snapshots`` / ``fx_rate`` 를 읽어서만 계산한다.
 
 코인 하나마다
     - 모든 (국내 × 해외) 조합의 김프를 계산해 **가장 큰 김프** 조합을 고르고
@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.errors import MarketDataNotFoundError
 from app.db import repository
-from app.db.models import KrwRate, MarketSnapshot
+from app.db.models import MarketSnapshot
 from app.models.matrix import MatrixCoinEntry, MatrixDirection, MatrixResult
 from app.models.orderbook import OrderBookLevel
 from app.services.orderbook_walk import walk_by_amount, walk_by_quantity
@@ -98,16 +98,13 @@ class MatrixService:
         started = time.perf_counter()
 
         snapshots = await repository.get_snapshots(session)
-        rates = {r.exchange: r for r in await repository.get_krw_rates(session)}
 
         if not snapshots:
             raise MarketDataNotFoundError(
                 "DB 에 시세 스냅샷이 없습니다. 먼저 POST /refresh 로 수집하세요.",
             )
-        if not rates:
-            raise MarketDataNotFoundError(
-                "DB 에 KRW-USDT 환율이 없습니다. 먼저 POST /refresh 로 수집하세요.",
-            )
+        # 통일 환율 — 모든 조합이 같은 은행 고시 USD/KRW 를 쓴다.
+        fx = await repository.require_fx_rate(session)
 
         # 국내(KRW 가격)와 해외(USDT 가격)를 저장된 통화로 구분한다.
         domestic: dict[str, dict[str, MarketSnapshot]] = {}
@@ -117,9 +114,6 @@ class MatrixService:
                 domestic.setdefault(snap.base, {})[snap.exchange] = snap
             elif snap.quote == settings.fx_stablecoin:
                 overseas.setdefault(snap.base, {})[snap.exchange] = snap
-
-        reference = settings.krw_reference_exchange
-        fallback_rate: KrwRate = rates.get(reference) or next(iter(rates.values()))
 
         excluded = {b.upper() for b in settings.scan_excluded_bases}
         warnings: list[str] = []
@@ -142,7 +136,7 @@ class MatrixService:
             for dom in dom_snaps.values():
                 dom_bids = repository.levels_from_json(dom.bids)
                 dom_asks = repository.levels_from_json(dom.asks)
-                rate = rates.get(dom.exchange, fallback_rate).rate
+                rate = fx.rate
 
                 for ovs in ovs_snaps.values():
                     combinations += 1

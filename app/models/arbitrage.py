@@ -88,11 +88,11 @@ class ArbitrageResult(BaseModel):
         ..., description="투입 금액의 원화 환산 (기준 환율 적용)"
     )
 
-    usdt_krw_rate: float = Field(
+    usd_krw_rate: float = Field(
         ...,
         description=(
-            "적용한 기준 USDT/KRW 환율 (DB `krw_rates`). 국내 거래소 호가에는 "
-            "각 거래소 자기 환율을 우선 쓰고, 없으면 이 값으로 폴백한다"
+            "적용한 통일 환율 — 하나은행 고시 USD/KRW 매매기준율 (DB `fx_rate`). "
+            "해외 USDT 가격에 이 값을 곱해 원화 환산한다 (USDT≈USD 페그 전제)"
         ),
     )
 

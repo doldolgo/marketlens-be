@@ -2,6 +2,10 @@
 
 거래소를 직접 호출하지 않는다. ``POST /refresh`` 가 저장해둔
 ``market_snapshots`` 의 호가를 기존 :class:`OrderBook` 모델로 되살려 반환한다.
+
+테스트 예시:
+    http://3.34.104.16:8000/orderbook/upbit?symbol=BTC/KRW&depth=5
+    http://3.34.104.16:8000/orderbook/binance?symbol=BTC/USDT&depth=5
 """
 
 from __future__ import annotations

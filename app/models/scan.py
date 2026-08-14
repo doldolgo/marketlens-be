@@ -42,7 +42,7 @@ class ScanEntry(BaseModel):
         ...,
         description=(
             "해외 가격 (USDT). 김프면 매도호가(ask), 역김프면 매수호가(bid). "
-            "원화 환산은 usdt_krw_rate 를 곱하면 된다"
+            "원화 환산은 usd_krw_rate 를 곱하면 된다"
         ),
     )
 
@@ -84,11 +84,11 @@ class ScanResult(BaseModel):
         default_factory=list, description="비교에 참여한 해외 거래소"
     )
 
-    usdt_krw_rate: float = Field(
+    usd_krw_rate: float = Field(
         ...,
         description=(
-            "적용한 USDT/KRW 환율. `krw_rates` 에 저장된 국내 거래소의 "
-            "마지막 체결가 하나다"
+            "적용한 통일 환율 — 하나은행 고시 USD/KRW 매매기준율 (DB `fx_rate`). "
+            "해외 USDT 가격에 이 값을 곱해 원화 환산한다 (USDT≈USD 페그 전제)"
         ),
     )
     rate_updated_at: int | None = Field(

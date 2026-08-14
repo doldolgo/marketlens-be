@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 from conftest import (
     BINANCE_PRICES,
-    KRW_RATES,
+    FX_RATE,
     NOW_MS,
     UPBIT_PRICES,
 )
@@ -43,6 +43,9 @@ class TestBasicEndpoints:
             "/slippage/{exchange_id}",
             "/matrix",
             "/arbitrage",
+            "/history/coin",
+            "/history/fx",
+            "/history/sync",
         }
 
     async def test_every_operation_has_summary(self, client) -> None:
@@ -58,23 +61,14 @@ class TestFxEndpoint:
         assert r.status_code == 404
         assert r.json()["error"]["code"] == "market_data_not_found"
 
-    async def test_lists_all_stored_rates(self, seeded_client) -> None:
+    async def test_returns_unified_rate(self, seeded_client) -> None:
+        """환율은 거래소 구분 없는 단일 값 (하나은행 고시 매매기준율)이다."""
         d = (await seeded_client.get("/rate")).json()
 
-        rates = {r["exchange"]: r for r in d["rates"]}
-        assert rates["upbit"]["rate"] == 1400.0
-        assert rates["bithumb"]["rate"] == 1401.0  # 거래소마다 환율이 다르다
-        assert rates["upbit"]["updated_at"] is not None
-        # 거래소 이름 오름차순 정렬
-        assert [r["exchange"] for r in d["rates"]] == ["bithumb", "upbit"]
-
-    async def test_single_exchange_filter(self, seeded_client) -> None:
-        d = (await seeded_client.get("/rate?exchange=UPBIT")).json()  # 대소문자 무관
-        assert [r["exchange"] for r in d["rates"]] == ["upbit"]
-
-    async def test_exchange_without_rate_is_404(self, seeded_client) -> None:
-        r = await seeded_client.get("/rate?exchange=binance")
-        assert r.status_code == 404
+        assert d["rate"] == FX_RATE
+        assert d["source"] == "hana"
+        assert d["round_no"] == 100
+        assert d["updated_at"] is not None
 
 
 class TestOrderbookEndpoint:
@@ -133,7 +127,7 @@ class TestCompareEndpoint:
             "upbit",
             "bithumb",
         ]  # 환산가 오름차순
-        assert d["usdt_krw_rate"] == KRW_RATES["upbit"]
+        assert d["usd_krw_rate"] == FX_RATE
         assert d["spread"]["buy_exchange"] == "binance"
         assert d["spread"]["sell_exchange"] == "bithumb"
         assert d["spread"]["percent"] > 0
@@ -197,7 +191,8 @@ class TestPremiumEndpoints:
         ).json()
 
         assert upbit["dom_price"] != bithumb["dom_price"]
-        assert upbit["usdt_krw_rate"] != bithumb["usdt_krw_rate"]
+        # 환율은 통일 환율 하나 — 국내 거래소를 바꿔도 같다
+        assert upbit["usd_krw_rate"] == bithumb["usd_krw_rate"] == 1400.0
 
     async def test_overseas_domestic_is_400(self, seeded_client) -> None:
         r = await seeded_client.get("/premium?sym=BTC&dom=binance")

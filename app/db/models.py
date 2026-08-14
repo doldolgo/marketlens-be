@@ -10,8 +10,9 @@
     환산이 필요한 계산은 조회 시점에 ``fx_rate`` 를 곱해서 한다.
 
 ``fx_rate`` — 단 한 행
-    하나은행 고시 USD/KRW **매매기준율** (최신 고시). 환율 통일 작업의
-    저장 공간이다 — 아직은 ``krw_rates`` 도 함께 존재한다.
+    하나은행 고시 USD/KRW **매매기준율** (최신 고시).
+    예전에는 국내 거래소별 KRW-USDT 시세를 환율로 썼지만(``krw_rates``),
+    지금은 모든 계산이 이 은행 고시 환율 하나로 통일됐다.
 
 **가격 변동 이력 (히스토리)** — 김프/역프 통계의 원재료.
 
@@ -116,25 +117,6 @@ class FxRate(Base):
     )
 
 
-class KrwRate(Base):
-    """국내 거래소의 KRW-USDT 환율."""
-
-    __tablename__ = "krw_rates"
-
-    #: 국내 거래소 ID (upbit / bithumb)
-    exchange: Mapped[str] = mapped_column(String(32), primary_key=True)
-    #: USDT 1개당 원화 가격 (마지막 체결가)
-    rate: Mapped[float] = mapped_column(Float)
-    #: 원본 마켓 심볼 (KRW-USDT)
-    native_symbol: Mapped[str] = mapped_column(String(64), default="")
-    #: 거래소가 준 시세 시각 (epoch ms)
-    price_timestamp: Mapped[int] = mapped_column(BigInteger, default=0)
-    #: 이 행을 마지막으로 갱신한 시각
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
-    )
-
-
 # ----------------------------------------------------------------------
 # 가격 변동 이력
 # ----------------------------------------------------------------------
@@ -188,15 +170,19 @@ class PricePoint(Base):
     오늘(UTC) 데이터가 여기 쌓이고, 하루가 완결되면 팩킹이 청크로 옮긴다.
     가격은 거래소 API 가 준 십진 표기 그대로의 문자열이다 — 정확한 값 보존이
     목적이고, 산술은 팩킹/조회 때 Decimal 로 한다.
+
+    **가격 단위는 exchange 가 결정한다** — upbit 행은 KRW, binance 행은 USDT.
+    ts 는 epoch 초라 연도까지 담긴 완전한 시각이다. 사람이 읽는 형태는
+    ``v_price_points`` 뷰(:mod:`app.db.views`)로 본다.
     """
 
     __tablename__ = "price_points"
 
     exchange: Mapped[str] = mapped_column(String(32), primary_key=True)
     base: Mapped[str] = mapped_column(String(32), primary_key=True)
-    #: 변동 시각 (절대 epoch 초)
+    #: 변동 시각 (절대 epoch 초 — 연도 포함 완전한 시각)
     ts: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    #: 변동 후 가격 (십진 문자열, 예: "90191000" / "1518.4")
+    #: 변동 후 가격 (십진 문자열, 단위는 exchange 따라 KRW 또는 USDT)
     price: Mapped[str] = mapped_column(String(40))
 
 
@@ -232,9 +218,9 @@ class FxPoint(Base):
 
     __tablename__ = "fx_points"
 
-    #: 고시 시각 (절대 epoch 초)
+    #: 고시 시각 (절대 epoch 초 — 연도 포함 완전한 시각)
     ts: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    #: 매매기준율 (십진 문자열, 예: "1518.4")
+    #: 매매기준율 (십진 문자열, 단위: USD 1달러당 원)
     price: Mapped[str] = mapped_column(String(40))
 
 
