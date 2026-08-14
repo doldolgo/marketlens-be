@@ -12,6 +12,7 @@ from app.api.routes import (
     arbitrage,
     compare,
     exchanges,
+    history,
     rate,
     health,
     matrix,
@@ -86,3 +87,4 @@ app.include_router(spreads.router)
 app.include_router(slippage.router)
 app.include_router(matrix.router)
 app.include_router(arbitrage.router)
+app.include_router(history.router)
