@@ -4,7 +4,7 @@
 **서로 다른 거래**이기 때문이다.
 
 거래소를 직접 호출하지 않는다. ``POST /refresh`` 가 저장해둔
-``market_snapshots`` / ``fx_rate`` 를 읽어서만 계산한다.
+``market_snapshots`` / ``usdkrw_rate`` 를 읽어서만 계산한다.
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ _SHARED_DESC = """
 거래소를 직접 호출하지 않고 **DB 스냅샷만 읽는다.** 데이터가 오래됐으면
 `data_oldest_at` 으로 알 수 있고, `POST /refresh` 로 갱신한다.
 
-환율은 `fx_rate` 에 저장된 **하나은행 고시 USD/KRW 매매기준율** 하나다 —
+환율은 `usdkrw_rate` 에 저장된 **하나은행 고시 USD/KRW 매매기준율** 하나다 —
 어느 국내 거래소를 기준으로 하든 같은 환율이 적용된다.
 
 > ⚠️ 거래 수수료·출금 수수료·전송 시간은 반영하지 않은 이론값이다.
@@ -239,7 +239,7 @@ class PremiumSearchResult(BaseModel):
         "다만 **둘 다 손해일 때는 '덜 나쁜 쪽'** 이므로 해당 방향의 `profitable` 을 "
         "반드시 함께 확인해야 한다.\n\n"
         "`dom` 으로 국내 거래소를 고르면 그 거래소 기준으로 계산된다. "
-        "환율은 어느 거래소든 통일 환율(`fx_rate`) 하나다."
+        "환율은 어느 거래소든 통일 환율(`usdkrw_rate`) 하나다."
     ),
 )
 async def search_premium(

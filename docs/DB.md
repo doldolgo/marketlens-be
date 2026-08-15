@@ -5,7 +5,7 @@
 ```
 실시간 (실시간 스프레드 창 담당) — POST /refresh 가 코인을 찾아 갱신
   market_snapshots   거래소×코인별 현재가·호가·입출금 상태
-  fx_rate            통일 환율 (하나은행 고시 USD/KRW) — 항상 1행
+  usdkrw_rate            통일 환율 (하나은행 고시 USD/KRW) — 항상 1행
 
 기록 (기록/통계 창 담당) — 계속 쌓이는 append 전용
   premium_archive    김프/역프 기록 (시각·코인·김프·역프)
@@ -17,7 +17,7 @@
 데이터 흐름 한눈에:
 
 ```
-POST /refresh ─▶ market_snapshots 갱신(UPSERT) + fx_rate 갱신
+POST /refresh ─▶ market_snapshots 갱신(UPSERT) + usdkrw_rate 갱신
       │                └─▶ 실시간 스프레드 창 (GET /spreads 등)
       └─▶ 갱신 직후 김프/역프 계산 → premium_archive 에 한 줄 추가
                        └─▶ 기록/통계 창 (GET /history/premium)
@@ -58,7 +58,7 @@ UPSERT 만** 한다 — 지웠다 다시 만들지 않고, 이번 수집에 빠�
 
 예시 행: `(binance, BTC, BTCUSDT, USDT, 63747.2, asks=[[63745.61, 7.686], ...])`
 
-## `fx_rate` — 통일 환율, 항상 딱 1행
+## `usdkrw_rate` — 통일 환율, 항상 딱 1행
 
 모든 원화 환산이 쓰는 **단 하나의 환율** — 하나은행 고시 매매기준율.
 refresh 가 최신 고시로 계속 덮어쓴다 (더 오래된 고시로의 역행은 UPSERT 의
@@ -127,7 +127,7 @@ epoch 초는 사람이 못 읽으므로, 앱 기동 시 읽기 전용 뷰를 만
 |---|---|
 | `v_premium_archive` | 김프 기록 — `time_kst` (연도 포함 KST) + fwd/rev % |
 | `v_platform_status` | 플랫폼 상태 — 마지막 수신(KST) + **실패율 계산 포함** |
-| `v_fx_rate` | 라이브 환율 + 고시 시각(KST) |
+| `v_usdkrw_rate` | 라이브 환율 + 고시 시각(KST) |
 
 예시 (`SELECT * FROM v_premium_archive LIMIT 2`):
 

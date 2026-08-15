@@ -1,6 +1,6 @@
 """거래소 간 가격 비교 결과 모델.
 
-데이터는 전부 DB 스냅샷(``market_snapshots`` / ``fx_rate``)에서 나온다.
+데이터는 전부 DB 스냅샷(``market_snapshots`` / ``usdkrw_rate``)에서 나온다.
 거래소 직접 호출은 없다.
 """
 
@@ -60,7 +60,7 @@ class ComparisonResult(BaseModel):
     usd_krw_rate: float | None = Field(
         None,
         description=(
-            "적용한 통일 환율 — 하나은행 고시 USD/KRW 매매기준율 (DB `fx_rate`). "
+            "적용한 통일 환율 — 하나은행 고시 USD/KRW 매매기준율 (DB `usdkrw_rate`). "
             "아직 수집 전이면 null"
         ),
     )

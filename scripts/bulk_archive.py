@@ -5,13 +5,13 @@
 한 번에 계산해 테이블 형식 그대로 저장한다.
 
     가격: 업비트 초봉 + 바이낸스 1초봉 (플랫폼이 지원하는 최소 간격)
-    환율: 하나은행 고시 (--fx-stride 간격 샘플링, 기본 30회차 ≈ 20분)
+    환율: 하나은행 고시 (--usdkrw-stride 간격 샘플링, 기본 30회차 ≈ 20분)
     계산: 종가 기준 김프/역프 — 셋 중 하나라도 변한 초마다 한 줄
 
 사용 예 (EC2 의 marketlens-be 디렉토리에서):
 
     python -m scripts.bulk_archive --bases BTC
-    python -m scripts.bulk_archive --bases BTC,ETH --days 92 --fx-stride 15
+    python -m scripts.bulk_archive --bases BTC,ETH --days 92 --usdkrw-stride 15
 
 동작 원칙
     - 하루(UTC) 단위로 수집→계산→저장→커밋한다. 중단돼도 재실행하면
@@ -60,7 +60,7 @@ async def main() -> None:
         help="며칠 전까지를 목표 구간으로 할지 (기본 92 — 업비트 초봉 보관 한계)",
     )
     parser.add_argument(
-        "--fx-stride",
+        "--usdkrw-stride",
         type=int,
         default=30,
         help="환율 고시 샘플링 간격 (N회차마다 1건, 기본 30 ≈ 20분 간격)",
@@ -72,7 +72,7 @@ async def main() -> None:
         "--pace-binance", type=float, default=0.1, help="바이낸스 요청 간격 초"
     )
     parser.add_argument(
-        "--fx-pace", type=float, default=0.35, help="하나은행 요청 간격 초"
+        "--usdkrw-pace", type=float, default=0.35, help="하나은행 요청 간격 초"
     )
     args = parser.parse_args()
 
@@ -111,14 +111,14 @@ async def main() -> None:
             # 2) 환율은 전체 구간을 한 번에 수집한다 (코인과 무관하게 재사용 가능
             #    하지만 구간이 코인마다 다를 수 있어 구간별로 받는다).
             for range_start, range_end in ranges:
-                fx_events = await service.collect_fx_events(
+                usdkrw_events = await service.collect_usdkrw_events(
                     range_start,
                     range_end,
-                    stride=args.fx_stride,
-                    pace=args.fx_pace,
+                    stride=args.usdkrw_stride,
+                    pace=args.usdkrw_pace,
                     log=_log,
                 )
-                if not fx_events:
+                if not usdkrw_events:
                     _log(
                         f"{base} — 구간에 환율이 없어 건너뜁니다 "
                         "(하나은행 조회 실패?)"
@@ -135,7 +135,7 @@ async def main() -> None:
                         base,
                         range_start,
                         range_end,
-                        fx_events=fx_events,
+                        usdkrw_events=usdkrw_events,
                         newest_first=is_head,
                         pace_upbit=args.pace_upbit,
                         pace_binance=args.pace_binance,

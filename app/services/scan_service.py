@@ -4,7 +4,7 @@
 
 거래소를 직접 호출하지 않는다. ``POST /refresh`` 가 저장해둔
 ``market_snapshots`` 에서 **국내(KRW) 전종목 × 해외(USDT) 스냅샷의 교집합**을
-돌며 두 방향의 수익률을 조합마다 계산한다. 환율은 통일 환율(``fx_rate``,
+돌며 두 방향의 수익률을 조합마다 계산한다. 환율은 통일 환율(``usdkrw_rate``,
 하나은행 고시 USD/KRW 매매기준율) 하나다.
 
 수익률 계산식은 `/premium/fwd` · `/premium/rev` 와 **완전히 동일**하다.
@@ -30,7 +30,7 @@ from app.models.ticker import PriceSide
 from app.services.premium_service import (
     exchange_name,
     premium_service,
-    resolve_fx_rate,
+    resolve_usdkrw_rate,
     resolve_side,
 )
 
@@ -150,7 +150,7 @@ class ScanService:
         started = time.perf_counter()
 
         domestic_id = premium_service.resolve_domestic(domestic)
-        rate = await resolve_fx_rate(session)
+        rate = await resolve_usdkrw_rate(session)
 
         # 스냅샷 전체를 한 번에 읽어 국내(KRW)와 해외(USDT)로 나눈다.
         snapshots = await repository.get_snapshots(session)
@@ -163,7 +163,7 @@ class ScanService:
             ):
                 domestic_snaps[snap.base] = snap
             elif (
-                snap.quote == settings.fx_stablecoin
+                snap.quote == settings.overseas_quote
                 and snap.exchange != domestic_id
             ):
                 overseas_snaps.setdefault(snap.exchange, {})[snap.base] = snap
@@ -177,7 +177,7 @@ class ScanService:
                 overseas_ids.append(eid)
                 if not overseas_snaps.get(eid):
                     warnings.append(
-                        f"{eid} 거래소의 {settings.fx_stablecoin} 스냅샷이 DB 에 "
+                        f"{eid} 거래소의 {settings.overseas_quote} 스냅샷이 DB 에 "
                         "없어 스캔에서 빠졌습니다. POST /refresh 로 수집했는지 "
                         "확인하세요."
                     )

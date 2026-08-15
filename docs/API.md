@@ -73,7 +73,7 @@
 | `price_timestamp` | 거래소가 준 시세 시각 (epoch ms) |
 | `updated_at` | 이 행을 마지막으로 갱신한 시각 (DB 서버 시계) |
 
-#### `fx_rate` — 통일 환율, 항상 1행
+#### `usdkrw_rate` — 통일 환율, 항상 1행
 
 | 컬럼 | 설명 |
 |---|---|
@@ -87,7 +87,7 @@
 
 - **환산 없이 저장** — 가격·호가는 그 거래소 통화 그대로 저장한다
   (업비트·빗썸 = KRW, 바이낸스 = USDT). 원화 환산은 조회 시점에 통일 환율
-  (`fx_rate`)을 곱해서 한다.
+  (`usdkrw_rate`)을 곱해서 한다.
 - **호가는 금액 한도까지만** — 누적 체결 가능액이 서버 설정
   `ORDERBOOK_MAX_AMOUNT_KRW`(기본 10억원)에 도달하는 깊이까지만 저장한다.
   그보다 큰 금액의 슬리피지는 계산할 수 없고, 응답에 `depth_exhausted` 로
@@ -208,7 +208,7 @@ Adminer (http://localhost:8080): 시스템 `PostgreSQL`, 서버 `db`,
 |---|:---:|---|
 | 호가 (매수·매도 다단계) | ✅ | 저장된 깊이 안에서 — 국내 30단계, 바이낸스 기본 100단계, `ORDERBOOK_MAX_AMOUNT_KRW` 커버분까지 |
 | 마지막 체결가 (현재가) | ✅ | 수집 시점의 값 |
-| USD/KRW 환율 | ✅ | `fx_rate` 저장값 — 하나은행 고시 매매기준율 **하나로 통일** |
+| USD/KRW 환율 | ✅ | `usdkrw_rate` 저장값 — 하나은행 고시 매매기준율 **하나로 통일** |
 | 국내 거래소 선택 (업비트/빗썸) | ✅ | `dom` 파라미터 |
 | 김치 프리미엄 / 역김프 | ✅ | `/premium/fwd` · `/premium/rev` |
 | 전종목 스캔 · 전 코인 매트릭스 | ✅ | DB 만 읽으므로 거래소 호출 0 |
@@ -273,7 +273,7 @@ DB 는 거래소당 한 마켓(국내 = KRW, 바이낸스 = USDT)만 저장하�
 ### 환율
 
 업비트·빗썸은 KRW, 바이낸스는 USDT 로 가격을 매기므로 그대로는 비교할 수 없다.
-환율은 **`fx_rate` 에 저장된 하나은행 고시 USD/KRW 매매기준율 하나**를 쓴다 —
+환율은 **`usdkrw_rate` 에 저장된 하나은행 고시 USD/KRW 매매기준율 하나**를 쓴다 —
 어느 국내 거래소를 기준으로 하든 같은 환율이다.
 
 - **왜 은행 고시인가.** 예전에는 국내 거래소의 `KRW-USDT` 시세를 환율로 썼지만,
@@ -302,7 +302,7 @@ DB 는 거래소당 한 마켓(국내 = KRW, 바이낸스 = USDT)만 저장하�
 | KRW 전종목 현재가 + 호가 | 업비트 · 빗썸 (전종목 일괄 조회) | `market_snapshots` |
 | USDT 마켓 현재가 + 호가 | 바이낸스 (국내 상장 코인만, 심볼별 depth) | `market_snapshots` |
 | 입출금 가능 여부 | 업비트 · 바이낸스 (API 키 필요) · 빗썸 (public) | `market_snapshots` |
-| USD/KRW 환율 (하나은행 고시 매매기준율) | 하나은행 | `fx_rate` |
+| USD/KRW 환율 (하나은행 고시 매매기준율) | 하나은행 | `usdkrw_rate` |
 | 김프/역프 기록 (갱신 직후 계산) | — | `premium_archive` |
 | 플랫폼 수신 상태·실패율 카운터 | — | `platform_status` |
 
@@ -344,7 +344,7 @@ curl -X POST "http://localhost:8000/refresh" -H "X-Refresh-Token: <토큰>"
     { "exchange": "binance", "saved": 202,
       "wallet_status_available": false, "mode": "per_symbol" }
   ],
-  "fx": { "rate": 1418.4, "source_time": 1786627013, "round_no": 732 },
+  "usdkrw": { "rate": 1418.4, "source_time": 1786627013, "round_no": 732 },
   "archived": 391,
   "total_saved": 704,
   "failures": [],
@@ -362,7 +362,7 @@ curl -X POST "http://localhost:8000/refresh" -H "X-Refresh-Token: <토큰>"
 | `snapshots[].saved` | 저장(UPSERT)한 코인 수 — 이번 수집에 없는 코인도 지우지 않는다 |
 | `snapshots[].wallet_status_available` | 입출금 가능 여부를 채웠는지. false 면 키가 없거나 조회 실패 → null 저장 |
 | `snapshots[].mode` | `bulk`=전종목 일괄 조회 (업비트·빗썸), `per_symbol`=심볼별 조회 (바이낸스) |
-| `fx` | 저장한 통일 환율 (하나은행 고시). 이번 수집 실패 시 null — 계산은 DB 의 마지막 환율로 계속 |
+| `usdkrw` | 저장한 통일 환율 (하나은행 고시). 이번 수집 실패 시 null — 계산은 DB 의 마지막 환율로 계속 |
 | `archived` | 이번 회차에 남긴 김프/역프 기록 수 — (국내 거래소 × 코인)당 한 줄 |
 | `failures` | 수집하지 못한 항목 (`exchange`, `sym`, `error_code`, `message`) |
 | `warnings` | 키 없음, 환율 조회 실패 등 주의 사항 |
@@ -525,7 +525,7 @@ curl "http://localhost:8000/orderbook/binance?symbol=BTC/USDT&depth=3"
 여러 거래소의 같은 코인 가격(마지막 체결가)을 하나의 통화로 환산해 비교하고,
 **차익 스프레드**를 계산한다. DB 스냅샷만 읽는다.
 
-환율은 DB 의 통일 환율(`fx_rate`, 하나은행 고시 USD/KRW) 하나다 — KRW 환산은
+환율은 DB 의 통일 환율(`usdkrw_rate`, 하나은행 고시 USD/KRW) 하나다 — KRW 환산은
 이 환율을 곱하고, USDT 환산은 이 환율로 나눈다.
 응답의 가격은 전부 `common_currency` 로 환산된 최종값이다.
 
@@ -686,7 +686,7 @@ curl "http://localhost:8000/premium?sym=XRP"
 | 파라미터 | 타입 | 필수 | 기본값 | 설명 |
 |---|---|:---:|---|---|
 | `sym` | string | ✅ | — | 조회할 코인 심볼 |
-| `dom` | string | | `upbit` | 국내 거래소. 환율은 어느 거래소든 통일 환율(`fx_rate`) 하나다 |
+| `dom` | string | | `upbit` | 국내 거래소. 환율은 어느 거래소든 통일 환율(`usdkrw_rate`) 하나다 |
 | `fx` | string[] | | 전체 | 비교할 **해외** 거래소 ID. 반복 지정 가능. 생략하면 DB 에 USDT 스냅샷이 있는 전체 (국내 기준 거래소 제외) |
 
 ```bash
@@ -1394,7 +1394,7 @@ curl "http://localhost:8000/history/status"
 |---|---|---|
 | 최신/특정 회차 고시 | `POST /cms/rate/wpfxd651_01i_01.do` | HTML 조각 응답 — 고시일시(초 단위)·회차·매매기준율을 파싱. 하루 1,300~2,000회 고시, 15개월+ 과거 조회 가능. 키 불필요 |
 
-- Base URL: `https://www.kebhana.com` (설정 `HANA_FX_BASE_URL`)
+- Base URL: `https://www.kebhana.com` (설정 `HANA_BASE_URL`)
 - 파라미터·파싱 상세는 `app/history/hana.py` 모듈 docstring 참고.
 
 ### 김프 기록 대량 채우기 (`scripts/bulk_archive.py`)

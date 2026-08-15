@@ -1,7 +1,7 @@
 """금액 기준 차익거래 시뮬레이션 서비스 — DB 스냅샷 기반.
 
 거래소를 직접 호출하지 않는다. ``POST /refresh`` 가 저장해둔
-``market_snapshots`` / ``fx_rate`` 를 읽어서만 계산한다.
+``market_snapshots`` / ``usdkrw_rate`` 를 읽어서만 계산한다.
 
 동작 순서
     1. 대상 코인의 전 거래소 스냅샷과 환율을 DB 에서 읽는다.
@@ -135,7 +135,7 @@ class ArbitrageService:
     def _build_venues(
         self,
         snapshots: list[MarketSnapshot],
-        fx_rate: float,
+        usdkrw_rate: float,
         *,
         currency: str,
         depth: int,
@@ -150,7 +150,7 @@ class ArbitrageService:
             # 환산 가능한 통화(KRW/USDT)가 아니면 비교 대상이 아니다.
             if snap.quote not in (
                 settings.krw_reference_quote,
-                settings.fx_stablecoin,
+                settings.overseas_quote,
             ):
                 continue
 
@@ -170,8 +170,8 @@ class ArbitrageService:
                 continue
 
             # 모든 거래소가 같은 통일 환율(은행 고시 USD/KRW)을 쓴다.
-            to_currency = self._factor(snap.quote, currency, fx_rate)
-            to_krw = self._factor(snap.quote, settings.krw_reference_quote, fx_rate)
+            to_currency = self._factor(snap.quote, currency, usdkrw_rate)
+            to_krw = self._factor(snap.quote, settings.krw_reference_quote, usdkrw_rate)
 
             best_bid = book.bids[0].price
             best_ask = book.asks[0].price
@@ -220,7 +220,7 @@ class ArbitrageService:
         domestic = [
             v for v in venues if v.snap.quote == settings.krw_reference_quote
         ]
-        overseas = [v for v in venues if v.snap.quote == settings.fx_stablecoin]
+        overseas = [v for v in venues if v.snap.quote == settings.overseas_quote]
 
         if not domestic:
             raise NoArbitrageOpportunityError(
@@ -230,7 +230,7 @@ class ArbitrageService:
         if not overseas:
             raise NoArbitrageOpportunityError(
                 "비교할 해외 거래소가 없습니다.",
-                detail={"quote": settings.fx_stablecoin},
+                detail={"quote": settings.overseas_quote},
             )
 
         if direction is PremiumDirection.FWD:
@@ -330,7 +330,7 @@ class ArbitrageService:
                 detail={"base": base},
             )
         # 통일 환율 — 없거나 0 이하면 여기서 404 성격의 예외가 난다.
-        fx = await repository.require_fx_rate(session)
+        usdkrw = await repository.require_usdkrw_rate(session)
 
         # 대상 거래소 필터. 명시적으로 요청했는데 스냅샷이 없으면 실패로 기록한다.
         failures: list[ArbitrageFailure] = []
@@ -365,7 +365,7 @@ class ArbitrageService:
 
         venues = self._build_venues(
             pool,
-            fx.rate,
+            usdkrw.rate,
             currency=currency,
             depth=depth,
             failures=failures,
@@ -413,7 +413,7 @@ class ArbitrageService:
         input_krw = (
             amount
             if currency == settings.krw_reference_quote
-            else amount * fx.rate
+            else amount * usdkrw.rate
         )
 
         # --- 경고 ---
@@ -474,7 +474,7 @@ class ArbitrageService:
             sym=base,
             direction=direction,
             input_amount_krw=input_krw,
-            usd_krw_rate=fx.rate,
+            usd_krw_rate=usdkrw.rate,
             premium_percent=premium_percent,
             buy=buy_side,
             sell=sell_side,

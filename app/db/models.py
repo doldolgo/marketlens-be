@@ -10,7 +10,7 @@
     **코인을 찾아 UPSERT 만 한다** — 지웠다 다시 만들지 않으며, 이번 수집에
     빠진 코인도 삭제하지 않는다 (신선도는 updated_at 으로 판별).
 
-``fx_rate`` — 단 한 행
+``usdkrw_rate`` — 단 한 행
     하나은행 고시 USD/KRW **매매기준율** (최신 고시). 모든 원화 환산이
     이 값 하나로 통일된다.
 
@@ -89,10 +89,10 @@ class MarketSnapshot(Base):
     )
 
 
-class FxRate(Base):
+class UsdKrwRate(Base):
     """통일 환율 — 하나은행 고시 USD/KRW 매매기준율의 최신 값 **한 행**."""
 
-    __tablename__ = "fx_rate"
+    __tablename__ = "usdkrw_rate"
 
     #: 항상 1. 단일 행을 강제하기 위한 고정 PK.
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)

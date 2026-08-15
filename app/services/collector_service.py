@@ -48,9 +48,9 @@ from app.history.service import premium_from_quotes
 from app.models.orderbook import MarketType, OrderBook, OrderBookLevel
 from app.models.refresh import (
     ExchangeRefreshStat,
-    FxRateInfo,
     RefreshFailure,
     RefreshResult,
+    UsdKrwRateInfo,
 )
 from app.models.symbol import Symbol
 
@@ -108,8 +108,8 @@ class CollectorService:
         domestic_task = asyncio.gather(
             *(self._domestic_market(eid, failures) for eid in domestic_ids)
         )
-        wallet_results, domestic_results, fx_observation = await asyncio.gather(
-            wallet_task, domestic_task, self._fx_rate(failures)
+        wallet_results, domestic_results, usdkrw_observation = await asyncio.gather(
+            wallet_task, domestic_task, self._usdkrw_rate(failures)
         )
         wallets: dict[str, dict[str, WalletStatus] | None] = dict(
             zip(_WALLET_FETCHERS, wallet_results, strict=True)
@@ -117,13 +117,13 @@ class CollectorService:
 
         # 이번에 환율을 못 받았으면 DB 의 마지막 값으로 계산을 이어간다.
         # (환율은 분 단위로 급변하지 않으므로 낡은 값이 없는 것보다 낫다)
-        fx_rate_value: float | None = (
-            float(fx_observation.rate) if fx_observation is not None else None
+        usdkrw_rate_value: float | None = (
+            float(usdkrw_observation.rate) if usdkrw_observation is not None else None
         )
-        if fx_rate_value is None:
-            stored_fx = await repository.get_fx_rate(session)
-            if stored_fx is not None and stored_fx.rate > 0:
-                fx_rate_value = stored_fx.rate
+        if usdkrw_rate_value is None:
+            stored_usdkrw = await repository.get_usdkrw_rate(session)
+            if stored_usdkrw is not None and stored_usdkrw.rate > 0:
+                usdkrw_rate_value = stored_usdkrw.rate
                 warnings.append(
                     "환율 수집에 실패해 DB 의 마지막 환율로 계산했습니다 "
                     "(failures 참고)."
@@ -135,7 +135,7 @@ class CollectorService:
             domestic_bases |= set(books)
 
         binance_result, futures_market_count = await asyncio.gather(
-            self._binance_market(domestic_bases, fx_rate_value, failures, warnings),
+            self._binance_market(domestic_bases, usdkrw_rate_value, failures, warnings),
             self._binance_futures_count(warnings),
         )
 
@@ -177,7 +177,7 @@ class CollectorService:
                 # (USDT≈USD 로 보고 은행 환율을 쓴다 — 자르는 깊이 기준일 뿐이라
                 #  1% 미만의 페그 오차는 결과에 의미 있는 차이를 만들지 않는다)
                 max_amount if eid != "binance" else self._usdt_amount(
-                    max_amount, fx_rate_value
+                    max_amount, usdkrw_rate_value
                 ),
             )
             # 코인을 찾아 UPSERT 만 한다 — 지웠다 다시 만들지 않는다.
@@ -212,14 +212,14 @@ class CollectorService:
                 dw_failed=dw_failed,
             )
 
-        if fx_observation is not None:
-            # 라이브 환율 단일 행(fx_rate) 갱신 — 역행은 UPSERT 가드가 막는다.
-            await history_service.record_fx_observation(session, fx_observation)
+        if usdkrw_observation is not None:
+            # 라이브 환율 단일 행(usdkrw_rate) 갱신 — 역행은 UPSERT 가드가 막는다.
+            await history_service.record_usdkrw_observation(session, usdkrw_observation)
 
         # 4단계 — 김프/역프 아카이브. 방금 갱신한 스냅샷에서 코인·시각·
         # 김프·역프만 뽑아 기록 테이블에 한 줄씩 추가한다 (기록/통계 창).
         archived = 0
-        if fx_rate_value is not None and "binance" in books_by_exchange:
+        if usdkrw_rate_value is not None and "binance" in books_by_exchange:
             archive_rows: list[dict] = []
             fx_books = books_by_exchange["binance"]
             for dom_eid in domestic_ids:
@@ -238,7 +238,7 @@ class CollectorService:
                         dom_book.asks[0].price,
                         fx_book.bids[0].price,
                         fx_book.asks[0].price,
-                        fx_rate_value,
+                        usdkrw_rate_value,
                     )
                     if result is None:
                         continue
@@ -254,7 +254,7 @@ class CollectorService:
                     )
             if archive_rows:
                 archived = await repository.add_premium_rows(session, archive_rows)
-        elif fx_rate_value is None:
+        elif usdkrw_rate_value is None:
             warnings.append(
                 "환율이 없어 이번 회차의 김프 기록(premium_archive)을 건너뜁니다."
             )
@@ -263,13 +263,13 @@ class CollectorService:
 
         return RefreshResult(
             snapshots=stats,
-            fx=(
-                FxRateInfo(
-                    rate=float(fx_observation.rate),
-                    source_time=fx_observation.ts,
-                    round_no=fx_observation.round_no,
+            usdkrw=(
+                UsdKrwRateInfo(
+                    rate=float(usdkrw_observation.rate),
+                    source_time=usdkrw_observation.ts,
+                    round_no=usdkrw_observation.round_no,
                 )
-                if fx_observation is not None
+                if usdkrw_observation is not None
                 else None
             ),
             total_saved=sum(s.saved for s in stats),
@@ -337,9 +337,9 @@ class CollectorService:
         lasts = {b: q.last for b, q in quotes.items() if q.last is not None}
         return exchange_id, books, lasts
 
-    async def _fx_rate(
+    async def _usdkrw_rate(
         self, failures: list[RefreshFailure]
-    ) -> hana.FxObservation | None:
+    ) -> hana.UsdKrwObservation | None:
         """하나은행 최신 고시 USD/KRW 매매기준율.
 
         예전에는 국내 거래소별 KRW-USDT 시세를 환율로 썼지만, 그 값에는
@@ -351,9 +351,9 @@ class CollectorService:
         except Exception as exc:  # noqa: BLE001 — 환율 실패가 수집 전체를 죽이면 안 된다
             failures.append(
                 RefreshFailure(
-                    exchange="fx_hana",
+                    exchange="hana",
                     sym="USD/KRW",
-                    error_code="fx_fetch_failed",
+                    error_code="usdkrw_fetch_failed",
                     message=f"{type(exc).__name__}: {exc}",
                 )
             )
@@ -362,7 +362,7 @@ class CollectorService:
     async def _binance_market(
         self,
         domestic_bases: set[str],
-        fx_rate: float | None,
+        usdkrw_rate: float | None,
         failures: list[RefreshFailure],
         warnings: list[str],
     ) -> tuple[str, dict[str, OrderBook], dict[str, float]]:
@@ -375,7 +375,7 @@ class CollectorService:
         exchange = get_exchange("binance")
         try:
             quotes = await exchange.fetch_bulk_quotes(
-                settings.fx_stablecoin, need_book=False
+                settings.overseas_quote, need_book=False
             )
         except MarketLensError as exc:
             failures.append(
@@ -396,7 +396,7 @@ class CollectorService:
 
         lasts = {b: q.last for b, q in quotes.items() if q.last is not None}
         targets = sorted(domestic_bases & set(lasts))
-        if fx_rate is None:
+        if usdkrw_rate is None:
             warnings.append(
                 "USD/KRW 환율(하나은행 고시)을 얻지 못해 바이낸스 호가 저장 깊이를 "
                 "금액 기준으로 자르지 못했습니다. 조회된 전체 깊이를 저장합니다."
@@ -408,7 +408,7 @@ class CollectorService:
             async with semaphore:
                 try:
                     book = await exchange.fetch_orderbook(
-                        Symbol(base=base, quote=settings.fx_stablecoin),
+                        Symbol(base=base, quote=settings.overseas_quote),
                         depth=settings.binance_orderbook_depth,
                         market_type=MarketType.SPOT,
                     )
@@ -446,7 +446,7 @@ class CollectorService:
         """
         try:
             quotes = await get_exchange("binance").fetch_bulk_quotes(
-                settings.fx_stablecoin,
+                settings.overseas_quote,
                 need_book=False,
                 market_type=MarketType.FUTURES,
             )

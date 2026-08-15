@@ -10,7 +10,7 @@ from conftest import (
     UPBIT_PRICES,
     fwd_execution_percent,
     rev_execution_percent,
-    seed_fx_rate,
+    seed_usdkrw_rate,
     seed_rows,
     seed_standard,
     snapshot_row,
@@ -160,7 +160,7 @@ class TestWalletFlags:
                 )
             ],
         )
-        await seed_fx_rate(db)
+        await seed_usdkrw_rate(db)
 
         res = await matrix_service.build(db, amount_krw=1_000_000.0)
         btc = res.coins[0]
@@ -201,7 +201,7 @@ class TestWalletFlags:
                 )
             ],
         )
-        await seed_fx_rate(db)
+        await seed_usdkrw_rate(db)
 
         res = await matrix_service.build(db, amount_krw=1_000_000.0)
         btc = res.coins[0]
@@ -228,7 +228,7 @@ class TestEdgeCases:
                 )
             ],
         )
-        await seed_fx_rate(db)
+        await seed_usdkrw_rate(db)
 
         res = await matrix_service.build(db, amount_krw=1_000_000.0)
         assert res.coins == []
@@ -250,7 +250,7 @@ class TestEdgeCases:
             "binance",
             [snapshot_row("binance", "AI", 100.0, quote="USDT", krw_factor=1400)],
         )
-        await seed_fx_rate(db)
+        await seed_usdkrw_rate(db)
 
         res = await matrix_service.build(db, amount_krw=1_000_000.0)
         assert res.coins[0].suspicious is True

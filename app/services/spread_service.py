@@ -10,7 +10,7 @@
 매수·매도 양쪽 중 **작은 쪽**을 USD(T) 기준으로 담는다.
 
 거래소를 직접 호출하지 않는다. ``POST /refresh`` 가 저장해둔
-``market_snapshots`` / ``fx_rate`` 를 읽어서만 계산한다.
+``market_snapshots`` / ``usdkrw_rate`` 를 읽어서만 계산한다.
 """
 
 from __future__ import annotations
@@ -113,7 +113,7 @@ class SpreadService:
 
         snapshots = await repository.get_snapshots(session)
         # 통일 환율 — 모든 페어가 같은 은행 고시 USD/KRW 를 쓴다.
-        fx_rate = await repository.require_fx_rate(session)
+        usdkrw_rate = await repository.require_usdkrw_rate(session)
 
         # 국내(KRW)와 해외(USDT) 스냅샷으로 나눈다.
         domestic: dict[str, dict[str, MarketSnapshot]] = {}
@@ -121,7 +121,7 @@ class SpreadService:
         for snap in snapshots:
             if snap.quote == settings.krw_reference_quote:
                 domestic.setdefault(snap.exchange, {})[snap.base] = snap
-            elif snap.quote == settings.fx_stablecoin:
+            elif snap.quote == settings.overseas_quote:
                 overseas.setdefault(snap.exchange, {})[snap.base] = snap
 
         if not domestic or not overseas:
@@ -139,7 +139,7 @@ class SpreadService:
 
         rows: list[SpreadRow] = []
         for dom_ex in sorted(domestic):
-            rate = fx_rate.rate
+            rate = usdkrw_rate.rate
             for fx_ex in sorted(overseas):
                 if fx_ex == dom_ex:
                     continue
@@ -157,7 +157,7 @@ class SpreadService:
         rows.sort(key=lambda r: (r.sym, r.dom, r.fx))
 
         return SpreadsResult(
-            rate=fx_rate.rate,
+            rate=usdkrw_rate.rate,
             rows=rows,
             fetched_at=int(time.time() * 1000),
             elapsed_ms=round((time.perf_counter() - started) * 1000, 2),

@@ -14,7 +14,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import MarketDataNotFoundError
-from app.db.models import FxRate, MarketSnapshot, PlatformStatus, PremiumArchive
+from app.db.models import MarketSnapshot, PlatformStatus, PremiumArchive, UsdKrwRate
 from app.models.orderbook import MarketType, OrderBook, OrderBookLevel
 
 #: 대량 INSERT 한 문장의 최대 행 수 — asyncpg 파라미터 한도(32,767개) 보호.
@@ -92,7 +92,7 @@ async def upsert_exchange_snapshots(
     return len(rows)
 
 
-async def upsert_fx_rate(
+async def upsert_usdkrw_rate(
     session: AsyncSession,
     *,
     rate: float,
@@ -109,7 +109,7 @@ async def upsert_fx_rate(
     재수신은 허용해 값이 항상 최소한 갱신 가능 상태를 유지한다.
     """
     dialect = session.get_bind().dialect.name
-    stmt = (pg_insert if dialect == "postgresql" else sqlite_insert)(FxRate).values(
+    stmt = (pg_insert if dialect == "postgresql" else sqlite_insert)(UsdKrwRate).values(
         [
             {
                 "id": 1,
@@ -128,7 +128,7 @@ async def upsert_fx_rate(
                 "round_no": stmt.excluded.round_no,
                 "updated_at": func.now(),
             },
-            where=FxRate.source_time <= stmt.excluded.source_time,
+            where=UsdKrwRate.source_time <= stmt.excluded.source_time,
         )
     )
 
@@ -404,14 +404,14 @@ async def require_snapshot(
     return snap
 
 
-async def get_fx_rate(session: AsyncSession) -> FxRate | None:
+async def get_usdkrw_rate(session: AsyncSession) -> UsdKrwRate | None:
     """통일 환율(USD/KRW 매매기준율). 아직 수집 전이면 None."""
-    return await session.get(FxRate, 1)
+    return await session.get(UsdKrwRate, 1)
 
 
-async def require_fx_rate(session: AsyncSession) -> FxRate:
+async def require_usdkrw_rate(session: AsyncSession) -> UsdKrwRate:
     """통일 환율을 가져오되, 없거나 0 이하면 도메인 예외를 던진다."""
-    rate = await get_fx_rate(session)
+    rate = await get_usdkrw_rate(session)
     if rate is None or rate.rate <= 0:
         raise MarketDataNotFoundError(
             "DB 에 USD/KRW 환율이 없습니다. "

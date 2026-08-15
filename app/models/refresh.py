@@ -28,7 +28,7 @@ class ExchangeRefreshStat(BaseModel):
     )
 
 
-class FxRateInfo(BaseModel):
+class UsdKrwRateInfo(BaseModel):
     """저장한 통일 환율 (하나은행 고시 USD/KRW 매매기준율)."""
 
     rate: float = Field(..., description="USD 1달러당 원화 (매매기준율)")
@@ -51,7 +51,7 @@ class RefreshResult(BaseModel):
     snapshots: list[ExchangeRefreshStat] = Field(
         default_factory=list, description="거래소별 스냅샷 저장 결과"
     )
-    fx: FxRateInfo | None = Field(
+    usdkrw: UsdKrwRateInfo | None = Field(
         None,
         description=(
             "저장한 통일 환율 (하나은행 USD/KRW 매매기준율). "
