@@ -92,8 +92,8 @@ async def fetch_1s_range(
     """[start_ts, end_ts) 구간의 1초봉 종가를 (epoch 초, 종가) 오름차순으로.
 
     반환값은 **모든 초**를 담는다 (밀집). 변동만 남기는 축약은 호출자
-    (:func:`app.history.service.keep_changes`) 몫이다 — 수집과 축약을
-    분리해 두면 축약 규칙이 바뀌어도 수집기는 그대로다.
+    (아카이브 서비스) 몫이다 — 수집과 축약을 분리해 두면 축약 규칙이
+    바뀌어도 수집기는 그대로다.
     """
     symbol = f"{base.upper()}USDT"
     out: list[tuple[int, Decimal]] = []

@@ -2,15 +2,15 @@
 
 거래소 간 가격차(김프·역프)를 계산하는 백엔드. 데이터 흐름은 두 갈래다.
 
-- **수집** — `POST /refresh` 가 시세·호가·입출금 상태·환율(하나은행 고시)을,
-  `POST /history/sync` 가 초 단위 **가격 변동 이력**을 PostgreSQL 에 저장한다.
-  거래소·은행을 실제로 호출하는 경로는 이 둘뿐이다.
+- **수집** — `POST /refresh` 가 시세·호가·입출금 상태·환율(하나은행 고시)을
+  저장하고, 갱신 직후 **김프/역프 기록**(premium_archive)과 **플랫폼 상태**
+  (platform_status)도 함께 쌓는다. 외부를 실제로 호출하는 경로는 이것 하나다
+  (+ 과거 구간을 채우는 scripts/bulk_archive.py).
 - **조회** — 그 외 모든 API 는 외부를 직접 부르지 않고 **DB 만 읽어** 계산한다.
 
 - Base URL (로컬): `http://localhost:8000`
-- 인증: 조회 API 는 **없음**. `POST /refresh` 와 `POST /history/sync` 만 서버에
-  `REFRESH_TOKEN` 이 설정된 경우 `X-Refresh-Token` 헤더가 필요하다
-  (로컬처럼 비어 있으면 검사 안 함).
+- 인증: 조회 API 는 **없음**. `POST /refresh` 만 서버에 `REFRESH_TOKEN` 이
+  설정된 경우 `X-Refresh-Token` 헤더가 필요하다 (로컬처럼 비어 있으면 검사 안 함).
 - 응답 형식: `application/json`
 - 대화형 문서: `http://localhost:8000/docs` (Swagger UI), `http://localhost:8000/redoc`
 
@@ -36,7 +36,7 @@
    - [GET /slippage/{exchange_id}](#get-slippageexchange_id)
    - [GET /matrix](#get-matrix)
    - [GET /arbitrage](#get-arbitrage)
-   - [GET /history/coin · /history/fx · POST /history/sync](#가격-변동-이력--historycoin--historyfx--historysync)
+   - [GET /history/premium · /history/status](#기록통계--historypremium--historystatus)
 6. [에러 응답](#6-에러-응답)
 7. [수집기가 호출하는 원본 거래소 API](#7-수집기가-호출하는-원본-거래소-api)
 8. [API 키 · 입출금 상태 조회](#8-api-키--입출금-상태-조회)
@@ -57,8 +57,8 @@
 
 ### 테이블
 
-라이브 테이블 2개(아래)와 변동 이력 테이블 5개가 있다. 이력 쪽 구조와 압축
-원리는 **[DB.md](DB.md)** 에 따로 정리돼 있다.
+테이블은 4개다 — 스냅샷·환율(아래) + 김프 기록(premium_archive) +
+플랫폼 상태(platform_status). 전체 구조는 **[DB.md](DB.md)** 참고.
 
 #### `market_snapshots` — 거래소 × 코인 하나당 한 행
 
@@ -92,8 +92,8 @@
   `ORDERBOOK_MAX_AMOUNT_KRW`(기본 10억원)에 도달하는 깊이까지만 저장한다.
   그보다 큰 금액의 슬리피지는 계산할 수 없고, 응답에 `depth_exhausted` 로
   표시된다.
-- **없어진 코인은 삭제** — 이번 수집에 없는 코인(상장폐지 등)은 그 거래소의
-  행에서 지운다. DB 는 항상 "마지막 수집 시점의 전체 스냅샷"이다.
+- **코인을 찾아 갱신만 한다** — 이번 수집에 없는 코인도 지우지 않는다.
+  상장폐지 코인은 행이 남되 `updated_at` 이 멈추므로 신선도로 걸러진다.
 
 ### 데이터 신선도
 
@@ -139,7 +139,7 @@
 | `GET /slippage/{id}` | `app/api/routes/slippage.py` | `app/services/slippage_service.py` | `app/models/slippage.py` |
 | `GET /matrix` | `app/api/routes/matrix.py` | `app/services/matrix_service.py` | `app/models/matrix.py` |
 | `GET /arbitrage` | `app/api/routes/arbitrage.py` | `app/services/arbitrage_service.py` | `app/models/arbitrage.py` |
-| `GET /history/*` · `POST /history/sync` | `app/api/routes/history.py` | `app/history/service.py` | 라우트 파일 안 |
+| `GET /history/*` | `app/api/routes/history.py` | `app/history/service.py` | 라우트 파일 안 |
 
 ---
 
@@ -199,9 +199,8 @@ Adminer (http://localhost:8080): 시스템 `PostgreSQL`, 서버 `db`,
 | `GET /slippage/{id}` | **슬리피지** — 시장가 거래 시 평균 체결가 악화 | 거래소, 심볼, 방향, 금액/수량 | 평균 체결가, 슬리피지 %, 단계별 체결 |
 | `GET /matrix` | **전 코인 매트릭스** — 코인별 최대 김프·최대 역프 | 금액 1개 | 코인별 최적 조합 + 실현 수익률 + 입출금 가능 여부 |
 | `GET /arbitrage` | **N원 넣으면 실제로 얼마 남나** | 코인, 금액, 통화, 방향 | 매수/매도처, 슬리피지, 실수익 |
-| `GET /history/coin` | **가격 변동 로그** — 몇 초 뒤에 얼마로 변했나 | 거래소, 코인, 주/월 | dt·price·diff 이벤트 열 |
-| `GET /history/fx` | **환율 변동 로그** | 주/월 | dt·환율 이벤트 열 |
-| `POST /history/sync` | **이력 증분 수집 + 팩킹** (cron 용) | 없음 | 시리즈별 신규 이벤트 수 |
+| `GET /history/premium` | **김프/역프 기록** — 몇 초 뒤에 얼마로 바뀌었나 | 코인, 페어, 주/월 | dt·fwd·rev 기록 열 |
+| `GET /history/status` | **플랫폼 상태** — 마지막 수신·마켓 수·입출금 실패율 | 없음 | 플랫폼별 카운터 |
 
 ### 조회 가능한 데이터 범위
 
@@ -218,7 +217,7 @@ Adminer (http://localhost:8080): 시스템 `PostgreSQL`, 서버 `db`,
 | **입금/출금 가능 여부** | ✅ | 수집 시 저장. 업비트·바이낸스는 API 키 필요, 없으면 null |
 | 선물 시세 | ❌ | DB 는 **현물만** 저장한다 |
 | 시가·고가·저가·등락률·거래량 | ❌ | 저장하지 않음 |
-| 초 단위 가격·환율 변동 이력 | ✅ | `/history/coin` · `/history/fx` — 변동 순간만 저장 ([HISTORY.md](HISTORY.md)) |
+| 김프/역프 기록 (초 단위까지) | ✅ | `/history/premium` — refresh 실시간 + 대량 채우기 ([HISTORY.md](HISTORY.md)) |
 | 개별 체결 내역 / 캔들 | ❌ | 원본 캔들은 저장하지 않는다 (변동 이벤트로 축약) |
 | 거래·출금 수수료 반영 | ❌ | 모든 수익 계산이 **수수료 미반영 이론값** |
 | 잔고 · 주문 · 입출금 실행 | ❌ | 미구현 |
@@ -283,9 +282,9 @@ DB 는 거래소당 한 마켓(국내 = KRW, 바이낸스 = USDT)만 저장하�
 - **USDT≈USD 페그 전제.** 해외 가격은 USDT 표시지만 은행 USD/KRW 를 곱해
   환산한다 — 김프 계산의 업계 표준 방식이다.
 - 은행은 하루 1,300~2,000회(평균 ~44초 간격) 고시하며, `POST /refresh` 와
-  `POST /history/sync` 가 최신 고시를 저장한다. 각 응답의 `rate_updated_at`
+  최신 고시는 `POST /refresh` 가 저장한다. 각 응답의 `rate_updated_at`
   (또는 `/rate` 의 `updated_at`)으로 신선도를 확인한다.
-- 과거 환율의 변동 이력은 `GET /history/fx` 로 조회한다.
+- 과거 김프/역프 기록은 `GET /history/premium` 으로 조회한다.
 
 ---
 
@@ -303,12 +302,14 @@ DB 는 거래소당 한 마켓(국내 = KRW, 바이낸스 = USDT)만 저장하�
 | KRW 전종목 현재가 + 호가 | 업비트 · 빗썸 (전종목 일괄 조회) | `market_snapshots` |
 | USDT 마켓 현재가 + 호가 | 바이낸스 (국내 상장 코인만, 심볼별 depth) | `market_snapshots` |
 | 입출금 가능 여부 | 업비트 · 바이낸스 (API 키 필요) · 빗썸 (public) | `market_snapshots` |
-| USD/KRW 환율 (하나은행 고시 매매기준율) | 하나은행 | `fx_rate` + 이력 `fx_points` |
+| USD/KRW 환율 (하나은행 고시 매매기준율) | 하나은행 | `fx_rate` |
+| 김프/역프 기록 (갱신 직후 계산) | — | `premium_archive` |
+| 플랫폼 수신 상태·실패율 카운터 | — | `platform_status` |
 
 - 가격·호가는 **환산 없이 그 거래소 통화 그대로** 저장된다.
 - 호가는 `ORDERBOOK_MAX_AMOUNT_KRW`(기본 10억원)의 체결을 커버하는 깊이까지만
   저장된다. 바이낸스 호가는 USDT 기준이므로 통일 환율로 환산한 금액을 쓴다.
-- 이번 수집에 없는 코인은 지워진다 (응답의 `deleted`).
+- 이번 수집에 없는 코인도 지우지 않는다 — 코인을 찾아 갱신만 하며, 낡은 행은 `updated_at` 으로 판별한다.
 - API 키가 없으면 입출금 가능 여부만 null 로 저장되고 나머지는 정상 수집된다
   (`warnings` 에 표시).
 - 부분 실패를 허용한다 — 개별 거래소·심볼 조회 실패는 `failures` 에 담기고
@@ -336,14 +337,15 @@ curl -X POST "http://localhost:8000/refresh" -H "X-Refresh-Token: <토큰>"
 ```json
 {
   "snapshots": [
-    { "exchange": "upbit", "saved": 189, "deleted": 0,
+    { "exchange": "upbit", "saved": 189,
       "wallet_status_available": true, "mode": "bulk" },
-    { "exchange": "bithumb", "saved": 313, "deleted": 1,
+    { "exchange": "bithumb", "saved": 313,
       "wallet_status_available": true, "mode": "bulk" },
-    { "exchange": "binance", "saved": 202, "deleted": 0,
+    { "exchange": "binance", "saved": 202,
       "wallet_status_available": false, "mode": "per_symbol" }
   ],
   "fx": { "rate": 1418.4, "source_time": 1786627013, "round_no": 732 },
+  "archived": 391,
   "total_saved": 704,
   "failures": [],
   "warnings": [
@@ -357,10 +359,11 @@ curl -X POST "http://localhost:8000/refresh" -H "X-Refresh-Token: <토큰>"
 
 | 필드 | 설명 |
 |---|---|
-| `snapshots[].saved` / `deleted` | 저장(UPSERT)한 코인 수 / 이번 수집에 없어서 지운 코인 수 |
+| `snapshots[].saved` | 저장(UPSERT)한 코인 수 — 이번 수집에 없는 코인도 지우지 않는다 |
 | `snapshots[].wallet_status_available` | 입출금 가능 여부를 채웠는지. false 면 키가 없거나 조회 실패 → null 저장 |
 | `snapshots[].mode` | `bulk`=전종목 일괄 조회 (업비트·빗썸), `per_symbol`=심볼별 조회 (바이낸스) |
 | `fx` | 저장한 통일 환율 (하나은행 고시). 이번 수집 실패 시 null — 계산은 DB 의 마지막 환율로 계속 |
+| `archived` | 이번 회차에 남긴 김프/역프 기록 수 — (국내 거래소 × 코인)당 한 줄 |
 | `failures` | 수집하지 못한 항목 (`exchange`, `sym`, `error_code`, `message`) |
 | `warnings` | 키 없음, 환율 조회 실패 등 주의 사항 |
 | `total_calls` | 이번 갱신에서 나간 **거래소 HTTP 호출 수** (실측) |
@@ -436,8 +439,8 @@ curl "http://localhost:8000/exchanges"
 
 **USD/KRW 통일 환율 조회 — DB 저장값.**
 
-값은 **하나은행 고시 매매기준율**이다. `POST /refresh` 와 `POST /history/sync`
-가 최신 고시를 저장한다. 파라미터는 없다 (거래소별 환율 개념이 없어졌다).
+값은 **하나은행 고시 매매기준율**이다. `POST /refresh` 가 최신 고시를
+저장한다. 파라미터는 없다 (거래소별 환율 개념이 없어졌다).
 
 ```bash
 curl "http://localhost:8000/rate"
@@ -463,7 +466,7 @@ curl "http://localhost:8000/rate"
 | `round_no` | 당일 고시 회차 |
 | `updated_at` | DB 저장 시각 (epoch ms) — **데이터 신선도 기준** |
 
-아직 수집 전이면 `404 market_data_not_found`. 과거 환율은 `GET /history/fx`.
+아직 수집 전이면 `404 market_data_not_found`.
 
 ---
 
@@ -1294,26 +1297,26 @@ curl "http://localhost:8000/arbitrage?sym=XRP&amount=5000&currency=USDT&exchange
 
 ---
 
-### 가격 변동 이력 — /history/coin · /history/fx · /history/sync
+### 기록/통계 — /history/premium · /history/status
 
-김프/역프 통계의 재료인 **초 단위 가격·환율 변동 로그**다. 사용법·백필·운영은
-**[HISTORY.md](HISTORY.md)**, 저장 구조는 **[DB.md](DB.md)** 에 정리돼 있다.
+기록/통계 창의 데이터다. 사용법·대량 채우기·운영은 **[HISTORY.md](HISTORY.md)**,
+저장 구조는 **[DB.md](DB.md)** 에 정리돼 있다.
 
 | 엔드포인트 | 무엇을 하나 |
 |---|---|
-| `GET /history/coin?exchange=&base=&unit=week\|month&date=&offset=&limit=` | 코인 가격 변동 로그 — 각 이벤트는 `dt`(직전 변동에서 몇 초 뒤)·`price`·`diff` |
-| `GET /history/fx?unit=&date=&offset=&limit=` | 환율(USD/KRW) 변동 로그 — 같은 형식, 거래소·코인 개념 없음 |
-| `POST /history/sync` | 증분 수집 + 완결된 날 팩킹. 1분 cron 용, `X-Refresh-Token` 적용 |
+| `GET /history/premium?base=&unit=week\|month&date=&dom=&fx=&offset=&limit=` | 김프/역프 기록 — 각 항목은 `dt`(직전 기록에서 몇 초 뒤)·`fwd`(김프 %)·`rev`(역프 %) |
+| `GET /history/status` | 플랫폼별 마지막 수신 시각·상장 마켓 수(현물/선물)·입출금 실패율 |
 
 ```bash
-curl "http://localhost:8000/history/coin?exchange=binance&base=BTC&unit=week&limit=20"
-curl "http://localhost:8000/history/fx?unit=month&date=2026-08-01&limit=20"
+curl "http://localhost:8000/history/premium?base=BTC&unit=week&limit=20"
+curl "http://localhost:8000/history/status"
 ```
 
 - DB 는 절대 시각(epoch 초)으로 저장하고, 응답은 상대 시간 차(`dt`)로 준다 —
   `first_ts` 에 dt 를 누적하면 절대 타임라인이 복원된다.
-- 이력은 업비트·바이낸스만 지원한다 (빗썸 초봉 API 미확인).
-- 과거 3개월 백필: `python -m scripts.backfill_history --bases BTC`
+- 기록은 refresh 가 매 회차 남기는 실시간 기록(호가 기준)과, 대량 채우기가
+  캔들로 계산한 과거 기록(종가 기준)이 한 타임라인에 섞인다.
+- 과거 구간 채우기: `python -m scripts.bulk_archive --bases BTC`
 
 ---
 
@@ -1350,9 +1353,9 @@ curl "http://localhost:8000/history/fx?unit=month&date=2026-08-01&limit=20"
 
 ## 7. 수집기가 호출하는 원본 API
 
-`POST /refresh` 와 `POST /history/sync` 가 부르는 외부 API 들이다. 시세·호가·
-환율·이력은 **모두 인증이 필요 없는 public API** 이고, 입출금 상태만 거래소에
-따라 키가 필요하다 ([8장](#8-api-키--입출금-상태-조회)).
+`POST /refresh` 와 `scripts/bulk_archive.py` 가 부르는 외부 API 들이다.
+시세·호가·환율·캔들은 **모두 인증이 필요 없는 public API** 이고, 입출금
+상태만 거래소에 따라 키가 필요하다 ([8장](#8-api-키--입출금-상태-조회)).
 
 ### 업비트 · 빗썸 (v1 API 형태가 같다)
 
@@ -1394,13 +1397,13 @@ curl "http://localhost:8000/history/fx?unit=month&date=2026-08-01&limit=20"
 - Base URL: `https://www.kebhana.com` (설정 `HANA_FX_BASE_URL`)
 - 파라미터·파싱 상세는 `app/history/hana.py` 모듈 docstring 참고.
 
-### 변동 이력 수집 (`POST /history/sync` · 백필)
+### 김프 기록 대량 채우기 (`scripts/bulk_archive.py`)
 
 | 원천 | 엔드포인트 | 비고 |
 |---|---|---|
 | 업비트 초봉 | `GET /v1/candles/seconds?market=KRW-BTC&count=200&to=...` | 체결 있던 초만 캔들 존재. **보관 3개월 롤링**, 요청당 200개, candles 그룹 10 req/s |
 | 바이낸스 1초봉 | `GET /api/v3/klines?symbol=BTCUSDT&interval=1s&limit=1000&startTime=...` | 전체 이력, 요청당 1000개, weight 2/호출 |
-| 하나은행 고시 | 위와 동일 | sync 는 최신 1건 폴링, 백필은 회차 루프 |
+| 하나은행 고시 | 위와 동일 (refresh 는 최신 1건, 대량 채우기는 회차 샘플링) | |
 
 ### 입출금 상태
 

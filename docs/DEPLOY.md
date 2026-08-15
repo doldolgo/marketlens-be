@@ -30,7 +30,7 @@ AWS 콘솔 → RDS → 데이터베이스 생성:
 ```bash
 # EC2 의 ~/marketlens-be/.env
 DATABASE_URL=postgresql://marketlens:<비밀번호>@<RDS엔드포인트>:5432/marketlens
-REFRESH_TOKEN=랜덤문자열                # POST /refresh·/history/sync 보호 (openssl rand -hex 32)
+REFRESH_TOKEN=랜덤문자열                # POST /refresh 보호 (openssl rand -hex 32)
 UPBIT_API_KEY=...                       # 입출금 상태 조회용 (선택)
 UPBIT_SECRET_KEY=...
 BINANCE_API_KEY=...
@@ -51,39 +51,33 @@ HISTORY_BASES=["BTC"]                   # 변동 이력을 수집할 코인 (선
 시세·이력 갱신은 자동이 아니다 — EC2 crontab 으로 주기 호출한다:
 
 ```bash
-# 라이브 시세·호가·환율 갱신 (매분)
+# 라이브 시세·호가·환율 갱신 (매분) — 김프/역프 기록과 플랫폼 상태도 함께 쌓인다
 * * * * * curl -s -X POST -H "X-Refresh-Token: <토큰>" http://localhost:8000/refresh > /dev/null
-# 가격 변동 이력 증분 수집 (매분) — 김프/역프 통계용, /history/*
-* * * * * curl -s -X POST -H "X-Refresh-Token: <토큰>" http://localhost:8000/history/sync > /dev/null
 ```
 
-## 변동 이력 백필 (이력 기능 배포 후 최초 1회)
+## 김프 기록 대량 채우기 (배포 후 최초 1회)
 
-과거 3개월치를 채운다. 업비트 초봉이 3개월 롤링이라 **배포 후 바로 돌리는 게
-이득**이다 (미룰수록 과거를 잃는다). 중단돼도 재실행하면 이어서 진행된다.
+과거 3개월치 김프/역프 기록을 채운다. 업비트 초봉이 3개월 롤링이라 **배포 후
+바로 돌리는 게 이득**이다 (미룰수록 과거를 잃는다). 중단돼도 재실행하면
+이어서 진행된다.
 
 ```bash
-docker compose exec be python -m scripts.backfill_history --bases BTC
+docker compose exec be python -m scripts.bulk_archive --bases BTC
 ```
 
-옵션·소요 시간은 [HISTORY.md](HISTORY.md#백필--과거-3개월-채우기-최초-1회) 참고.
+옵션·소요 시간은 [HISTORY.md](HISTORY.md#대량-채우기-실행법-최초-1회--필요할-때) 참고.
 
-## 환율 통일 마이그레이션 (1회성)
+## 구조 마이그레이션
 
-환율이 거래소별 KRW-USDT 에서 하나은행 고시 USD/KRW(`fx_rate`)로 통일되면서
-예전 테이블은 더 이상 쓰이지 않는다. 배포 후 RDS 에서 정리한다:
-
-```sql
-DROP TABLE IF EXISTS krw_rates;
-```
-
-(테이블 자동 생성은 "없는 것만 만들기"라 옛 테이블을 지워주지 않는다.)
+별도 작업이 필요 없다 — **앱이 기동할 때 이전 구조의 잔재를 자동 정리**한다
+(구 압축 이력 테이블 price_points/price_chunks/fx_points/fx_chunks/
+history_cursors 와 krw_rates 를 DROP — `app/db/views.py` CLEANUP_DDL).
 
 ## 트러블슈팅
 
-- 배포 직후 `/rate` 가 404 → 아직 환율 수집 전이다. refresh 나 sync 가 한 번
+- 배포 직후 `/rate` 가 404 → 아직 환율 수집 전이다. refresh 가 한 번
   돌면 채워진다.
-- `/history/*` 가 404 (구간에 데이터 없음) → 백필을 안 돌렸거나 sync cron 이
-  없는 상태다.
-- sync 응답의 `failures` 에 특정 시리즈가 반복해서 나오면 해당 원천 API 장애
-  — 커서 덕분에 복구되면 밀린 구간을 자동으로 따라잡는다.
+- `/history/premium` 이 404 (구간에 기록 없음) → refresh cron 이 없거나,
+  과거 구간은 bulk_archive 를 아직 안 돌린 상태다.
+- refresh 가 오래 멈췄다 재개되면 그 사이 기록이 비는데, bulk_archive 를
+  돌리면 마지막 기록 이후 구간이 초 단위로 채워진다.

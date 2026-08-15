@@ -43,9 +43,8 @@ class TestBasicEndpoints:
             "/slippage/{exchange_id}",
             "/matrix",
             "/arbitrage",
-            "/history/coin",
-            "/history/fx",
-            "/history/sync",
+            "/history/premium",
+            "/history/status",
         }
 
     async def test_every_operation_has_summary(self, client) -> None:

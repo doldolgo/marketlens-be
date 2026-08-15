@@ -74,13 +74,14 @@ async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         # 읽기 전용 뷰 — epoch 초를 연도 포함 KST 시각으로 보여준다.
+        # 이전 구조(압축 이력·krw_rates)의 잔재도 이때 정리한다.
         # PostgreSQL 전용 (테스트용 SQLite 에는 만들지 않는다).
         if conn.dialect.name == "postgresql":
             from sqlalchemy import text
 
-            from app.db.views import VIEW_DDL
+            from app.db.views import CLEANUP_DDL, VIEW_DDL
 
-            for ddl in VIEW_DDL:
+            for ddl in (*CLEANUP_DDL, *VIEW_DDL):
                 await conn.execute(text(ddl))
 
 

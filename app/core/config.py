@@ -57,13 +57,11 @@ class Settings(BaseSettings):
     #: 하나은행 고시환율 조회 베이스 URL. 모든 원화 환산이 이 환율로 통일된다.
     hana_fx_base_url: str = "https://www.kebhana.com"
 
-    # ── 가격 변동 이력 ────────────────────────────────────────────────
-    #: 변동 이력을 수집할 코인 목록. POST /history/sync 가 이 코인들을 돈다.
-    #: (백필 스크립트는 --bases 인자로 별도 지정)
+    # ── 김프/역프 기록 (premium_archive) ─────────────────────────────
+    #: 대량 업데이트(scripts/bulk_archive.py)의 기본 대상 코인 목록 —
+    #: CLI --bases 를 생략하면 이 값을 쓴다. 실시간 기록은 refresh 가
+    #: 국내 상장 전 코인에 대해 자동으로 남기므로 여기 없어도 기록된다.
     history_bases: list[str] = ["BTC"]
-    #: 커서가 없는 시리즈의 첫 sync 가 거슬러 올라갈 최대 시간(초).
-    #: 그보다 먼 과거는 scripts/backfill_history.py 몫이다.
-    history_sync_lookback_seconds: int = 3600
 
     # 전종목 스캔 —
     #: 이 값을 넘는 프리미엄은 '의심' 으로 표시한다.

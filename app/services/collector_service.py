@@ -7,11 +7,15 @@
     1. 국내 거래소(업비트·빗썸)의 **KRW 전종목** — 현재가 + 호가 깊이
     2. 바이낸스의 USDT 마켓 중 **국내에 상장된 코인** — 현재가 + 호가 깊이
     3. 각 거래소의 **입출금 가능 여부** (업비트·바이낸스는 API 키 필요, 빗썸은 public)
-    4. **환율** — 하나은행 고시 USD/KRW 매매기준율 (거래소별 KRW-USDT 시세를
-       쓰던 예전 방식을 대체. 모든 원화 환산이 이 값 하나로 통일된다)
+    4. **환율** — 하나은행 고시 USD/KRW 매매기준율 (모든 원화 환산 통일)
 
-환율은 라이브 단일 행(``fx_rate``)과 변동 이력 스테이징(``fx_points``)에
-동시에 반영된다 — refresh 만 주기적으로 돌아도 환율 이력이 쌓인다.
+저장은 세 갈래다.
+    - ``market_snapshots`` — 코인을 찾아 **UPSERT 만** 한다 (삭제 없음).
+      실시간 스프레드 창의 데이터.
+    - ``premium_archive`` — 방금 갱신한 스냅샷에서 코인·시각·김프·역프만
+      뽑아 한 줄씩 추가한다. 기록/통계 창의 데이터.
+    - ``platform_status`` — 플랫폼당 한 행: 마지막 수신 시각과 카운터
+      (전체 업데이트 횟수 +1, 입출금 불가 관측 시 실패 횟수 +1).
 
 호가는 전부 저장하지 않는다. 슬리피지 계산이 커버해야 하는 최대 금액
 (``ORDERBOOK_MAX_AMOUNT_KRW``)에 누적 체결 가능액이 도달할 때까지의 단계만
@@ -40,6 +44,7 @@ from app.exchanges.private.wallet_status import (
 from app.exchanges.registry import domestic_exchange_ids, get_exchange
 from app.history import hana
 from app.history import service as history_service
+from app.history.service import premium_from_quotes
 from app.models.orderbook import MarketType, OrderBook, OrderBookLevel
 from app.models.refresh import (
     ExchangeRefreshStat,
@@ -129,22 +134,24 @@ class CollectorService:
         for _, books, _ in domestic_results:
             domestic_bases |= set(books)
 
-        binance_result = await self._binance_market(
-            domestic_bases, fx_rate_value, failures, warnings
+        binance_result, futures_market_count = await asyncio.gather(
+            self._binance_market(domestic_bases, fx_rate_value, failures, warnings),
+            self._binance_futures_count(warnings),
         )
 
         # 3단계 — DB 반영. 한 트랜잭션으로 묶는다.
         stats: list[ExchangeRefreshStat] = []
         max_amount = settings.orderbook_max_amount_krw
+        now_ts = int(time.time())
+        #: 아카이브 계산용 — 이번에 갱신된 거래소별 호가 원본
+        books_by_exchange: dict[str, dict[str, OrderBook]] = {}
 
         for (eid, books, lasts), mode in [
             *[(r, "bulk") for r in domestic_results],
             (binance_result, "per_symbol"),
         ]:
             # 수집이 통째로 실패한 거래소는 DB 를 건드리지 않는다.
-            # 빈 결과로 replace 하면 일시적 API 장애 한 번에 그 거래소의
-            # 기존 데이터가 전부 삭제되어 버린다. 낡은 데이터가 없는 것보다 낫고,
-            # 신선도는 updated_at 으로 판별할 수 있다.
+            # 기존 스냅샷이 남아 있고, 신선도는 updated_at 으로 판별한다.
             if not books:
                 warnings.append(
                     f"{eid} 수집 결과가 비어 있어 기존 스냅샷을 유지합니다 "
@@ -154,7 +161,6 @@ class CollectorService:
                     ExchangeRefreshStat(
                         exchange=eid,
                         saved=0,
-                        deleted=0,
                         wallet_status_available=wallets.get(eid) is not None,
                         mode=mode,
                     )
@@ -174,24 +180,85 @@ class CollectorService:
                     max_amount, fx_rate_value
                 ),
             )
-            saved, deleted = await repository.replace_exchange_snapshots(
-                session, eid, rows
-            )
+            # 코인을 찾아 UPSERT 만 한다 — 지웠다 다시 만들지 않는다.
+            saved = await repository.upsert_exchange_snapshots(session, eid, rows)
+            books_by_exchange[eid] = books
             stats.append(
                 ExchangeRefreshStat(
                     exchange=eid,
                     saved=saved,
-                    deleted=deleted,
                     wallet_status_available=wallet is not None,
                     mode=mode,
                 )
             )
 
+            # 플랫폼 상태 — 마지막 수신 시각 + 카운터.
+            # 입출금 불가(false)가 하나라도 관측됐으면 실패 횟수 +1.
+            # (null 은 "확인 불가"이지 실패가 아니다)
+            dw_failed = any(
+                r.deposit_enabled is False or r.withdrawal_enabled is False
+                for r in rows
+            )
+            await repository.bump_platform_status(
+                session,
+                exchange=eid,
+                received_ts=now_ts,
+                # 국내는 KRW 전종목 = 상장 현물 마켓 수. 바이낸스는 일괄
+                # 조회가 준 USDT 전종목 수가 상장 마켓 수다.
+                spot_market_count=len(lasts) if eid == "binance" else len(books),
+                futures_market_count=(
+                    futures_market_count if eid == "binance" else 0
+                ),
+                dw_failed=dw_failed,
+            )
+
         if fx_observation is not None:
-            # 라이브 단일 행(fx_rate) 갱신 + 환율 변동 이력 적재.
-            # "변동만 저장" 규칙은 record_fx_observation 한 곳에 구현돼 있고
-            # POST /history/sync 도 같은 경로를 쓴다.
+            # 라이브 환율 단일 행(fx_rate) 갱신 — 역행은 UPSERT 가드가 막는다.
             await history_service.record_fx_observation(session, fx_observation)
+
+        # 4단계 — 김프/역프 아카이브. 방금 갱신한 스냅샷에서 코인·시각·
+        # 김프·역프만 뽑아 기록 테이블에 한 줄씩 추가한다 (기록/통계 창).
+        archived = 0
+        if fx_rate_value is not None and "binance" in books_by_exchange:
+            archive_rows: list[dict] = []
+            fx_books = books_by_exchange["binance"]
+            for dom_eid in domestic_ids:
+                dom_books = books_by_exchange.get(dom_eid)
+                if not dom_books:
+                    continue
+                for base in dom_books.keys() & fx_books.keys():
+                    dom_book, fx_book = dom_books[base], fx_books[base]
+                    if not (
+                        dom_book.bids and dom_book.asks
+                        and fx_book.bids and fx_book.asks
+                    ):
+                        continue
+                    result = premium_from_quotes(
+                        dom_book.bids[0].price,
+                        dom_book.asks[0].price,
+                        fx_book.bids[0].price,
+                        fx_book.asks[0].price,
+                        fx_rate_value,
+                    )
+                    if result is None:
+                        continue
+                    archive_rows.append(
+                        {
+                            "dom": dom_eid,
+                            "fx": "binance",
+                            "base": base,
+                            "ts": now_ts,
+                            "fwd": result[0],
+                            "rev": result[1],
+                        }
+                    )
+            if archive_rows:
+                archived = await repository.add_premium_rows(session, archive_rows)
+        elif fx_rate_value is None:
+            warnings.append(
+                "환율이 없어 이번 회차의 김프 기록(premium_archive)을 건너뜁니다."
+            )
+
         await session.commit()
 
         return RefreshResult(
@@ -206,6 +273,7 @@ class CollectorService:
                 else None
             ),
             total_saved=sum(s.saved for s in stats),
+            archived=archived,
             failures=failures,
             warnings=warnings,
             total_calls=sum(request_counts().values()) - calls_before,
@@ -369,6 +437,23 @@ class CollectorService:
         results = await asyncio.gather(*(one(b) for b in targets))
         books = {base: book for base, book in results if book is not None}
         return "binance", books, lasts
+
+    async def _binance_futures_count(self, warnings: list[str]) -> int | None:
+        """바이낸스 USDT 선물의 상장 마켓 수 (일괄 조회 1회).
+
+        platform_status.futures_market_count 용이다. 실패해도 수집 전체는
+        계속한다 — 이번 회차만 이전 값이 유지되도록 None 을 돌려준다.
+        """
+        try:
+            quotes = await get_exchange("binance").fetch_bulk_quotes(
+                settings.fx_stablecoin,
+                need_book=False,
+                market_type=MarketType.FUTURES,
+            )
+            return len(quotes)
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"바이낸스 선물 마켓 수 조회 실패 — {exc}")
+            return None
 
     # ------------------------------------------------------------------
     # 변환
