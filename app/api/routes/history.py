@@ -26,7 +26,7 @@
 from __future__ import annotations
 
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Query
@@ -38,6 +38,20 @@ from app.db import repository
 from app.db.database import get_session
 from app.db.models import PremiumArchive
 from app.history import service as history_service
+from app.history.streaks import (
+    DEFAULT_MAX_GAP_SECONDS,
+    StreakStats,
+    find_segments,
+)
+from app.models.streak import (
+    OverallStats,
+    StreakDirection,
+    StreakResponse,
+    StreakSegment,
+)
+
+#: 응답의 사람이 읽는 시각은 KST 로 준다 (서비스 사용자가 국내 기준이다).
+KST = timezone(timedelta(hours=9))
 
 router = APIRouter(prefix="/history", tags=["history"])
 
@@ -283,5 +297,152 @@ async def platform_status(
             )
             for r in rows
         ],
+        fetched_at=int(time.time() * 1000),
+    )
+
+
+def _kst_iso(ts: int) -> str:
+    """epoch 초 → KST ISO 8601 문자열."""
+    return datetime.fromtimestamp(ts, tz=KST).isoformat()
+
+
+def _to_direction(stats: StreakStats) -> StreakDirection:
+    return StreakDirection(
+        count=stats.count,
+        max_duration_seconds=stats.max_duration_seconds,
+        avg_duration_seconds=stats.avg_duration_seconds,
+        max_percent=stats.max_percent,
+        avg_percent=stats.avg_percent,
+        segments=[
+            StreakSegment(
+                start_ts=s.start_ts,
+                end_ts=s.end_ts,
+                start=_kst_iso(s.start_ts),
+                end=_kst_iso(s.end_ts),
+                duration_seconds=s.duration_seconds,
+                samples=s.samples,
+                max_percent=s.max_percent,
+                avg_percent=s.avg_percent,
+            )
+            for s in stats.segments
+        ],
+    )
+
+
+@router.get(
+    "/streaks",
+    response_model=StreakResponse,
+    summary="김프/역프 구간 통계 (기준치 이상이 언제부터 언제까지)",
+    description=(
+        "한 코인이 **언제까지 김프였고 언제까지 역프였는지**를 구간으로 묶어 "
+        "돌려준다 — 기록/통계 창의 요약 데이터.\n\n"
+        "`threshold` 로 기준치를 주면 그 값 **이상**인 기록만 남기고, 시각이 "
+        "이어지는 것끼리 묶어 한 구간으로 본다. 기준치를 올릴수록 구간이 잘게 "
+        "쪼개진다.\n\n"
+        "예 — 값이 `0 1 3 6 29 4 31` 이고 `threshold=4` 면 `6 29 4 31` 이 남아 "
+        "**구간 1개**다. `threshold=5` 면 4 가 탈락해 이어짐이 끊기고 "
+        "`(6 29)`, `(31)` **구간 2개**가 된다.\n\n"
+        "김프(`fwd`)와 역프(`rev`)는 **각각 따로** 센다. 둘은 부호만 뒤집은 같은 "
+        "값이 아니다 — 양쪽 호가 차이 때문에 둘 다 음수인 순간이 많아서, "
+        "절댓값이 아니라 방향별로 `>= threshold` 를 본다.\n\n"
+        "수집이 멈췄던 구멍은 이어 붙이지 않는다. 이웃한 기록이 "
+        "`max_gap` 초를 넘겨 벌어져 있으면 거기서 구간을 끊는다 — 그러지 않으면 "
+        "'몇 시간 연속 김프' 라는 없던 사실이 만들어진다."
+    ),
+)
+async def premium_streaks(
+    session: Annotated[AsyncSession, Depends(get_session)],
+    base: Annotated[str, Query(description="코인 심볼", examples=["BTC"])],
+    threshold: Annotated[
+        float,
+        Query(
+            ge=0,
+            description="기준치 %. 이 값 **이상**인 기록만 구간에 든다 (초과가 아님)",
+            examples=[1.0],
+        ),
+    ] = 0.0,
+    dom: Annotated[
+        Literal["upbit", "bithumb"], Query(description="국내 거래소 ID")
+    ] = "upbit",
+    fx: Annotated[Literal["binance"], Query(description="해외 거래소 ID")] = "binance",
+    start: Annotated[
+        int | None,
+        Query(description="조회 시작 (epoch 초). 생략하면 기록의 처음부터"),
+    ] = None,
+    end: Annotated[
+        int | None,
+        Query(description="조회 종료 (epoch 초, 미포함). 생략하면 지금까지"),
+    ] = None,
+    max_gap: Annotated[
+        int,
+        Query(
+            ge=1,
+            description=(
+                "이 초를 넘겨 기록이 벌어지면 구간을 끊는다 "
+                f"(기본 {DEFAULT_MAX_GAP_SECONDS}초 — 정상 수집 간격은 약 60초)"
+            ),
+        ),
+    ] = DEFAULT_MAX_GAP_SECONDS,
+) -> StreakResponse:
+    symbol = base.upper()
+    bounds = await repository.get_premium_bounds(session, dom, fx, symbol)
+    if bounds is None:
+        raise MarketDataNotFoundError(
+            f"{dom}×{fx} {symbol} 의 김프 기록이 없습니다. refresh 가 돌고 "
+            "있는지, 과거 구간은 bulk_archive 스크립트를 실행했는지 확인하세요.",
+            detail={"dom": dom, "fx": fx, "base": symbol},
+        )
+    first_ts, last_ts = bounds
+
+    start_ts = first_ts if start is None else start
+    end_ts = (int(time.time()) + 1) if end is None else end
+    if end_ts <= start_ts:
+        raise InvalidRequestError(
+            "end 는 start 보다 뒤여야 합니다.",
+            detail={"start": start_ts, "end": end_ts},
+        )
+
+    rows = await repository.get_premium_range(
+        session, dom, fx, symbol, start_ts, end_ts
+    )
+
+    kimp_stats = find_segments(
+        [(r.ts, r.fwd) for r in rows], threshold, max_gap_seconds=max_gap
+    )
+    reverse_stats = find_segments(
+        [(r.ts, r.rev) for r in rows], threshold, max_gap_seconds=max_gap
+    )
+
+    # 전체 요약 — 기준치를 적용하기 **전** 기록 그대로. 지속 시간만은 구간
+    # 개념이라 기준치를 타므로, 두 방향의 구간을 합쳐서 낸다.
+    all_durations = [
+        s.duration_seconds for s in (*kimp_stats.segments, *reverse_stats.segments)
+    ]
+    overall = OverallStats(
+        max_kimp_percent=max((r.fwd for r in rows), default=0.0),
+        avg_kimp_percent=(sum(r.fwd for r in rows) / len(rows)) if rows else 0.0,
+        max_reverse_percent=max((r.rev for r in rows), default=0.0),
+        avg_reverse_percent=(sum(r.rev for r in rows) / len(rows)) if rows else 0.0,
+        max_duration_seconds=max(all_durations, default=0),
+        avg_duration_seconds=(
+            sum(all_durations) / len(all_durations) if all_durations else 0.0
+        ),
+        segment_count=len(all_durations),
+    )
+
+    return StreakResponse(
+        base=symbol,
+        dom=dom,
+        fx=fx,
+        threshold_percent=threshold,
+        max_gap_seconds=max_gap,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        scanned=len(rows),
+        kimp=_to_direction(kimp_stats),
+        reverse=_to_direction(reverse_stats),
+        overall=overall,
+        last_updated_ts=last_ts,
+        last_updated=_kst_iso(last_ts),
         fetched_at=int(time.time() * 1000),
     )
