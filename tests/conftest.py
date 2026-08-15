@@ -81,8 +81,8 @@ def snapshot_row(
     *,
     quote: str = "KRW",
     krw_factor: float = 1.0,
-    deposit: bool | None = True,
-    withdrawal: bool | None = True,
+    deposit: bool = True,
+    withdrawal: bool = True,
     native: str | None = None,
     ts: int = NOW_MS,
 ) -> SnapshotRow:
@@ -131,7 +131,7 @@ async def seed_standard(session) -> None:
         session,
         "bithumb",
         [
-            snapshot_row("bithumb", b, p, deposit=None, withdrawal=None)
+            snapshot_row("bithumb", b, p, deposit=False, withdrawal=False)
             for b, p in BITHUMB_PRICES.items()
         ],
     )

@@ -151,20 +151,17 @@ async def fetch_final_round(basis_date: date) -> UsdKrwObservation:
 
 
 async def fetch_latest() -> UsdKrwObservation:
-    """지금 시점의 최신 고시.
+    """지금 시점의 최신 고시. ``POST /refresh`` 가 환율을 얻는 통로다.
 
-    오늘(KST) 기준일부터 시도하고, 아직 고시가 없으면(이른 아침·주말·휴일)
-    하루씩 거슬러 올라간다. 주말 이틀 + 연휴를 감안해 6일까지 본다.
+    오늘(KST)을 기준일로 최종 회차를 묻는다. 고시가 없는 날(이른 아침·주말·
+    휴일)에도 은행이 **가장 최근 영업일의 최종 회차를 대신 돌려주므로** 한
+    번만 물으면 된다. 2026-08-15(토·광복절)와 미래 날짜로 실호출해 확인했다 —
+    둘 다 직전 영업일(8/14)의 1095회차가 돌아왔다.
+
+    반환값의 ``basis_date`` 는 **요청한 날짜**라 실제 고시일과 다를 수 있다.
+    실제 시각은 항상 응답에서 파싱한 ``ts`` 이므로 저장에는 문제가 없다.
     """
-    today = datetime.now(tz=KST).date()
-    last_error: Exception | None = None
-    for back in range(7):
-        basis = today - timedelta(days=back)
-        try:
-            return await fetch_final_round(basis)
-        except HanaParseError as exc:
-            last_error = exc  # 휴일 등 — 하루 더 과거로
-    raise last_error  # type: ignore[misc]
+    return await fetch_final_round(datetime.now(tz=KST).date())
 
 
 async def fetch_day_rounds(

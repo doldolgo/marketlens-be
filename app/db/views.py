@@ -67,6 +67,18 @@ CLEANUP_DDL: list[str] = [
     "DROP TABLE IF EXISTS fx_chunks",
     "DROP TABLE IF EXISTS history_cursors",
     "DROP TABLE IF EXISTS krw_rates",
+    # 입출금 가능 여부에서 null 을 없앤다 — "확인 불가"도 False 로 통일한다.
+    # 이미 쌓인 null 을 메운 뒤 NOT NULL 을 건다 (순서를 바꾸면 실패한다).
+    "UPDATE market_snapshots SET deposit_enabled = FALSE "
+    "WHERE deposit_enabled IS NULL",
+    "UPDATE market_snapshots SET withdrawal_enabled = FALSE "
+    "WHERE withdrawal_enabled IS NULL",
+    "ALTER TABLE market_snapshots "
+    "ALTER COLUMN deposit_enabled SET DEFAULT FALSE, "
+    "ALTER COLUMN deposit_enabled SET NOT NULL",
+    "ALTER TABLE market_snapshots "
+    "ALTER COLUMN withdrawal_enabled SET DEFAULT FALSE, "
+    "ALTER COLUMN withdrawal_enabled SET NOT NULL",
     # 옛 이름 정리 — 환율 테이블 fx_rate → usdkrw_rate.
     # (`fx` 는 해외 거래소를 가리키는 이름이라 환율에는 쓰지 않는다)
     # 뷰가 테이블을 참조하므로 뷰부터 지운다.

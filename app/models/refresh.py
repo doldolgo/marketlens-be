@@ -59,6 +59,14 @@ class RefreshResult(BaseModel):
         ),
     )
     total_saved: int = Field(0, description="저장한 전체 행 수")
+    deleted: int = Field(
+        0,
+        description=(
+            "짝을 잃어 market_snapshots 에서 지운 행 수 — 국내·해외 한쪽에만 "
+            "남아 김프를 계산할 수 없게 된 코인. 지우기 전 마지막 김프를 "
+            "premium_archive 에 남긴다"
+        ),
+    )
     archived: int = Field(
         0,
         description=(
