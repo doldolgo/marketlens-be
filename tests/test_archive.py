@@ -76,7 +76,7 @@ class TestMergeTimeline:
         rows, seeds = service.merge_premium_timeline(
             upbit_events=[(DAY_TS, Decimal("100000000")), (DAY_TS + 10, Decimal("100100000"))],
             binance_events=[(DAY_TS, Decimal("71000"))],
-            fx_events=[(DAY_TS, Decimal("1400"))],
+            usdkrw_events=[(DAY_TS, Decimal("1400"))],
         )
         assert [r["ts"] for r in rows] == [DAY_TS, DAY_TS + 10]
         # 두 번째 줄: 업비트만 변했고 바이낸스·환율은 forward-fill
@@ -89,7 +89,7 @@ class TestMergeTimeline:
         rows, _ = service.merge_premium_timeline(
             upbit_events=[(DAY_TS, Decimal("100000000"))],
             binance_events=[(DAY_TS + 5, Decimal("71000"))],
-            fx_events=[(DAY_TS + 9, Decimal("1400"))],
+            usdkrw_events=[(DAY_TS + 9, Decimal("1400"))],
         )
         assert [r["ts"] for r in rows] == [DAY_TS + 9]  # 환율까지 온 뒤 첫 줄
 
@@ -98,7 +98,7 @@ class TestMergeTimeline:
         rows, _ = service.merge_premium_timeline(
             upbit_events=[(DAY_TS + 3, Decimal("100000000"))],
             binance_events=[],
-            fx_events=[],
+            usdkrw_events=[],
             seeds=(Decimal("99000000"), Decimal("71000"), Decimal("1400")),
         )
         assert [r["ts"] for r in rows] == [DAY_TS + 3]
@@ -108,7 +108,7 @@ class TestMergeTimeline:
         rows, _ = service.merge_premium_timeline(
             upbit_events=[(DAY_TS, Decimal("100000000")), (DAY_TS + 5, Decimal("100000000"))],
             binance_events=[(DAY_TS, Decimal("71000"))],
-            fx_events=[(DAY_TS, Decimal("1400"))],
+            usdkrw_events=[(DAY_TS, Decimal("1400"))],
         )
         assert len(rows) == 1  # 같은 값 재관측은 기록 없음
 

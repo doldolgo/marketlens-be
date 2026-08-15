@@ -9,7 +9,7 @@ from conftest import (
     FX_RATE,
     best_ask,
     best_bid,
-    seed_fx_rate,
+    seed_usdkrw_rate,
     seed_rows,
     seed_standard,
     snapshot_row,
@@ -51,7 +51,7 @@ class TestValidation:
 
     async def test_single_venue_is_409_style(self, db) -> None:
         await seed_rows(db, "upbit", [snapshot_row("upbit", "BTC", 100_000_000.0)])
-        await seed_fx_rate(db)
+        await seed_usdkrw_rate(db)
         with pytest.raises(NoArbitrageOpportunityError):
             await arbitrage_service.simulate(db, "BTC", amount=1_000_000.0)
 
@@ -121,7 +121,7 @@ class TestAutoDirection:
             "binance",
             [snapshot_row("binance", "BTC", 71_000.0, quote="USDT", krw_factor=1400)],
         )
-        await seed_fx_rate(db)
+        await seed_usdkrw_rate(db)
 
         with pytest.raises(NoArbitrageOpportunityError):
             await arbitrage_service.simulate(db, "BTC", amount=1_000_000.0)
@@ -182,7 +182,7 @@ class TestFixedDirection:
         )
         # 해외 하나 + KRW 스냅샷 없음 → 방향 고정 계산 불가. 다만 후보 2곳 미만
         # 검사가 먼저라 NoArbitrageOpportunityError 로 걸린다.
-        await seed_fx_rate(db)
+        await seed_usdkrw_rate(db)
         with pytest.raises(NoArbitrageOpportunityError):
             await arbitrage_service.simulate(
                 db, "BTC", amount=1_000_000.0, direction=PremiumDirection.FWD

@@ -10,7 +10,7 @@
     **코인을 찾아 UPSERT 만 한다** — 지웠다 다시 만들지 않으며, 이번 수집에
     빠진 코인도 삭제하지 않는다 (신선도는 updated_at 으로 판별).
 
-``fx_rate`` — 단 한 행
+``usdkrw_rate`` — 단 한 행
     하나은행 고시 USD/KRW **매매기준율** (최신 고시). 모든 원화 환산이
     이 값 하나로 통일된다.
 
@@ -76,10 +76,12 @@ class MarketSnapshot(Base):
     #: 매수 호가 [[가격, 잔량], ...] 가격 내림차순
     bids: Mapped[list] = mapped_column(JsonList, default=list)
 
-    #: 입금 가능 여부. 확인할 수 없으면(키 없음 등) None.
-    deposit_enabled: Mapped[bool | None] = mapped_column(default=None)
-    #: 출금 가능 여부. 확인할 수 없으면 None.
-    withdrawal_enabled: Mapped[bool | None] = mapped_column(default=None)
+    #: 입금 가능 여부. **null 을 두지 않는다** — 확인할 수 없으면(키 없음·API
+    #: 장애) 보수적으로 False 로 저장한다. "모른다"와 "막혔다"를 구분하려면
+    #: platform_status 의 실패 카운터를 본다.
+    deposit_enabled: Mapped[bool] = mapped_column(default=False)
+    #: 출금 가능 여부. 위와 같은 규칙 (확인 불가 → False).
+    withdrawal_enabled: Mapped[bool] = mapped_column(default=False)
 
     #: 거래소가 준 시세 시각 (epoch ms). 없는 거래소는 수신 시각.
     price_timestamp: Mapped[int] = mapped_column(BigInteger, default=0)
@@ -89,10 +91,10 @@ class MarketSnapshot(Base):
     )
 
 
-class FxRate(Base):
+class UsdKrwRate(Base):
     """통일 환율 — 하나은행 고시 USD/KRW 매매기준율의 최신 값 **한 행**."""
 
-    __tablename__ = "fx_rate"
+    __tablename__ = "usdkrw_rate"
 
     #: 항상 1. 단일 행을 강제하기 위한 고정 PK.
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)

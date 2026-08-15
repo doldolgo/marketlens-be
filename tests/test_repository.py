@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from conftest import NOW_MS, seed_fx_rate, snapshot_row
+from conftest import NOW_MS, seed_usdkrw_rate, snapshot_row
 
 from app.core.errors import MarketDataNotFoundError
 from app.db import repository
@@ -68,36 +68,36 @@ class TestUpsertExchangeSnapshots:
         assert len(await repository.get_snapshots(db, exchange="upbit")) == 1
 
 
-class TestFxRate:
+class TestUsdKrwRate:
     async def test_insert_then_update_keeps_single_row(self, db) -> None:
         """통일 환율은 단일 행 — 갱신해도 행이 늘지 않는다."""
-        await repository.upsert_fx_rate(
+        await repository.upsert_usdkrw_rate(
             db, rate=1400.0, source_time=NOW_MS // 1000, round_no=1
         )
         await db.commit()
-        await repository.upsert_fx_rate(
+        await repository.upsert_usdkrw_rate(
             db, rate=1410.0, source_time=NOW_MS // 1000 + 60, round_no=2
         )
         await db.commit()
 
-        row = await repository.get_fx_rate(db)
+        row = await repository.get_usdkrw_rate(db)
         assert row is not None
         assert row.rate == 1410.0
         assert row.round_no == 2
         assert row.source_time == NOW_MS // 1000 + 60
 
-    async def test_require_fx_rate_raises_when_missing(self, db) -> None:
+    async def test_require_usdkrw_rate_raises_when_missing(self, db) -> None:
         with pytest.raises(MarketDataNotFoundError):
-            await repository.require_fx_rate(db)
+            await repository.require_usdkrw_rate(db)
 
-    async def test_require_fx_rate_rejects_non_positive(self, db) -> None:
+    async def test_require_usdkrw_rate_rejects_non_positive(self, db) -> None:
         """0 이하 환율은 없는 것으로 취급한다 — 나눗셈 보호."""
-        await repository.upsert_fx_rate(
+        await repository.upsert_usdkrw_rate(
             db, rate=0.0, source_time=NOW_MS // 1000, round_no=1
         )
         await db.commit()
         with pytest.raises(MarketDataNotFoundError):
-            await repository.require_fx_rate(db)
+            await repository.require_usdkrw_rate(db)
 
 
 class TestQueries:

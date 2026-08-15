@@ -14,7 +14,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import MarketDataNotFoundError
-from app.db.models import FxRate, MarketSnapshot, PlatformStatus, PremiumArchive
+from app.db.models import MarketSnapshot, PlatformStatus, PremiumArchive, UsdKrwRate
 from app.models.orderbook import MarketType, OrderBook, OrderBookLevel
 
 #: 대량 INSERT 한 문장의 최대 행 수 — asyncpg 파라미터 한도(32,767개) 보호.
@@ -32,8 +32,9 @@ class SnapshotRow:
     price: float
     asks: list[list[float]] = field(default_factory=list)
     bids: list[list[float]] = field(default_factory=list)
-    deposit_enabled: bool | None = None
-    withdrawal_enabled: bool | None = None
+    #: 입출금 가능 여부는 null 을 두지 않는다 — 확인 불가도 False 로 저장한다.
+    deposit_enabled: bool = False
+    withdrawal_enabled: bool = False
     price_timestamp: int = 0
 
 
@@ -54,6 +55,38 @@ def _upsert(session: AsyncSession, table, rows: list[dict], index: list[str]):
 # ----------------------------------------------------------------------
 # 쓰기 — 수집기 전용
 # ----------------------------------------------------------------------
+
+
+async def upsert_snapshots(session: AsyncSession, rows: list[SnapshotRow]) -> int:
+    """스냅샷 행들을 **코인을 찾아 UPSERT** 한다 (거래소가 섞여 있어도 된다).
+
+    수집기가 코인 하나를 처리할 때 그 코인의 업비트·빗썸·바이낸스 행을 한
+    번에 넘기는 용도다. 있는 행은 갱신, 없는 행은 삽입한다.
+
+    Returns:
+        저장(UPSERT)한 행 수
+    """
+    if not rows:
+        return 0
+    payload = [
+        {
+            "exchange": r.exchange,
+            "base": r.base,
+            "native_symbol": r.native_symbol,
+            "quote": r.quote,
+            "price": r.price,
+            "asks": r.asks,
+            "bids": r.bids,
+            "deposit_enabled": r.deposit_enabled,
+            "withdrawal_enabled": r.withdrawal_enabled,
+            "price_timestamp": r.price_timestamp,
+        }
+        for r in rows
+    ]
+    await session.execute(
+        _upsert(session, MarketSnapshot, payload, ["exchange", "base"])
+    )
+    return len(rows)
 
 
 async def upsert_exchange_snapshots(
@@ -92,7 +125,7 @@ async def upsert_exchange_snapshots(
     return len(rows)
 
 
-async def upsert_fx_rate(
+async def upsert_usdkrw_rate(
     session: AsyncSession,
     *,
     rate: float,
@@ -109,7 +142,7 @@ async def upsert_fx_rate(
     재수신은 허용해 값이 항상 최소한 갱신 가능 상태를 유지한다.
     """
     dialect = session.get_bind().dialect.name
-    stmt = (pg_insert if dialect == "postgresql" else sqlite_insert)(FxRate).values(
+    stmt = (pg_insert if dialect == "postgresql" else sqlite_insert)(UsdKrwRate).values(
         [
             {
                 "id": 1,
@@ -128,7 +161,7 @@ async def upsert_fx_rate(
                 "round_no": stmt.excluded.round_no,
                 "updated_at": func.now(),
             },
-            where=FxRate.source_time <= stmt.excluded.source_time,
+            where=UsdKrwRate.source_time <= stmt.excluded.source_time,
         )
     )
 
@@ -315,13 +348,23 @@ async def bump_platform_status(
     futures_market_count: int | None,
     dw_failed: bool,
 ) -> None:
-    """플랫폼 행을 갱신한다 — 수신 시각 기록 + 카운터 증가.
+    """``platform_status`` 에서 이 거래소의 행 하나를 갱신한다 (없으면 만든다).
 
-    market_snapshots 업데이트 직후 호출된다:
-        - last_received_ts ← 이번 수신 시각, update_count += 1
-        - 이번 업데이트에서 입금 또는 출금 불가 코인이 있었으면(dw_failed)
-          dw_fail_count += 1
-    실패율 = dw_fail_count / update_count 로 계산한다.
+    ``platform_status`` 는 거래소당 딱 한 행이고, 그 거래소의 수집이 얼마나
+    잘 되고 있는지를 누적해 둔다. GET /history/status 가 이 행들을 읽는다.
+    한 거래소의 market_snapshots 를 갱신할 때마다 곧바로 이 함수가 불린다.
+
+    바뀌는 값:
+        - ``last_received_ts`` ← 이번 수신 시각으로 **덮어쓴다**
+        - ``spot_market_count`` / ``futures_market_count`` ← 이번에 관측한
+          상장 마켓 수로 **덮어쓴다** (futures 가 None 이면 "이번엔 못 셌다"는
+          뜻이라 이전 값을 그대로 둔다)
+        - ``update_count`` **+1** — 이 함수가 불린 총 횟수
+        - ``dw_fail_count`` **+1** — 단, 이번 갱신에서 입금 또는 출금 불가
+          코인이 하나라도 있었을 때만 (``dw_failed``)
+
+    앞의 둘은 최신값 스냅샷이고 뒤의 둘은 누적 카운터다. 입출금 실패율은
+    저장하지 않고 조회 시 dw_fail_count / update_count 로 계산한다.
     """
     dialect = session.get_bind().dialect.name
     insert = pg_insert if dialect == "postgresql" else sqlite_insert
@@ -382,6 +425,31 @@ async def get_snapshots(
     return list(result.scalars())
 
 
+async def list_snapshot_bases(session: AsyncSession) -> set[str]:
+    """지금 market_snapshots 에 행이 남아 있는 코인 이름 전부.
+
+    수집이 만든 '이번 회차 교집합'과 비교해, 더 이상 김프를 계산할 수 없게
+    된 코인을 찾아내는 데 쓴다.
+    """
+    result = await session.execute(select(MarketSnapshot.base).distinct())
+    return set(result.scalars())
+
+
+async def delete_snapshots_by_base(session: AsyncSession, base: str) -> int:
+    """코인 하나의 스냅샷을 **모든 거래소에서** 지운다.
+
+    국내·해외 어느 한쪽에만 남은 코인은 김프/역프를 계산할 수 없어 실시간
+    창에 띄울 수 없다. 지우기 전에 호출자가 마지막 김프를 아카이브한다.
+
+    Returns:
+        지운 행 수
+    """
+    result = await session.execute(
+        delete(MarketSnapshot).where(MarketSnapshot.base == base.upper())
+    )
+    return result.rowcount or 0
+
+
 async def get_snapshot(
     session: AsyncSession, exchange: str, base: str
 ) -> MarketSnapshot | None:
@@ -404,14 +472,14 @@ async def require_snapshot(
     return snap
 
 
-async def get_fx_rate(session: AsyncSession) -> FxRate | None:
+async def get_usdkrw_rate(session: AsyncSession) -> UsdKrwRate | None:
     """통일 환율(USD/KRW 매매기준율). 아직 수집 전이면 None."""
-    return await session.get(FxRate, 1)
+    return await session.get(UsdKrwRate, 1)
 
 
-async def require_fx_rate(session: AsyncSession) -> FxRate:
+async def require_usdkrw_rate(session: AsyncSession) -> UsdKrwRate:
     """통일 환율을 가져오되, 없거나 0 이하면 도메인 예외를 던진다."""
-    rate = await get_fx_rate(session)
+    rate = await get_usdkrw_rate(session)
     if rate is None or rate.rate <= 0:
         raise MarketDataNotFoundError(
             "DB 에 USD/KRW 환율이 없습니다. "

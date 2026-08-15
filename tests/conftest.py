@@ -36,7 +36,7 @@ def _stable_settings(monkeypatch):
     monkeypatch.setattr(settings, "scan_suspicious_percent", 5.0)
     monkeypatch.setattr(settings, "krw_reference_exchange", "upbit")
     monkeypatch.setattr(settings, "krw_reference_quote", "KRW")
-    monkeypatch.setattr(settings, "fx_stablecoin", "USDT")
+    monkeypatch.setattr(settings, "overseas_quote", "USDT")
     monkeypatch.setattr(settings, "orderbook_max_amount_krw", 1_000_000_000.0)
     monkeypatch.setattr(settings, "default_orderbook_depth", 10)
 
@@ -81,8 +81,8 @@ def snapshot_row(
     *,
     quote: str = "KRW",
     krw_factor: float = 1.0,
-    deposit: bool | None = True,
-    withdrawal: bool | None = True,
+    deposit: bool = True,
+    withdrawal: bool = True,
     native: str | None = None,
     ts: int = NOW_MS,
 ) -> SnapshotRow:
@@ -109,9 +109,9 @@ async def seed_rows(session, exchange: str, rows: list[SnapshotRow]) -> None:
     await session.commit()
 
 
-async def seed_fx_rate(session, rate: float = FX_RATE) -> None:
-    """통일 환율(fx_rate 단일 행)을 심는다."""
-    await repository.upsert_fx_rate(
+async def seed_usdkrw_rate(session, rate: float = FX_RATE) -> None:
+    """통일 환율(usdkrw_rate 단일 행)을 심는다."""
+    await repository.upsert_usdkrw_rate(
         session, rate=rate, source_time=NOW_MS // 1000, round_no=100
     )
     await session.commit()
@@ -131,7 +131,7 @@ async def seed_standard(session) -> None:
         session,
         "bithumb",
         [
-            snapshot_row("bithumb", b, p, deposit=None, withdrawal=None)
+            snapshot_row("bithumb", b, p, deposit=False, withdrawal=False)
             for b, p in BITHUMB_PRICES.items()
         ],
     )
@@ -143,7 +143,7 @@ async def seed_standard(session) -> None:
             for b, p in BINANCE_PRICES.items()
         ],
     )
-    await seed_fx_rate(session)
+    await seed_usdkrw_rate(session)
 
 
 # ── 기대값 헬퍼 (테스트가 시드와 같은 상수로 직접 계산한다) ─────────────

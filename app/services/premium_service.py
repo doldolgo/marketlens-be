@@ -1,7 +1,7 @@
 """김치 프리미엄 / 역프리미엄 계산 서비스 — DB 스냅샷 기반.
 
 거래소를 직접 호출하지 않는다. ``POST /refresh`` 가 저장해둔
-``market_snapshots`` / ``fx_rate`` 를 읽어서만 계산한다.
+``market_snapshots`` / ``usdkrw_rate`` 를 읽어서만 계산한다.
 
 두 방향은 **서로 다른 거래**다.
 
@@ -15,7 +15,7 @@
 살 때는 매도호가(ask), 팔 때는 매수호가(bid). 방향에 따라 쓰는 호가가
 달라지므로 김프/역김프 값은 서로 독립적이다.
 
-환율은 ``fx_rate`` 에 저장된 **하나은행 고시 USD/KRW 매매기준율 하나**다.
+환율은 ``usdkrw_rate`` 에 저장된 **하나은행 고시 USD/KRW 매매기준율 하나**다.
 예전의 국내 거래소별 KRW-USDT 시세(테더 프리미엄이 섞인 값) 대신, 어느
 국내 거래소를 기준으로 하든 같은 은행 환율을 쓴다.
 """
@@ -34,7 +34,7 @@ from app.core.errors import (
     UnsupportedExchangeError,
 )
 from app.db import repository
-from app.db.models import FxRate, MarketSnapshot
+from app.db.models import MarketSnapshot, UsdKrwRate
 from app.exchanges.registry import domestic_exchange_ids, get_exchange
 from app.models.premium import (
     PremiumDirection,
@@ -61,13 +61,13 @@ def snapshot_price(snap: MarketSnapshot, side: PriceSide) -> float | None:
     return asks[0].price if asks else None
 
 
-async def resolve_fx_rate(session: AsyncSession) -> FxRate:
+async def resolve_usdkrw_rate(session: AsyncSession) -> UsdKrwRate:
     """통일 환율(하나은행 고시 USD/KRW 매매기준율)을 DB 에서 가져온다.
 
     거래소별 환율 개념이 없어졌으므로 어떤 계산이든 이 한 값을 쓴다.
     없으면(수집 전) 404 성격의 도메인 예외를 던진다.
     """
-    return await repository.require_fx_rate(session)
+    return await repository.require_usdkrw_rate(session)
 
 
 def exchange_name(exchange_id: str) -> str:
@@ -121,16 +121,16 @@ class PremiumService:
             return [
                 s
                 for s in snaps
-                if s.quote == settings.fx_stablecoin and s.exchange != domestic_id
+                if s.quote == settings.overseas_quote and s.exchange != domestic_id
             ]
 
-        symbol_str = f"{base.upper()}/{settings.fx_stablecoin}"
+        symbol_str = f"{base.upper()}/{settings.overseas_quote}"
         found: list[MarketSnapshot] = []
         for exchange_id in exchanges:
             # 등록되지 않은 거래소 ID 는 여기서 404 로 걸러진다.
             eid = get_exchange(exchange_id).id
             snap = await repository.get_snapshot(session, eid, base)
-            if snap is None or snap.quote != settings.fx_stablecoin:
+            if snap is None or snap.quote != settings.overseas_quote:
                 failures.append(
                     PremiumFailure(
                         exchange=eid,
@@ -138,7 +138,7 @@ class PremiumService:
                         error_code=MarketDataNotFoundError.code,
                         message=(
                             f"DB 에 {eid} 거래소의 {base.upper()} "
-                            f"{settings.fx_stablecoin} 마켓 스냅샷이 없습니다. "
+                            f"{settings.overseas_quote} 마켓 스냅샷이 없습니다. "
                             "POST /refresh 로 수집했는지 확인하세요."
                         ),
                     )
@@ -221,7 +221,7 @@ class PremiumService:
                 f"{settings.krw_reference_quote} 마켓 스냅샷이 없습니다.",
                 detail={"exchange": domestic_id, "base": base.upper()},
             )
-        rate = await resolve_fx_rate(session)
+        rate = await resolve_usdkrw_rate(session)
 
         failures: list[PremiumFailure] = []
         overseas_snaps = await self._overseas_snapshots(

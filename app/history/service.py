@@ -71,14 +71,14 @@ def premium_from_closes(
 # ----------------------------------------------------------------------
 
 
-async def record_fx_observation(
-    session: AsyncSession, observation: hana.FxObservation
+async def record_usdkrw_observation(
+    session: AsyncSession, observation: hana.UsdKrwObservation
 ) -> None:
-    """하나은행 고시 관측을 라이브 환율 행(``fx_rate``)에 반영한다.
+    """하나은행 고시 관측을 라이브 환율 행(``usdkrw_rate``)에 반영한다.
 
     더 오래된 고시로의 역행은 UPSERT 의 WHERE 절이 막으므로 그냥 부르면 된다.
     """
-    await repository.upsert_fx_rate(
+    await repository.upsert_usdkrw_rate(
         session,
         rate=float(observation.rate),
         source_time=observation.ts,
@@ -152,7 +152,7 @@ def _changes(
 def merge_premium_timeline(
     upbit_events: list[tuple[int, Decimal]],
     binance_events: list[tuple[int, Decimal]],
-    fx_events: list[tuple[int, Decimal]],
+    usdkrw_events: list[tuple[int, Decimal]],
     *,
     seeds: tuple[Decimal | None, Decimal | None, Decimal | None] = (None, None, None),
 ) -> tuple[list[dict], tuple[Decimal | None, Decimal | None, Decimal | None]]:
@@ -166,31 +166,31 @@ def merge_premium_timeline(
         (아카이브 행 목록(dom/fx/base 는 호출자가 채움), 마지막 세 값 —
         다음 날 이어서 계산할 때 씨앗으로 쓴다)
     """
-    up, bn, fx = seeds
+    up, bn, usdkrw = seeds
     merged: dict[int, list] = {}
     for ts, v in upbit_events:
         merged.setdefault(ts, [None, None, None])[0] = v
     for ts, v in binance_events:
         merged.setdefault(ts, [None, None, None])[1] = v
-    for ts, v in fx_events:
+    for ts, v in usdkrw_events:
         merged.setdefault(ts, [None, None, None])[2] = v
 
     rows: list[dict] = []
     # 씨앗이 완전하면 "직전 김프"도 씨앗으로 계산한다 — 날짜 경계에서
     # 전날 마지막 값과 같은 김프가 중복 기록되는 것을 막는다.
     prev_fwd: float | None = None
-    if up is not None and bn is not None and fx is not None:
-        seeded = premium_from_closes(float(up), float(bn), float(fx))
+    if up is not None and bn is not None and usdkrw is not None:
+        seeded = premium_from_closes(float(up), float(bn), float(usdkrw))
         if seeded is not None:
             prev_fwd = seeded[0]
     for ts in sorted(merged):
         u_new, b_new, f_new = merged[ts]
         up = u_new if u_new is not None else up
         bn = b_new if b_new is not None else bn
-        fx = f_new if f_new is not None else fx
-        if up is None or bn is None or fx is None:
+        usdkrw = f_new if f_new is not None else usdkrw
+        if up is None or bn is None or usdkrw is None:
             continue  # 아직 세 값이 다 갖춰지지 않은 초반 구간
-        result = premium_from_closes(float(up), float(bn), float(fx))
+        result = premium_from_closes(float(up), float(bn), float(usdkrw))
         if result is None:
             continue
         fwd, rev = result
@@ -198,7 +198,7 @@ def merge_premium_timeline(
             continue  # 김프가 그대로면 기록할 것이 없다
         prev_fwd = fwd
         rows.append({"ts": ts, "fwd": fwd, "rev": rev})
-    return rows, (up, bn, fx)
+    return rows, (up, bn, usdkrw)
 
 
 async def fill_premium_gap(
@@ -207,7 +207,7 @@ async def fill_premium_gap(
     start_ts: int,
     end_ts: int,
     *,
-    fx_events: list[tuple[int, Decimal]],
+    usdkrw_events: list[tuple[int, Decimal]],
     newest_first: bool = False,
     pace_upbit: float = 0.2,
     pace_binance: float = 0.1,
@@ -229,7 +229,7 @@ async def fill_premium_gap(
     행이 하나 더 생길 수 있다 — 기록의 정확성에는 영향이 없다.
 
     Args:
-        fx_events: 구간을 덮는 환율 변동 목록 (호출자가 미리 수집.
+        usdkrw_events: 구간을 덮는 환율 변동 목록 (호출자가 미리 수집.
             구간 시작 이전 씨앗 값 포함).
     Returns:
         저장한 행 수.
@@ -253,18 +253,18 @@ async def fill_premium_gap(
             base, day_start, day_end, pace=pace_binance
         )
         # 환율 씨앗: 이 날 시작 이전의 마지막 고시.
-        fx_seed: Decimal | None = None
-        for ts, v in fx_events:
+        usdkrw_seed: Decimal | None = None
+        for ts, v in usdkrw_events:
             if ts <= day_start:
-                fx_seed = v
+                usdkrw_seed = v
             else:
                 break
         upbit_ev = _changes(upbit_obs, None)
         binance_ev = _changes(binance_obs, None)
-        fx_ev = [(ts, v) for ts, v in fx_events if day_start < ts < day_end]
+        usdkrw_ev = [(ts, v) for ts, v in usdkrw_events if day_start < ts < day_end]
 
         rows, _ = merge_premium_timeline(
-            upbit_ev, binance_ev, fx_ev, seeds=(None, None, fx_seed)
+            upbit_ev, binance_ev, usdkrw_ev, seeds=(None, None, usdkrw_seed)
         )
 
         if rows:
@@ -285,7 +285,7 @@ async def fill_premium_gap(
     return saved
 
 
-async def collect_fx_events(
+async def collect_usdkrw_events(
     start_ts: int,
     end_ts: int,
     *,
@@ -313,7 +313,7 @@ async def collect_fx_events(
                 basis, stride=stride, pace=pace
             )
         except Exception as exc:  # noqa: BLE001 — 환율 하루 실패가 전체를 막으면 안 된다
-            log(f"fx {basis} — 실패, 건너뜀: {type(exc).__name__}: {exc}")
+            log(f"usdkrw {basis} — 실패, 건너뜀: {type(exc).__name__}: {exc}")
             basis += timedelta(days=1)
             continue
         for obs in observations:
@@ -321,7 +321,7 @@ async def collect_fx_events(
                 events.append((obs.ts, obs.rate))
                 prev = obs.rate
         if observations:
-            log(f"fx {basis} — 고시 {len(observations)}건 수집")
+            log(f"usdkrw {basis} — 고시 {len(observations)}건 수집")
         basis += timedelta(days=1)
 
     # 씨앗 보증: 구간 시작 이전 고시가 하나도 없으면(주말·연휴에 걸친 시작)
@@ -335,6 +335,6 @@ async def collect_fx_events(
             except Exception:  # noqa: BLE001 — 휴일이면 하루 더 과거로
                 continue
             events.insert(0, (final.ts, final.rate))
-            log(f"fx 씨앗 — {seed_basis} 최종 고시 {final.rate} 사용")
+            log(f"usdkrw 씨앗 — {seed_basis} 최종 고시 {final.rate} 사용")
             break
     return events

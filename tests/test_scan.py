@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from conftest import (
     NOW_MS,
-    seed_fx_rate,
+    seed_usdkrw_rate,
     seed_rows,
     seed_standard,
     snapshot_row,
@@ -67,13 +67,13 @@ class TestScan:
             "binance",
             [snapshot_row("binance", "BTC", 71_000.0, quote="USDT", krw_factor=1400)],
         )
-        await seed_fx_rate(db)
+        await seed_usdkrw_rate(db)
         with pytest.raises(MarketDataNotFoundError):
             await scan_service.scan(db)
 
     async def test_missing_overseas_snapshots_raises(self, db) -> None:
         await seed_rows(db, "upbit", [snapshot_row("upbit", "BTC", 100_000_000.0)])
-        await seed_fx_rate(db)
+        await seed_usdkrw_rate(db)
         with pytest.raises(MarketDataNotFoundError):
             await scan_service.scan(db)
 
@@ -137,7 +137,7 @@ class TestScan:
             "binance",
             [snapshot_row("binance", "AI", 100.0, quote="USDT", krw_factor=1400)],
         )
-        await seed_fx_rate(db)
+        await seed_usdkrw_rate(db)
 
         res = await scan_service.scan(db)
         assert res.best_fwd.sym == "AI"

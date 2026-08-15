@@ -1,7 +1,7 @@
 """거래소 간 가격 비교 서비스 — DB 스냅샷 기반.
 
 거래소를 직접 호출하지 않는다. ``POST /refresh`` 가 저장해둔
-``market_snapshots`` / ``fx_rate`` 를 읽어서만 계산한다.
+``market_snapshots`` / ``usdkrw_rate`` 를 읽어서만 계산한다.
 
 동작 순서
     1. 요청받은 코인의 스냅샷을 DB 에서 전부 읽는다 (거래소 필터 적용).
@@ -39,7 +39,7 @@ class ComparisonService:
         self,
         snap: MarketSnapshot,
         currency: str,
-        fx_rate: float | None,
+        usdkrw_rate: float | None,
     ) -> tuple[float, float | None]:
         """(환산 계수, 적용 환율) 을 구한다.
 
@@ -54,14 +54,14 @@ class ComparisonService:
 
         # 수집기가 0 이하 환율을 저장하지 않지만, 수동으로 오염된 DB 에서도
         # ZeroDivisionError 500 대신 명확한 404 가 나가도록 방어한다.
-        if fx_rate is None or fx_rate <= 0:
+        if usdkrw_rate is None or usdkrw_rate <= 0:
             raise MarketDataNotFoundError(
                 "DB 에 유효한 USD/KRW 환율이 없어 통화를 환산할 수 없습니다. "
                 "먼저 POST /refresh 로 수집하세요.",
                 detail={"exchange": snap.exchange, "quote": snap.quote},
             )
-        factor = fx_rate if currency == "KRW" else 1.0 / fx_rate
-        return factor, fx_rate
+        factor = usdkrw_rate if currency == "KRW" else 1.0 / usdkrw_rate
+        return factor, usdkrw_rate
 
     def _to_quote(self, snap: MarketSnapshot, factor: float) -> ExchangeQuote:
         """스냅샷 한 행을 공통 통화로 환산한 ExchangeQuote 로 변환한다."""
@@ -154,8 +154,8 @@ class ComparisonService:
             )
 
         # 통일 환율 — 아직 수집 전이면 None (환산이 필요할 때만 예외가 난다).
-        fx_row = await repository.get_fx_rate(session)
-        fx_rate = fx_row.rate if fx_row is not None else None
+        usdkrw_row = await repository.get_usdkrw_rate(session)
+        usdkrw_rate = usdkrw_row.rate if usdkrw_row is not None else None
 
         quotes: list[ExchangeQuote] = []
         oldest: datetime | None = None
@@ -165,7 +165,7 @@ class ComparisonService:
             if snap.quote not in _CONVERTIBLE:
                 continue  # BTC 마켓 등 — 현재 수집기는 저장하지 않는다
 
-            factor, _ = self._conversion(snap, currency, fx_rate)
+            factor, _ = self._conversion(snap, currency, usdkrw_rate)
             quotes.append(self._to_quote(snap, factor))
 
             if snap.updated_at is None:
@@ -180,7 +180,7 @@ class ComparisonService:
         return ComparisonResult(
             sym=base.upper(),
             common_currency=currency,
-            usd_krw_rate=fx_rate,
+            usd_krw_rate=usdkrw_rate,
             quotes=quotes,
             missing_exchanges=missing,
             spread=self._build_spread(quotes),

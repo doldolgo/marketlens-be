@@ -10,7 +10,7 @@ from conftest import (
     best_bid,
     fwd_execution_percent,
     rev_execution_percent,
-    seed_fx_rate,
+    seed_usdkrw_rate,
     seed_rows,
     seed_standard,
     snapshot_row,
@@ -180,7 +180,7 @@ class TestFetchPremiums:
         await seed_rows(
             db, "upbit", [snapshot_row("upbit", "BTC", 71_000.0, quote="USDT")]
         )
-        await seed_fx_rate(db)
+        await seed_usdkrw_rate(db)
         with pytest.raises(MarketDataNotFoundError):
             await premium_service.fetch_premiums(
                 db, "BTC", direction=PremiumDirection.FWD
@@ -246,7 +246,7 @@ class TestFetchPremiums:
         assert bithumb.usd_krw_rate == FX_RATE
         assert bithumb.usd_krw_rate == upbit.usd_krw_rate  # 거래소별 환율은 없다
 
-    async def test_missing_fx_rate_raises(self, db) -> None:
+    async def test_missing_usdkrw_rate_raises(self, db) -> None:
         """환율이 아직 수집되지 않았으면 계산 불가 — 404 성격의 예외."""
         await seed_rows(
             db, "bithumb", [snapshot_row("bithumb", "BTC", 100_100_000.0)]
@@ -264,7 +264,7 @@ class TestFetchPremiums:
     ) -> None:
         """명시한 해외 거래소의 스냅샷이 없으면 failures 에 기록하고 계속한다."""
         await seed_rows(db, "upbit", [snapshot_row("upbit", "BTC", 100_000_000.0)])
-        await seed_fx_rate(db)
+        await seed_usdkrw_rate(db)
 
         res = await premium_service.fetch_premiums(
             db,

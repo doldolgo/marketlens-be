@@ -1,6 +1,6 @@
 """환율 라우터 — DB 에 저장된 통일 환율(USD/KRW) 조회.
 
-거래소를 직접 호출하지 않는다. ``POST /refresh`` 가 ``fx_rate`` 테이블에 저장해둔 **하나은행 고시 매매기준율**을 읽어서
+거래소를 직접 호출하지 않는다. ``POST /refresh`` 가 ``usdkrw_rate`` 테이블에 저장해둔 **하나은행 고시 매매기준율**을 읽어서
 반환할 뿐이다.
 
 예전에는 국내 거래소별 KRW-USDT 마켓 시세를 환율로 썼지만, 그 값에는
@@ -71,7 +71,7 @@ class RateResponse(BaseModel):
 async def get_rate(
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> RateResponse:
-    row = await repository.require_fx_rate(session)
+    row = await repository.require_usdkrw_rate(session)
     return RateResponse(
         rate=row.rate,
         source_time=row.source_time,

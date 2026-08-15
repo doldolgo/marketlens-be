@@ -59,7 +59,7 @@ RETRY_WAIT = 2.0
 
 
 @dataclass(slots=True)
-class FxObservation:
+class UsdKrwObservation:
     """고시 한 건 — 언제(초 단위), 얼마(매매기준율), 몇 회차."""
 
     ts: int  # 고시 시각 (epoch 초)
@@ -72,7 +72,7 @@ class HanaParseError(RuntimeError):
     """응답 HTML 에서 고시 정보를 찾지 못했다 — 휴일이거나 형식 변경."""
 
 
-def _parse(html: str, basis_date: date) -> FxObservation:
+def _parse(html: str, basis_date: date) -> UsdKrwObservation:
     """응답 HTML 조각에서 고시일시·회차·USD 매매기준율을 뽑는다."""
     published = _PUBLISHED_RE.search(html)
     if published is None:
@@ -98,7 +98,7 @@ def _parse(html: str, basis_date: date) -> FxObservation:
     if rate <= 0:
         raise HanaParseError(f"{basis_date} 매매기준율이 0 이하입니다: {rate}")
 
-    return FxObservation(
+    return UsdKrwObservation(
         ts=ts, rate=rate, round_no=round_no, basis_date=basis_date
     )
 
@@ -119,14 +119,14 @@ async def _post(basis_date: date, *, pbld_dv_cd: str, pbld_sqn: int | None) -> s
     client = get_client()
     last_error: Exception | None = None
     for attempt in range(RETRIES):
-        record_call("fx_hana")
+        record_call("hana")
         try:
             response = await client.post(
-                f"{settings.hana_fx_base_url}/cms/rate/wpfxd651_01i_01.do",
+                f"{settings.hana_base_url}/cms/rate/wpfxd651_01i_01.do",
                 data=body,
                 headers={
                     "User-Agent": "Mozilla/5.0",
-                    "Referer": f"{settings.hana_fx_base_url}/cms/rate/wpfxd651_01i.do",
+                    "Referer": f"{settings.hana_base_url}/cms/rate/wpfxd651_01i.do",
                 },
                 timeout=_TIMEOUT,
             )
@@ -138,33 +138,30 @@ async def _post(basis_date: date, *, pbld_dv_cd: str, pbld_sqn: int | None) -> s
     raise last_error  # type: ignore[misc]
 
 
-async def fetch_round(basis_date: date, round_no: int) -> FxObservation:
+async def fetch_round(basis_date: date, round_no: int) -> UsdKrwObservation:
     """기준일의 특정 회차 고시 한 건."""
     html = await _post(basis_date, pbld_dv_cd="2", pbld_sqn=round_no)
     return _parse(html, basis_date)
 
 
-async def fetch_final_round(basis_date: date) -> FxObservation:
+async def fetch_final_round(basis_date: date) -> UsdKrwObservation:
     """기준일의 최종 회차 고시 — 회차 수 파악과 최신값 폴링에 쓴다."""
     html = await _post(basis_date, pbld_dv_cd="0", pbld_sqn=None)
     return _parse(html, basis_date)
 
 
-async def fetch_latest() -> FxObservation:
-    """지금 시점의 최신 고시.
+async def fetch_latest() -> UsdKrwObservation:
+    """지금 시점의 최신 고시. ``POST /refresh`` 가 환율을 얻는 통로다.
 
-    오늘(KST) 기준일부터 시도하고, 아직 고시가 없으면(이른 아침·주말·휴일)
-    하루씩 거슬러 올라간다. 주말 이틀 + 연휴를 감안해 6일까지 본다.
+    오늘(KST)을 기준일로 최종 회차를 묻는다. 고시가 없는 날(이른 아침·주말·
+    휴일)에도 은행이 **가장 최근 영업일의 최종 회차를 대신 돌려주므로** 한
+    번만 물으면 된다. 2026-08-15(토·광복절)와 미래 날짜로 실호출해 확인했다 —
+    둘 다 직전 영업일(8/14)의 1095회차가 돌아왔다.
+
+    반환값의 ``basis_date`` 는 **요청한 날짜**라 실제 고시일과 다를 수 있다.
+    실제 시각은 항상 응답에서 파싱한 ``ts`` 이므로 저장에는 문제가 없다.
     """
-    today = datetime.now(tz=KST).date()
-    last_error: Exception | None = None
-    for back in range(7):
-        basis = today - timedelta(days=back)
-        try:
-            return await fetch_final_round(basis)
-        except HanaParseError as exc:
-            last_error = exc  # 휴일 등 — 하루 더 과거로
-    raise last_error  # type: ignore[misc]
+    return await fetch_final_round(datetime.now(tz=KST).date())
 
 
 async def fetch_day_rounds(
@@ -172,7 +169,7 @@ async def fetch_day_rounds(
     *,
     stride: int = 1,
     pace: float = DEFAULT_PACE,
-) -> list[FxObservation]:
+) -> list[UsdKrwObservation]:
     """기준일의 고시를 회차 순서대로 모두(또는 stride 간격으로) 가져온다.
 
     백필 전용 — 하루 1,300~2,000회차라 stride=1 이면 그만큼의 요청이 나간다.
@@ -186,7 +183,7 @@ async def fetch_day_rounds(
     except HanaParseError:
         return []  # 휴일 — 이 기준일에는 고시가 없다
 
-    observations: list[FxObservation] = []
+    observations: list[UsdKrwObservation] = []
     for round_no in range(1, final.round_no + 1, max(1, stride)):
         if round_no == final.round_no:
             observations.append(final)

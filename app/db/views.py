@@ -7,7 +7,7 @@ KST 시각으로 보여주는 읽기 전용 뷰를 같이 만들어 둔다. 뷰�
 
     v_premium_archive   김프/역프 기록 — time_kst 로 "2026-08-14 09:00:00" 표기
     v_platform_status   플랫폼 상태 — 마지막 수신 시각(KST) + 입출금 실패율
-    v_fx_rate           라이브 환율 (고시 시각 포함)
+    v_usdkrw_rate       라이브 환율 (고시 시각 포함)
 
 PostgreSQL 전용이다 (테스트용 SQLite 에서는 만들지 않는다).
 """
@@ -44,12 +44,12 @@ VIEW_DDL: list[str] = [
     FROM platform_status
     """,
     """
-    CREATE OR REPLACE VIEW v_fx_rate AS
+    CREATE OR REPLACE VIEW v_usdkrw_rate AS
     SELECT rate AS usd_krw,
            round_no,
            to_timestamp(source_time) AT TIME ZONE 'Asia/Seoul' AS published_kst,
            updated_at
-    FROM fx_rate
+    FROM usdkrw_rate
     """,
 ]
 
@@ -67,4 +67,33 @@ CLEANUP_DDL: list[str] = [
     "DROP TABLE IF EXISTS fx_chunks",
     "DROP TABLE IF EXISTS history_cursors",
     "DROP TABLE IF EXISTS krw_rates",
+    # 입출금 가능 여부에서 null 을 없앤다 — "확인 불가"도 False 로 통일한다.
+    # 이미 쌓인 null 을 메운 뒤 NOT NULL 을 건다 (순서를 바꾸면 실패한다).
+    "UPDATE market_snapshots SET deposit_enabled = FALSE "
+    "WHERE deposit_enabled IS NULL",
+    "UPDATE market_snapshots SET withdrawal_enabled = FALSE "
+    "WHERE withdrawal_enabled IS NULL",
+    "ALTER TABLE market_snapshots "
+    "ALTER COLUMN deposit_enabled SET DEFAULT FALSE, "
+    "ALTER COLUMN deposit_enabled SET NOT NULL",
+    "ALTER TABLE market_snapshots "
+    "ALTER COLUMN withdrawal_enabled SET DEFAULT FALSE, "
+    "ALTER COLUMN withdrawal_enabled SET NOT NULL",
+    # 옛 이름 정리 — 환율 테이블 fx_rate → usdkrw_rate.
+    # (`fx` 는 해외 거래소를 가리키는 이름이라 환율에는 쓰지 않는다)
+    # 뷰가 테이블을 참조하므로 뷰부터 지운다.
+    "DROP VIEW IF EXISTS v_fx_rate",
+    # 이 시점엔 create_all 이 usdkrw_rate 를 이미 만들어 둔 상태라 RENAME 은
+    # 못 쓴다. 옛 테이블이 남아 있으면 한 행을 옮겨 담고 지운다.
+    """
+    DO $$
+    BEGIN
+        IF to_regclass('public.fx_rate') IS NOT NULL THEN
+            INSERT INTO usdkrw_rate (id, rate, source_time, round_no, updated_at)
+            SELECT id, rate, source_time, round_no, updated_at FROM fx_rate
+            ON CONFLICT (id) DO NOTHING;
+            DROP TABLE fx_rate;
+        END IF;
+    END $$
+    """,
 ]
