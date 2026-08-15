@@ -109,19 +109,19 @@ class ArbitrageResult(BaseModel):
 
     quantity: float = Field(..., description="싼 곳에서 매수된 코인 개수")
 
-    withdrawal_available: bool | None = Field(
-        None,
+    withdrawal_available: bool = Field(
+        False,
         description=(
             "**매수처에서 이 코인을 출금할 수 있는지.** 코인을 매도처로 옮겨야 "
             "차익이 실현되므로 False 면 이 경로는 실행 불가능하다. "
-            "확인 불가(키 없음 등)면 null"
+            "확인 불가(키 없음·API 장애)도 False 다"
         ),
     )
-    deposit_available: bool | None = Field(
-        None,
+    deposit_available: bool = Field(
+        False,
         description=(
             "**매도처에서 이 코인을 입금받을 수 있는지.** False 면 이 경로는 "
-            "실행 불가능하다. 확인 불가면 null"
+            "실행 불가능하다. 확인 불가도 False."
         ),
     )
 

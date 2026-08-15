@@ -120,18 +120,20 @@ class TestToRows:
         assert rows[0].deposit_enabled is True
         assert rows[0].withdrawal_enabled is False
 
-    def test_missing_wallet_entry_becomes_null(self) -> None:
+    def test_missing_wallet_entry_becomes_false(self) -> None:
+        """지갑 목록에 그 코인이 없으면 null 이 아니라 보수적으로 False."""
         wallet = {"ETH": WalletStatus(deposit=True, withdrawal=True)}
         rows = self.rows({"BTC": make_book()}, {"BTC": 100.0}, wallet)
 
-        assert rows[0].deposit_enabled is None
-        assert rows[0].withdrawal_enabled is None
+        assert rows[0].deposit_enabled is False
+        assert rows[0].withdrawal_enabled is False
 
-    def test_no_wallet_data_becomes_null(self) -> None:
+    def test_no_wallet_data_becomes_false(self) -> None:
+        """지갑 조회 자체가 실패해도 null 을 두지 않는다."""
         rows = self.rows({"BTC": make_book()}, {"BTC": 100.0}, None)
 
-        assert rows[0].deposit_enabled is None
-        assert rows[0].withdrawal_enabled is None
+        assert rows[0].deposit_enabled is False
+        assert rows[0].withdrawal_enabled is False
 
     def test_orderbook_is_truncated_by_max_amount(self) -> None:
         book = make_book(

@@ -172,19 +172,20 @@ class TestWalletFlags:
         assert btc.rev.withdrawal_available is False
         assert btc.rev.deposit_available is False
 
-    async def test_unknown_wallet_status_propagates_as_null(self, db) -> None:
-        """빗썸 입출금 상태를 모르는 표준 시드 — 판매처 입금 플래그가 null."""
+    async def test_unknown_wallet_status_becomes_false(self, db) -> None:
+        """빗썸 입출금 상태를 모르는 표준 시드 — 판매처 입금 플래그가 False.
+
+        null 을 두지 않기로 했으므로 "확인 불가"도 False 로 내려간다.
+        """
         await seed_standard(db)
         res = await matrix_service.build(db, amount_krw=1_000_000.0)
 
         btc = next(c for c in res.coins if c.sym == "BTC")
         assert btc.fwd.sell_exchange == "bithumb"
-        assert btc.fwd.deposit_available is None
-        # 주의: 현재 구현은 withdrawal_available 이 null 일 때만 경고를 붙인다.
-        # deposit_available 만 null 인 이 시나리오에서는 경고가 없다 (앱 코드의 비대칭).
+        assert btc.fwd.deposit_available is False
 
-    async def test_null_withdrawal_flag_adds_warning(self, db) -> None:
-        """구매처 출금 가능 여부를 모르면(null) 경고가 붙는다."""
+    async def test_blocked_withdrawal_flag_adds_warning(self, db) -> None:
+        """구매처 출금이 막힌 것으로 표시되면 경고가 붙는다."""
         await seed_rows(db, "upbit", [snapshot_row("upbit", "BTC", 100_000_000.0)])
         await seed_rows(
             db,
@@ -196,8 +197,8 @@ class TestWalletFlags:
                     71_000.0,
                     quote="USDT",
                     krw_factor=1400,
-                    deposit=None,
-                    withdrawal=None,
+                    deposit=False,
+                    withdrawal=False,
                 )
             ],
         )
@@ -205,8 +206,8 @@ class TestWalletFlags:
 
         res = await matrix_service.build(db, amount_krw=1_000_000.0)
         btc = res.coins[0]
-        assert btc.fwd.withdrawal_available is None  # 구매처 = 바이낸스
-        assert any("입출금 가능 여부" in w for w in res.warnings)
+        assert btc.fwd.withdrawal_available is False  # 구매처 = 바이낸스
+        assert any("입출금이 막힌" in w for w in res.warnings)
 
 
 class TestEdgeCases:

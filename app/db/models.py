@@ -76,10 +76,12 @@ class MarketSnapshot(Base):
     #: 매수 호가 [[가격, 잔량], ...] 가격 내림차순
     bids: Mapped[list] = mapped_column(JsonList, default=list)
 
-    #: 입금 가능 여부. 확인할 수 없으면(키 없음 등) None.
-    deposit_enabled: Mapped[bool | None] = mapped_column(default=None)
-    #: 출금 가능 여부. 확인할 수 없으면 None.
-    withdrawal_enabled: Mapped[bool | None] = mapped_column(default=None)
+    #: 입금 가능 여부. **null 을 두지 않는다** — 확인할 수 없으면(키 없음·API
+    #: 장애) 보수적으로 False 로 저장한다. "모른다"와 "막혔다"를 구분하려면
+    #: platform_status 의 실패 카운터를 본다.
+    deposit_enabled: Mapped[bool] = mapped_column(default=False)
+    #: 출금 가능 여부. 위와 같은 규칙 (확인 불가 → False).
+    withdrawal_enabled: Mapped[bool] = mapped_column(default=False)
 
     #: 거래소가 준 시세 시각 (epoch ms). 없는 거래소는 수신 시각.
     price_timestamp: Mapped[int] = mapped_column(BigInteger, default=0)
