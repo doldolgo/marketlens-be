@@ -89,8 +89,24 @@ async def main() -> None:
     started = time.perf_counter()
 
     try:
+        # 1) 환율은 목표 전체 구간을 **한 번만** 수집해 모든 코인이 재사용한다.
+        #    코인별 채울 구간은 전부 [target_start, now_ts) 의 부분집합이고,
+        #    fill_premium_gap 이 날짜별로 슬라이스·씨앗을 알아서 고르므로
+        #    상위 집합을 그대로 넘겨도 결과가 같다. 예전에는 코인마다 다시
+        #    받아서 실측 코인당 ~50분씩 낭비됐다 (92일 × 고시 샘플링).
+        usdkrw_events = await service.collect_usdkrw_events(
+            target_start,
+            now_ts,
+            stride=args.usdkrw_stride,
+            pace=args.usdkrw_pace,
+            log=_log,
+        )
+        if not usdkrw_events:
+            _log("환율을 하나도 수집하지 못해 중단합니다 (하나은행 조회 실패?)")
+            return
+
         for base in bases:
-            # 1) 아카이브의 첫/마지막 시각으로 채워야 할 구간을 계산한다.
+            # 2) 아카이브의 첫/마지막 시각으로 채워야 할 구간을 계산한다.
             async with session_factory() as session:
                 bounds = await repository.get_premium_bounds(
                     session, "upbit", "binance", base
@@ -108,23 +124,7 @@ async def main() -> None:
                 )
             )
 
-            # 2) 환율은 전체 구간을 한 번에 수집한다 (코인과 무관하게 재사용 가능
-            #    하지만 구간이 코인마다 다를 수 있어 구간별로 받는다).
             for range_start, range_end in ranges:
-                usdkrw_events = await service.collect_usdkrw_events(
-                    range_start,
-                    range_end,
-                    stride=args.usdkrw_stride,
-                    pace=args.usdkrw_pace,
-                    log=_log,
-                )
-                if not usdkrw_events:
-                    _log(
-                        f"{base} — 구간에 환율이 없어 건너뜁니다 "
-                        "(하나은행 조회 실패?)"
-                    )
-                    continue
-
                 # 3) 하루 단위로 캔들 수집 → 김프 계산 → 저장.
                 #    기존 기록 "이전"(head) 구간은 최신 날부터 거꾸로 채운다 —
                 #    중단돼도 남은 구간이 아카이브 경계 밖에 있어 재실행 시 이어진다.
