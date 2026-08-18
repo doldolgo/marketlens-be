@@ -671,23 +671,28 @@ async def premium_streaks_bulk(
     fwd_points: list[tuple[int, float]] = []
     rev_points: list[tuple[int, float]] = []
 
-    async for row_base, ts, fwd, rev in result:
-        if row_base != current:
-            if current is not None:
-                coins.append(
-                    _coin_streaks(current, fwd_points, rev_points, threshold, max_gap)
-                )
-            current = row_base
-            current_bucket = None
-            fwd_points, rev_points = [], []
-        bucket_id = ts // bucket if bucket > 0 else ts
-        if bucket_id == current_bucket:
-            fwd_points[-1] = (ts, fwd)
-            rev_points[-1] = (ts, rev)
-        else:
-            fwd_points.append((ts, fwd))
-            rev_points.append((ts, rev))
-            current_bucket = bucket_id
+    # 행 단위 async for 는 행당 코루틴 왕복이 붙어 100만 행에 수십 초가 걸린다
+    # (운영 실측 25초). 배치로 받아 안쪽은 동기 루프로 돈다 → 수 초.
+    async for partition in result.partitions():
+        for row_base, ts, fwd, rev in partition:
+            if row_base != current:
+                if current is not None:
+                    coins.append(
+                        _coin_streaks(
+                            current, fwd_points, rev_points, threshold, max_gap
+                        )
+                    )
+                current = row_base
+                current_bucket = None
+                fwd_points, rev_points = [], []
+            bucket_id = ts // bucket if bucket > 0 else ts
+            if bucket_id == current_bucket:
+                fwd_points[-1] = (ts, fwd)
+                rev_points[-1] = (ts, rev)
+            else:
+                fwd_points.append((ts, fwd))
+                rev_points.append((ts, rev))
+                current_bucket = bucket_id
     if current is not None:
         coins.append(
             _coin_streaks(current, fwd_points, rev_points, threshold, max_gap)
