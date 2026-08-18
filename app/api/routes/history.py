@@ -45,6 +45,8 @@ from app.history.streaks import (
     find_segments,
 )
 from app.models.streak import (
+    BulkStreakResponse,
+    CoinStreaks,
     OverallStats,
     StreakDirection,
     StreakResponse,
@@ -395,6 +397,40 @@ def _kst_iso(ts: int) -> str:
     return datetime.fromtimestamp(ts, tz=KST).isoformat()
 
 
+def _coin_streaks(
+    base: str,
+    fwd_points: list[tuple[int, float]],
+    rev_points: list[tuple[int, float]],
+    threshold: float,
+    max_gap: int,
+) -> CoinStreaks:
+    """한 코인의 (ts, 값) 목록으로 단건 응답과 같은 구간·요약 블록을 만든다."""
+    kimp_stats = find_segments(fwd_points, threshold, max_gap_seconds=max_gap)
+    reverse_stats = find_segments(rev_points, threshold, max_gap_seconds=max_gap)
+    all_durations = [
+        s.duration_seconds for s in (*kimp_stats.segments, *reverse_stats.segments)
+    ]
+    n = len(fwd_points)
+    return CoinStreaks(
+        base=base,
+        scanned=n,
+        last_ts=fwd_points[-1][0],
+        kimp=_to_direction(kimp_stats),
+        reverse=_to_direction(reverse_stats),
+        overall=OverallStats(
+            max_kimp_percent=max((v for _, v in fwd_points), default=0.0),
+            avg_kimp_percent=(sum(v for _, v in fwd_points) / n) if n else 0.0,
+            max_reverse_percent=max((v for _, v in rev_points), default=0.0),
+            avg_reverse_percent=(sum(v for _, v in rev_points) / n) if n else 0.0,
+            max_duration_seconds=max(all_durations, default=0),
+            avg_duration_seconds=(
+                sum(all_durations) / len(all_durations) if all_durations else 0.0
+            ),
+            segment_count=len(all_durations),
+        ),
+    )
+
+
 def _to_direction(stats: StreakStats) -> StreakDirection:
     return StreakDirection(
         count=stats.count,
@@ -533,5 +569,139 @@ async def premium_streaks(
         overall=overall,
         last_updated_ts=last_ts,
         last_updated=_kst_iso(last_ts),
+        fetched_at=int(time.time() * 1000),
+    )
+
+
+@router.get(
+    "/streaks/bulk",
+    response_model=BulkStreakResponse,
+    summary="전 코인 김프/역프 구간 통계 (한 국내 거래소, 요청 1회)",
+    description=(
+        "한 국내 거래소의 **기록이 있는 모든 코인**(또는 `bases` 로 지정한 "
+        "코인들)의 김프/역프 구간 통계를 한 번에 돌려준다 — 기록/통계 창이 "
+        "코인마다 `/history/streaks` 를 부르던 것을 요청 1회로 줄인다.\n\n"
+        "구간 규칙은 단건과 같다: `threshold` **이상**인 기록이 시각으로 "
+        "이어지면 한 구간, 이웃 기록이 `max_gap` 초를 넘겨 벌어지면 끊는다.\n\n"
+        "단건과 다른 점은 `bucket` 리샘플링이다 (기본 60초). 버킷마다 마지막 "
+        "기록 하나만 남긴다 — 대량 백필 데이터(초 단위)와 실시간 기록(약 "
+        "60초 단위)의 밀도를 맞춰야 코인끼리 구간 '횟수'를 비교할 수 있고, "
+        "훑는 행 수도 수십 배 줄어든다. 원본 그대로 보려면 `bucket=0`.\n\n"
+        "구간 내 기록이 하나도 없으면 404 가 아니라 **빈 coins 목록**이다 — "
+        "벌크 조회에서 '아무 코인도 없음'은 정상 상태다."
+    ),
+)
+async def premium_streaks_bulk(
+    session: Annotated[AsyncSession, Depends(get_session)],
+    threshold: Annotated[
+        float,
+        Query(
+            ge=0,
+            description="기준치 %. 이 값 **이상**인 기록만 구간에 든다 (초과가 아님)",
+            examples=[0.5],
+        ),
+    ] = 0.0,
+    dom: Annotated[
+        Literal["upbit", "bithumb"], Query(description="국내 거래소 ID")
+    ] = "upbit",
+    fx: Annotated[Literal["binance"], Query(description="해외 거래소 ID")] = "binance",
+    start: Annotated[
+        int | None,
+        Query(description="조회 시작 (epoch 초). 생략하면 기록의 처음부터"),
+    ] = None,
+    end: Annotated[
+        int | None,
+        Query(description="조회 종료 (epoch 초, 미포함). 생략하면 지금까지"),
+    ] = None,
+    max_gap: Annotated[
+        int,
+        Query(
+            ge=1,
+            description=(
+                "이 초를 넘겨 기록이 벌어지면 구간을 끊는다 "
+                f"(기본 {DEFAULT_MAX_GAP_SECONDS}초 — 정상 수집 간격은 약 60초)"
+            ),
+        ),
+    ] = DEFAULT_MAX_GAP_SECONDS,
+    bucket: Annotated[
+        int,
+        Query(
+            ge=0,
+            description=(
+                "리샘플링 버킷 (초). 버킷마다 마지막 기록 하나만 남긴다. "
+                "0 이면 리샘플링하지 않는다 (기본 60 — 실시간 수집 간격)"
+            ),
+        ),
+    ] = 60,
+    bases: Annotated[
+        str | None,
+        Query(
+            description="코인 심볼 목록 (쉼표 구분). 생략하면 기록이 있는 전 코인",
+            examples=["BTC,ETH,XRP"],
+        ),
+    ] = None,
+) -> BulkStreakResponse:
+    start_ts = 0 if start is None else start
+    end_ts = (int(time.time()) + 1) if end is None else end
+    if end_ts <= start_ts:
+        raise InvalidRequestError(
+            "end 는 start 보다 뒤여야 합니다.",
+            detail={"start": start_ts, "end": end_ts},
+        )
+    base_list = (
+        [b.strip().upper() for b in bases.split(",") if b.strip()] if bases else None
+    )
+
+    result = await repository.stream_premium_points(
+        session,
+        dom,
+        fx,
+        start_ts,
+        end_ts,
+        bases=base_list,
+    )
+
+    # 코인 하나 분량만 메모리에 들고, 코인이 바뀔 때마다 구간을 계산해 비운다.
+    # bucket 리샘플링도 여기서 한다 — 스트림이 시각 오름차순이므로 같은 버킷의
+    # 기록이 또 오면 마지막 것으로 덮어쓰면 된다 (SQL 로 하는 것보다 빠르다,
+    # repository.stream_premium_points 참고).
+    coins: list[CoinStreaks] = []
+    current: str | None = None
+    current_bucket: int | None = None
+    fwd_points: list[tuple[int, float]] = []
+    rev_points: list[tuple[int, float]] = []
+
+    async for row_base, ts, fwd, rev in result:
+        if row_base != current:
+            if current is not None:
+                coins.append(
+                    _coin_streaks(current, fwd_points, rev_points, threshold, max_gap)
+                )
+            current = row_base
+            current_bucket = None
+            fwd_points, rev_points = [], []
+        bucket_id = ts // bucket if bucket > 0 else ts
+        if bucket_id == current_bucket:
+            fwd_points[-1] = (ts, fwd)
+            rev_points[-1] = (ts, rev)
+        else:
+            fwd_points.append((ts, fwd))
+            rev_points.append((ts, rev))
+            current_bucket = bucket_id
+    if current is not None:
+        coins.append(
+            _coin_streaks(current, fwd_points, rev_points, threshold, max_gap)
+        )
+
+    return BulkStreakResponse(
+        dom=dom,
+        fx=fx,
+        threshold_percent=threshold,
+        max_gap_seconds=max_gap,
+        bucket_seconds=bucket,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        coin_count=len(coins),
+        coins=coins,
         fetched_at=int(time.time() * 1000),
     )

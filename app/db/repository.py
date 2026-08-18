@@ -341,6 +341,50 @@ async def get_premium_bounds(
     return int(first), int(last)
 
 
+async def stream_premium_points(
+    session: AsyncSession,
+    dom: str,
+    fx: str,
+    start_ts: int,
+    end_ts: int,
+    *,
+    bases: list[str] | None = None,
+):
+    """[start_ts, end_ts) 구간의 (base, ts, fwd, rev) 를 코인·시각 순으로 흘려준다.
+
+    벌크 구간 통계(GET /history/streaks/bulk)용이다. 코인 수 × 기간에 비례해
+    수백만 행이 될 수 있어 ORM 객체를 만들지 않고 튜플로 스트리밍한다 —
+    호출자는 코인 하나 분량만 메모리에 들고 있으면 된다.
+
+    정렬을 (base, ts) 로 두는 이유: PK 인덱스 (dom, fx, base, ts) 에서 dom·fx
+    를 고정하면 인덱스가 이미 이 순서라, 운영 DB 실측으로 수백만 행도 정렬
+    없이 인덱스 스캔 하나로 나온다 (버킷 리샘플링을 SQL 의 GROUP BY + 자기
+    조인으로 하면 같은 구간이 5배 가까이 느렸다 — 리샘플링은 호출자가
+    스트림을 받으며 파이썬에서 한다).
+    """
+    conds = [
+        PremiumArchive.dom == dom,
+        PremiumArchive.fx == fx,
+        PremiumArchive.ts >= start_ts,
+        PremiumArchive.ts < end_ts,
+    ]
+    if bases:
+        conds.append(PremiumArchive.base.in_(bases))
+
+    stmt = (
+        select(
+            PremiumArchive.base,
+            PremiumArchive.ts,
+            PremiumArchive.fwd,
+            PremiumArchive.rev,
+        )
+        .where(*conds)
+        .order_by(PremiumArchive.base, PremiumArchive.ts)
+        .execution_options(yield_per=5_000)
+    )
+    return await session.stream(stmt)
+
+
 # ----------------------------------------------------------------------
 # 플랫폼 상태
 # ----------------------------------------------------------------------
