@@ -27,6 +27,11 @@
 ``platform_status`` — 플랫폼(거래소)당 한 행
     마지막 수신 시각, 상장 마켓 수(현물/선물), 입출금 실패 횟수와 전체
     업데이트 횟수. 실패율 = dw_fail_count / update_count.
+
+``dw_fail_events`` — 입출금 실패가 관측된 회차 한 건당 한 행
+    dw_fail_count 가 +1 될 때 그 시각을 함께 남긴다 (수집 상태 창의
+    결측 구간 표시용). 최근 24시간치만 유지 — 지난 행은 refresh 가
+    돌 때마다 지운다.
 """
 
 from __future__ import annotations
@@ -138,6 +143,25 @@ class PremiumArchive(Base):
     fwd: Mapped[float] = mapped_column(Float)
     #: 역프 % — 국내에서 사서 해외에 팔 때 수익률
     rev: Mapped[float] = mapped_column(Float)
+
+
+class DwFailEvent(Base):
+    """입출금 실패가 관측된 refresh 회차 한 건 (수집 상태 창의 결측 구간 재료).
+
+    platform_status 의 dw_fail_count 가 +1 되는 바로 그 갱신에서 같은
+    트랜잭션으로 시각 한 줄을 남긴다. 조회 API 가 이 시각들을 이어 붙여
+    "언제부터 언제까지 실패였는지" 구간으로 만들어 준다.
+
+    보존 기간은 settings.dw_fail_retention_seconds (기본 24시간) —
+    지난 행은 다음 refresh 가 함께 지우므로 별도 청소 잡이 없다.
+    """
+
+    __tablename__ = "dw_fail_events"
+
+    #: 플랫폼(거래소) ID
+    exchange: Mapped[str] = mapped_column(String(32), primary_key=True)
+    #: 실패가 관측된 수신 시각 (절대 epoch 초)
+    ts: Mapped[int] = mapped_column(BigInteger, primary_key=True)
 
 
 class PlatformStatus(Base):

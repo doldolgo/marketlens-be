@@ -13,8 +13,15 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.errors import MarketDataNotFoundError
-from app.db.models import MarketSnapshot, PlatformStatus, PremiumArchive, UsdKrwRate
+from app.db.models import (
+    DwFailEvent,
+    MarketSnapshot,
+    PlatformStatus,
+    PremiumArchive,
+    UsdKrwRate,
+)
 from app.models.orderbook import MarketType, OrderBook, OrderBookLevel
 
 #: 대량 INSERT 한 문장의 최대 행 수 — asyncpg 파라미터 한도(32,767개) 보호.
@@ -365,6 +372,12 @@ async def bump_platform_status(
 
     앞의 둘은 최신값 스냅샷이고 뒤의 둘은 누적 카운터다. 입출금 실패율은
     저장하지 않고 조회 시 dw_fail_count / update_count 로 계산한다.
+
+    실패 시각 기록 (수집 상태 창의 결측 구간용):
+        ``dw_fail_count`` 가 +1 될 때 ``dw_fail_events`` 에 (exchange,
+        received_ts) 한 줄을 같이 남기고, 보존 기간
+        (settings.dw_fail_retention_seconds)이 지난 행은 매번 지운다 —
+        카운터와 같은 트랜잭션이라 어긋나지 않고, 별도 청소 잡이 필요 없다.
     """
     dialect = session.get_bind().dialect.name
     insert = pg_insert if dialect == "postgresql" else sqlite_insert
@@ -395,6 +408,16 @@ async def bump_platform_status(
         stmt.on_conflict_do_update(index_elements=["exchange"], set_=set_)
     )
 
+    if dw_failed:
+        # 같은 초에 두 번 불려도 (exchange, ts) PK 충돌로 조용히 넘어간다.
+        ev = insert(DwFailEvent).values(exchange=exchange, ts=received_ts)
+        await session.execute(ev.on_conflict_do_nothing())
+    await session.execute(
+        delete(DwFailEvent).where(
+            DwFailEvent.ts < received_ts - settings.dw_fail_retention_seconds
+        )
+    )
+
 
 async def get_platform_statuses(session: AsyncSession) -> list[PlatformStatus]:
     """모든 플랫폼의 상태 행."""
@@ -402,6 +425,21 @@ async def get_platform_statuses(session: AsyncSession) -> list[PlatformStatus]:
         select(PlatformStatus).order_by(PlatformStatus.exchange)
     )
     return list(result.scalars())
+
+
+async def get_dw_fail_events(
+    session: AsyncSession, since_ts: int
+) -> dict[str, list[int]]:
+    """``since_ts`` 이후의 입출금 실패 시각을 거래소별로 묶어 준다 (시각 오름차순)."""
+    result = await session.execute(
+        select(DwFailEvent.exchange, DwFailEvent.ts)
+        .where(DwFailEvent.ts >= since_ts)
+        .order_by(DwFailEvent.exchange, DwFailEvent.ts)
+    )
+    grouped: dict[str, list[int]] = {}
+    for exchange, ts in result.all():
+        grouped.setdefault(exchange, []).append(int(ts))
+    return grouped
 
 
 # ----------------------------------------------------------------------
