@@ -33,6 +33,7 @@ from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.errors import InvalidRequestError, MarketDataNotFoundError
 from app.db import repository
 from app.db.database import get_session
@@ -114,6 +115,19 @@ class PremiumHistoryResponse(BaseModel):
     fetched_at: int = Field(..., description="응답 생성 시각 (epoch ms)")
 
 
+class DwFailWindow(BaseModel):
+    """입출금 실패가 이어진 구간 하나 (수집 상태 창의 결측 구간 표시용)."""
+
+    start_ts: int = Field(..., description="구간 시작 (epoch 초)")
+    end_ts: int = Field(..., description="구간 끝 (epoch 초, 마지막 관측 시각)")
+    start: str = Field(..., description="구간 시작 (KST ISO 8601)")
+    end: str = Field(..., description="구간 끝 (KST ISO 8601)")
+    duration_seconds: int = Field(
+        ..., description="구간 길이 초 (end_ts - start_ts, 관측 1회짜리는 0)"
+    )
+    count: int = Field(..., description="구간에 든 실패 관측 횟수")
+
+
 class PlatformStatusEntry(BaseModel):
     """플랫폼 하나의 수신 상태."""
 
@@ -128,13 +142,66 @@ class PlatformStatusEntry(BaseModel):
     dw_fail_rate: float = Field(
         ..., description="입출금 실패율 = dw_fail_count / update_count (0~1)"
     )
+    dw_fail_windows: list[DwFailWindow] = Field(
+        ...,
+        description=(
+            "최근 보존 기간(retention_seconds) 안의 입출금 실패 구간 목록 "
+            "(시각 순). 실패 관측 시각이 max_gap 초 이내로 이어지면 한 구간이다."
+        ),
+    )
 
 
 class PlatformStatusResponse(BaseModel):
     """플랫폼별 수신 상태 목록."""
 
     platforms: list[PlatformStatusEntry] = Field(..., description="플랫폼별 상태")
+    retention_seconds: int = Field(
+        ..., description="실패 구간이 보관·표시되는 기간 초 (기본 24시간)"
+    )
+    max_gap_seconds: int = Field(
+        ..., description="실패 관측을 한 구간으로 잇는 최대 간격 초"
+    )
     fetched_at: int = Field(..., description="응답 생성 시각 (epoch ms)")
+
+
+def merge_fail_windows(
+    ts_list: list[int], max_gap: int, retention_start: int
+) -> list["DwFailWindow"]:
+    """실패 관측 시각들을 구간으로 잇는다.
+
+    이웃한 시각이 ``max_gap`` 초 이내면 같은 구간, 넘게 벌어지면 새 구간이다
+    (streaks 의 구간 끊기와 같은 규칙). ``retention_start`` 이전 시각은
+    이미 지워졌어야 하지만, 혹시 남아 있어도 표시 창 밖이므로 걸러 낸다.
+    """
+    out: list[DwFailWindow] = []
+    start = prev = None
+    count = 0
+
+    def _close() -> None:
+        out.append(
+            DwFailWindow(
+                start_ts=start,
+                end_ts=prev,
+                start=_kst_iso(start),
+                end=_kst_iso(prev),
+                duration_seconds=prev - start,
+                count=count,
+            )
+        )
+
+    for ts in ts_list:
+        if ts < retention_start:
+            continue
+        if start is None:
+            start, prev, count = ts, ts, 1
+        elif ts - prev <= max_gap:
+            prev, count = ts, count + 1
+        else:
+            _close()
+            start, prev, count = ts, ts, 1
+    if start is not None:
+        _close()
+    return out
 
 
 def _build_page(
@@ -271,17 +338,34 @@ async def premium_history(
         "입출금 실패 횟수와 전체 업데이트 횟수.\n\n"
         "`POST /refresh` 가 market_snapshots 를 업데이트할 때마다 함께 갱신된다: "
         "전체 업데이트 횟수 +1, 그 회차에 입금 또는 출금 불가 코인이 하나라도 "
-        "있었으면 실패 횟수 +1. `dw_fail_rate` = 실패 횟수 ÷ 전체 횟수."
+        "있었으면 실패 횟수 +1. `dw_fail_rate` = 실패 횟수 ÷ 전체 횟수.\n\n"
+        "`dw_fail_windows` 는 최근 24시간(`retention_seconds`) 안에서 실패가 "
+        "**언제부터 언제까지** 이어졌는지의 구간 목록이다 — 실패 횟수가 +1 될 때 "
+        "같이 기록된 시각들을, `max_gap` 초 이내로 이어지는 것끼리 묶은 것이다. "
+        "보존 기간이 지난 기록은 refresh 가 돌 때마다 DB 에서 지워진다."
     ),
 )
 async def platform_status(
     session: Annotated[AsyncSession, Depends(get_session)],
+    max_gap: Annotated[
+        int,
+        Query(
+            ge=1,
+            description=(
+                "실패 관측 시각이 이 초 이내로 이어지면 한 구간으로 묶는다 "
+                f"(기본 {DEFAULT_MAX_GAP_SECONDS}초 — 정상 수집 간격은 약 60초)"
+            ),
+        ),
+    ] = DEFAULT_MAX_GAP_SECONDS,
 ) -> PlatformStatusResponse:
     rows = await repository.get_platform_statuses(session)
     if not rows:
         raise MarketDataNotFoundError(
             "플랫폼 상태가 아직 없습니다. POST /refresh 가 한 번 돌면 생성됩니다.",
         )
+    retention = settings.dw_fail_retention_seconds
+    since_ts = int(time.time()) - retention
+    fail_events = await repository.get_dw_fail_events(session, since_ts)
     return PlatformStatusResponse(
         platforms=[
             PlatformStatusEntry(
@@ -294,9 +378,14 @@ async def platform_status(
                 dw_fail_rate=(
                     r.dw_fail_count / r.update_count if r.update_count else 0.0
                 ),
+                dw_fail_windows=merge_fail_windows(
+                    fail_events.get(r.exchange, []), max_gap, since_ts
+                ),
             )
             for r in rows
         ],
+        retention_seconds=retention,
+        max_gap_seconds=max_gap,
         fetched_at=int(time.time() * 1000),
     )
 

@@ -377,3 +377,96 @@ class TestErrorBody:
 
         assert set(body["error"]) == {"code", "message", "detail"}
         assert body["error"]["code"] == "unsupported_exchange"
+
+
+class TestPlatformStatusEndpoint:
+    """GET /history/status — 카운터 · 실패율 · 실패(결측) 구간."""
+
+    @staticmethod
+    async def _bump(db, exchange: str, ts: int, *, failed: bool) -> None:
+        from app.db import repository as repo
+
+        await repo.bump_platform_status(
+            db,
+            exchange=exchange,
+            received_ts=ts,
+            spot_market_count=3,
+            futures_market_count=None,
+            dw_failed=failed,
+        )
+        await db.commit()
+
+    async def test_empty_db_is_404(self, client) -> None:
+        assert (await client.get("/history/status")).status_code == 404
+
+    async def test_fail_windows_are_merged_by_gap(self, db, client) -> None:
+        """이웃 실패가 max_gap 이내면 한 구간, 넘게 벌어지면 쪼개진다."""
+        import time as _time
+
+        now = int(_time.time())
+        # upbit — 20분 전 단발 실패 1회 + 방금 전 60초 간격 연속 실패 2회.
+        await self._bump(db, "upbit", now - 1200, failed=True)
+        await self._bump(db, "upbit", now - 120, failed=True)
+        await self._bump(db, "upbit", now - 60, failed=True)
+        await self._bump(db, "upbit", now, failed=False)
+        # binance — 실패 없음.
+        await self._bump(db, "binance", now, failed=False)
+
+        d = (await client.get("/history/status")).json()
+        assert d["retention_seconds"] == 86_400
+        assert d["max_gap_seconds"] == 600
+
+        by_ex = {p["exchange"]: p for p in d["platforms"]}
+        upbit = by_ex["upbit"]
+        assert upbit["dw_fail_count"] == 3 and upbit["update_count"] == 4
+        assert upbit["dw_fail_rate"] == pytest.approx(0.75)
+
+        # 1200초 전 단발과 (120초 전, 60초 전) 연속이 구간 2개로 나뉜다.
+        w = upbit["dw_fail_windows"]
+        assert len(w) == 2
+        assert (w[0]["start_ts"], w[0]["end_ts"], w[0]["count"]) == (
+            now - 1200,
+            now - 1200,
+            1,
+        )
+        assert w[0]["duration_seconds"] == 0
+        assert (w[1]["start_ts"], w[1]["end_ts"], w[1]["count"]) == (
+            now - 120,
+            now - 60,
+            2,
+        )
+        assert w[1]["duration_seconds"] == 60
+        assert w[1]["start"].endswith("+09:00")  # 사람이 읽는 시각은 KST
+
+        assert by_ex["binance"]["dw_fail_windows"] == []
+
+    async def test_max_gap_param_splits_windows(self, db, client) -> None:
+        import time as _time
+
+        now = int(_time.time())
+        await self._bump(db, "upbit", now - 120, failed=True)
+        await self._bump(db, "upbit", now - 60, failed=True)
+
+        # 간격 60초 > max_gap 30초 → 구간이 둘로 쪼개진다.
+        d = (await client.get("/history/status?max_gap=30")).json()
+        assert len(d["platforms"][0]["dw_fail_windows"]) == 2
+
+    async def test_retention_prunes_old_events(self, db, client) -> None:
+        """보존 기간(24시간)이 지난 실패 시각은 다음 갱신 때 지워진다."""
+        import time as _time
+
+        from app.db import repository as repo
+
+        now = int(_time.time())
+        old_ts = now - 86_400 - 100
+        await self._bump(db, "upbit", old_ts, failed=True)
+        assert (await repo.get_dw_fail_events(db, 0)) == {"upbit": [old_ts]}
+
+        # 다음 갱신이 24시간 지난 행을 지운다 — 카운터는 그대로 누적이다.
+        await self._bump(db, "upbit", now, failed=True)
+        assert (await repo.get_dw_fail_events(db, 0)) == {"upbit": [now]}
+
+        d = (await client.get("/history/status")).json()
+        upbit = d["platforms"][0]
+        assert upbit["dw_fail_count"] == 2  # 누적 카운터는 줄지 않는다
+        assert [w["start_ts"] for w in upbit["dw_fail_windows"]] == [now]

@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     binance_orderbook_depth: int = 100
     #: 바이낸스 심볼별 depth 조회의 동시 실행 수. rate limit 보호용.
     refresh_concurrency: int = 20
+    #: 입출금 실패 시각(dw_fail_events)의 보존 기간 (초). 수집 상태 창이
+    #: 최근 이 기간의 실패 구간을 표시한다. 지난 행은 refresh 가 돌 때마다
+    #: 지운다 — 별도 청소 잡이 없다.
+    dw_fail_retention_seconds: int = 86_400
     #: POST /refresh 보호 토큰. 비우면 인증 없이 열린다 (로컬 개발용).
     #: 배포 시에는 반드시 설정할 것 — refresh 는 거래소 호출 수백 회가 나가는
     #: 비싼 작업이라, 외부인이 마음대로 트리거하면 rate limit 이 소진된다.
