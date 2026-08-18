@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api.routes import (
@@ -57,6 +58,9 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+# 벌크 이력 응답(/history/streaks/bulk)이 코인 수백 개 × 구간 목록이라 수 MB 가
+# 될 수 있다 — 반복 구조의 JSON 이라 gzip 으로 한 자릿수 %까지 줄어든다.
+app.add_middleware(GZipMiddleware, minimum_size=8_192)
 
 
 @app.exception_handler(MarketLensError)

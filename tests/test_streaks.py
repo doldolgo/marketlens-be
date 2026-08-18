@@ -153,6 +153,106 @@ class TestStreaksEndpoint:
         assert overall["max_duration_seconds"] == 0
         assert overall["segment_count"] == 0
 
+    async def test_bulk_returns_all_coins_in_one_call(self, client, db) -> None:
+        """벌크는 기록이 있는 코인 전부를 심볼 순으로 한 번에 준다."""
+        await seed_usdkrw_rate(db)
+        rows = []
+        for base, rev_level in [("BTC", 2.0), ("ETH", 0.2), ("XRP", 1.5)]:
+            rows += [
+                {"dom": "upbit", "fx": "binance", "base": base, "ts": t,
+                 "fwd": -rev_level, "rev": rev_level}
+                for t in (1000, 1060, 1120)
+            ]
+        await repository.add_premium_rows(db, rows)
+        await db.commit()
+
+        res = await client.get("/history/streaks/bulk?threshold=1&bucket=0")
+        assert res.status_code == 200
+        body = res.json()
+
+        assert body["coin_count"] == 3
+        assert [c["base"] for c in body["coins"]] == ["BTC", "ETH", "XRP"]
+
+        by_base = {c["base"]: c for c in body["coins"]}
+        # BTC·XRP 는 rev 1% 이상이 3건 연속 → 구간 1개 (120초).
+        for sym in ("BTC", "XRP"):
+            assert by_base[sym]["reverse"]["count"] == 1
+            assert by_base[sym]["reverse"]["max_duration_seconds"] == 120
+            assert by_base[sym]["kimp"]["count"] == 0
+        # ETH 는 기준치 미달 — 구간은 없지만 전체 통계는 있다.
+        assert by_base["ETH"]["reverse"]["count"] == 0
+        assert by_base["ETH"]["overall"]["max_reverse_percent"] == pytest.approx(0.2)
+        assert by_base["ETH"]["scanned"] == 3
+        assert by_base["ETH"]["last_ts"] == 1120
+
+    async def test_bulk_matches_single_endpoint(self, client, db) -> None:
+        """같은 데이터라면 벌크(bucket=0)와 단건의 구간 통계가 일치해야 한다."""
+        await seed_usdkrw_rate(db)
+        values = [0.3, 0.8, 0.9, 0.2, 1.4, 0.6, 0.7]
+        await repository.add_premium_rows(
+            db,
+            [
+                {"dom": "upbit", "fx": "binance", "base": "BTC",
+                 "ts": 1000 + i * 60, "fwd": -v, "rev": v}
+                for i, v in enumerate(values)
+            ],
+        )
+        await db.commit()
+
+        single = (await client.get("/history/streaks?base=BTC&threshold=0.5")).json()
+        bulk = (await client.get("/history/streaks/bulk?threshold=0.5&bucket=0")).json()
+
+        coin = bulk["coins"][0]
+        assert coin["reverse"] == single["reverse"]
+        assert coin["kimp"] == single["kimp"]
+        assert coin["overall"] == single["overall"]
+        assert coin["scanned"] == single["scanned"]
+
+    async def test_bulk_bucket_keeps_last_record_per_bucket(self, client, db) -> None:
+        """bucket=60 이면 60초 버킷마다 마지막 기록 하나만 남는다."""
+        await seed_usdkrw_rate(db)
+        # 버킷 [960,1020): 3건 (마지막 1019), 버킷 [1020,1080): 1건.
+        await repository.add_premium_rows(
+            db,
+            [
+                {"dom": "upbit", "fx": "binance", "base": "BTC", "ts": t,
+                 "fwd": fwd, "rev": -fwd}
+                for t, fwd in [(961, 5.0), (990, 6.0), (1019, 7.0), (1030, 8.0)]
+            ],
+        )
+        await db.commit()
+
+        body = (await client.get("/history/streaks/bulk?threshold=1&bucket=60")).json()
+
+        coin = body["coins"][0]
+        assert coin["scanned"] == 2
+        seg = coin["kimp"]["segments"][0]
+        # 남는 기록은 각 버킷의 마지막 — 1019(값 7)와 1030(값 8).
+        assert (seg["start_ts"], seg["end_ts"]) == (1019, 1030)
+        assert seg["max_percent"] == pytest.approx(8.0)
+        assert coin["kimp"]["count"] == 1
+
+    async def test_bulk_bases_filter_and_empty_result(self, client, db) -> None:
+        """bases 필터는 지정 코인만 남기고, 기록이 없으면 404 대신 빈 목록이다."""
+        await seed_usdkrw_rate(db)
+        await repository.add_premium_rows(
+            db,
+            [
+                {"dom": "upbit", "fx": "binance", "base": base, "ts": 1000,
+                 "fwd": 1.0, "rev": -1.0}
+                for base in ("BTC", "ETH")
+            ],
+        )
+        await db.commit()
+
+        body = (await client.get("/history/streaks/bulk?bases=eth")).json()
+        assert [c["base"] for c in body["coins"]] == ["ETH"]
+
+        empty = await client.get("/history/streaks/bulk?start=999999999")
+        assert empty.status_code == 200
+        assert empty.json()["coins"] == []
+        assert empty.json()["coin_count"] == 0
+
     async def test_overall_duration_merges_both_directions(self, client, db) -> None:
         """전체 지속은 김프 구간과 역프 구간을 합쳐서 낸다."""
         await seed_usdkrw_rate(db)

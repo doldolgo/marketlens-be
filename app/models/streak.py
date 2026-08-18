@@ -86,6 +86,56 @@ class OverallStats(BaseModel):
     )
 
 
+class CoinStreaks(BaseModel):
+    """벌크 응답에서 코인 하나 몫 — 단건 응답과 같은 구간·요약 구조."""
+
+    base: str = Field(..., description="코인 심볼")
+    scanned: int = Field(
+        ...,
+        description=(
+            "이 코인에서 훑은 기록 수. bucket 리샘플링 **이후** 기준이라 "
+            "단건 응답의 scanned(원본 기록 수)와 다를 수 있다"
+        ),
+    )
+    last_ts: int = Field(
+        ..., description="조회 구간 내 이 코인의 마지막 기록 시각 (epoch 초)"
+    )
+    kimp: StreakDirection = Field(..., description="김프 구간")
+    reverse: StreakDirection = Field(..., description="역프 구간")
+    overall: OverallStats = Field(..., description="조회 구간 전체 요약 (기준치 무관)")
+
+
+class BulkStreakResponse(BaseModel):
+    """GET /history/streaks/bulk 응답 — 한 국내 거래소의 전 코인 구간 통계."""
+
+    dom: str = Field(..., description="국내 거래소 ID")
+    fx: str = Field(..., description="해외 거래소 ID")
+    threshold_percent: float = Field(
+        ..., description="입력한 기준치 — 이 값 **이상**인 기록만 구간에 든다"
+    )
+    max_gap_seconds: int = Field(
+        ..., description="이 초를 넘겨 기록이 벌어지면 구간을 끊었다"
+    )
+    bucket_seconds: int = Field(
+        ...,
+        description=(
+            "리샘플링 버킷 (초). 버킷마다 마지막 기록 하나만 남긴다. "
+            "0 이면 원본 기록 그대로"
+        ),
+    )
+
+    start_ts: int = Field(..., description="조회 구간 시작 (epoch 초)")
+    end_ts: int = Field(..., description="조회 구간 종료 (epoch 초)")
+
+    coin_count: int = Field(..., description="구간 내 기록이 있었던 코인 수")
+    coins: list[CoinStreaks] = Field(
+        default_factory=list,
+        description="코인별 구간 통계 (심볼 오름차순). 기록이 없으면 빈 목록",
+    )
+
+    fetched_at: int = Field(..., description="서버 응답 생성 시각 (epoch ms)")
+
+
 class StreakResponse(BaseModel):
     """GET /history/streaks 응답."""
 
