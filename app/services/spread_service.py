@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.errors import MarketDataNotFoundError
+from app.exchanges.private.network_match import Verdict, choose, from_json
 from app.models.spread import FeedStatus, SpreadRow, SpreadsResult
 from app.services.live_store import (
     AnySnapshot,
@@ -56,6 +57,50 @@ def _age_seconds(*stamps: datetime | None) -> float:
 class SpreadService:
     """전 페어의 김프/역프를 FE SpreadRow 형태로 만든다. 데이터는 전부 메모리."""
 
+    @staticmethod
+    def _transfer_state(
+        dom_snap: AnySnapshot, fx_snap: AnySnapshot
+    ) -> tuple[bool | None, bool | None, bool | None, bool | None, str | None]:
+        """이 페어를 **실제로 옮길 수 있는지**를 네트워크까지 보고 판정한다.
+
+        코인 단위 입출금만 보면 틀린다 — 바이낸스 GRT 는 Arbitrum 출금이
+        열려 "가능"이지만 업비트는 Ethereum 으로만 받으므로 옮길 수 없다.
+        국내가 지원하는 망을 기준으로 잡고, 해외에서 그 망을 찾아 상태를 읽는다.
+
+        Returns:
+            (국내입금, 국내출금, 해외입금, 해외출금, 망 이름)
+        """
+        dom_nets = from_json(dom_snap.networks)
+        fx_nets = from_json(fx_snap.networks)
+
+        # 망 정보가 아예 없으면 예전처럼 코인 단위 값을 쓴다. 정보가 늘기
+        # 전보다 나빠질 이유는 없다 (수집 직후 한 사이클 동안의 과도기).
+        if not dom_nets:
+            return (
+                dom_snap.deposit_enabled,
+                dom_snap.withdrawal_enabled,
+                fx_snap.deposit_enabled,
+                fx_snap.withdrawal_enabled,
+                None,
+            )
+
+        dom_net, verdict, fx_net = choose(dom_nets, fx_nets)
+        dep_dom = dom_net.deposit if dom_net else dom_snap.deposit_enabled
+        wd_dom = dom_net.withdrawal if dom_net else dom_snap.withdrawal_enabled
+        net_name = dom_net.name if dom_net else None
+
+        if verdict is Verdict.MATCHED and fx_net is not None:
+            return dep_dom, wd_dom, fx_net.deposit, fx_net.withdrawal, net_name
+        if verdict is Verdict.ABSENT:
+            # 해외가 이 망을 아예 취급하지 않는다 — 옮길 길이 없다.
+            return dep_dom, wd_dom, False, False, net_name
+        # UNKNOWN. 해외 망 정보 자체가 없으면 예전 코인 단위 값으로 두고,
+        # 있는데 못 맞춘 것이면 **모른다고 말한다** — 여기서 코인 단위로
+        # 접으면 방금 걷어낸 낙관 편향이 그대로 돌아온다.
+        if not fx_nets:
+            return dep_dom, wd_dom, fx_snap.deposit_enabled, fx_snap.withdrawal_enabled, net_name
+        return dep_dom, wd_dom, None, None, net_name
+
     def _build_row(
         self,
         base: str,
@@ -66,6 +111,9 @@ class SpreadService:
     ) -> SpreadRow:
         """페어 하나의 행을 만든다. 호가가 비어 있으면 status=fail."""
         age = _age_seconds(dom_snap.updated_at, fx_snap.updated_at)
+        dep_dom, wd_dom, dep_fx, wd_fx, net_dom = self._transfer_state(
+            dom_snap, fx_snap
+        )
 
         dom_bid = _top_level(dom_snap.bids)
         dom_ask = _top_level(dom_snap.asks)
@@ -85,10 +133,11 @@ class SpreadService:
                 liq_dom=0.0,
                 liq_fx=0.0,
                 # 호가를 못 써도 입출금 상태는 따로 안다 — 그대로 싣는다
-                dep_dom=dom_snap.deposit_enabled,
-                wd_dom=dom_snap.withdrawal_enabled,
-                dep_fx=fx_snap.deposit_enabled,
-                wd_fx=fx_snap.withdrawal_enabled,
+                dep_dom=dep_dom,
+                wd_dom=wd_dom,
+                dep_fx=dep_fx,
+                wd_fx=wd_fx,
+                net_dom=net_dom,
             )
 
         # /premium 과 동일한 공식 — fwd: 해외 ask 로 사서 국내 bid 에 판다
@@ -111,10 +160,11 @@ class SpreadService:
             age=age,
             liq_dom=liq_dom,
             liq_fx=liq_fx,
-            dep_dom=dom_snap.deposit_enabled,
-            wd_dom=dom_snap.withdrawal_enabled,
-            dep_fx=fx_snap.deposit_enabled,
-            wd_fx=fx_snap.withdrawal_enabled,
+            dep_dom=dep_dom,
+            wd_dom=wd_dom,
+            dep_fx=dep_fx,
+            wd_fx=wd_fx,
+            net_dom=net_dom,
         )
 
     async def build(self, session: AsyncSession) -> SpreadsResult:

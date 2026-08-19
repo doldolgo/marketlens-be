@@ -67,6 +67,11 @@ CLEANUP_DDL: list[str] = [
     "DROP TABLE IF EXISTS fx_chunks",
     "DROP TABLE IF EXISTS history_cursors",
     "DROP TABLE IF EXISTS krw_rates",
+    # networks 컬럼은 나중에 생겼다. create_all 은 "없는 테이블만 만들기"라
+    # **이미 있는 테이블에 컬럼을 붙이지 않는다** — 여기서 직접 붙인다.
+    # (안 붙이면 조회는 메모리로 잘 되는데 저장만 조용히 실패한다)
+    "ALTER TABLE market_snapshots "
+    "ADD COLUMN IF NOT EXISTS networks JSONB DEFAULT '[]'::jsonb",
     # 입출금 가능 여부를 3-state 로 되돌린다 — "확인 불가"(null)를 "막힘"
     # (False)과 구분하기 위해서다. 예전엔 여기서 null 을 False 로 메우고
     # NOT NULL 을 걸었다 (커밋 4ae3847).

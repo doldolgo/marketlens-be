@@ -346,6 +346,7 @@ class CollectorService:
                         bids=r.bids,
                         deposit_enabled=r.deposit_enabled,
                         withdrawal_enabled=r.withdrawal_enabled,
+                        networks=r.networks,
                         price_timestamp=r.price_timestamp,
                         updated_at=live_now,
                     )
@@ -443,6 +444,7 @@ class CollectorService:
                     bids=snap.bids,
                     deposit_enabled=snap.deposit_enabled,
                     withdrawal_enabled=snap.withdrawal_enabled,
+                    networks=snap.networks,
                     price_timestamp=snap.price_timestamp,
                 )
             )
@@ -709,6 +711,20 @@ class CollectorService:
         books = {b: q for b, q in tops.items() if b in domestic_bases}
         return "binance", books, lasts
 
+    @staticmethod
+    def _networks_json(status: WalletStatus | None) -> list[dict]:
+        """네트워크별 상태를 저장 가능한 모양으로 편다.
+
+        코인 단위 값으로 접지 않고 그대로 남기는 이유는 wallet_status 모듈
+        docstring 참고 — 거래소 쌍을 봐야 "옮길 수 있는가"를 알 수 있다.
+        """
+        if status is None:
+            return []
+        return [
+            {"code": n.code, "name": n.name, "dep": n.deposit, "wd": n.withdrawal}
+            for n in status.networks
+        ]
+
     def _select_depth_targets(
         self,
         domestic_rows: dict[str, dict[str, SnapshotRow]],
@@ -881,6 +897,7 @@ class CollectorService:
                     # 한 값으로 합친다.
                     deposit_enabled=status.deposit if status else None,
                     withdrawal_enabled=status.withdrawal if status else None,
+                    networks=self._networks_json(status),
                     price_timestamp=book.timestamp,
                 )
             )
@@ -923,6 +940,7 @@ class CollectorService:
                     # 한 값으로 합친다.
                     deposit_enabled=status.deposit if status else None,
                     withdrawal_enabled=status.withdrawal if status else None,
+                    networks=self._networks_json(status),
                     # OrderBook.timestamp 와 같은 단위(epoch ms)로 맞춘다.
                     price_timestamp=now_ts * 1000,
                 )

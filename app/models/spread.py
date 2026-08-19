@@ -3,7 +3,7 @@
 FE `src/data/types.ts` 의 SpreadRow 가 원본 계약이다.
 
     { sym, dom, fx, fwd, rev, usd, spark, status, age, liqDom, liqFx,
-      depDom, wdDom, depFx, wdFx }
+      depDom, wdDom, depFx, wdFx, netDom }
 
 (국내 거래소 × 해외 거래소 × 코인) 페어 하나가 한 행이며, 한 행에
 **김프(fwd)와 역프(rev)를 함께** 담는다. 가격 기준은 다른 프리미엄 API 와
@@ -93,6 +93,17 @@ class SpreadRow(BaseModel):
     # 한 행은 (국내 × 해외) 페어라 실제로 옮기려면 **양쪽 다** 필요하다.
     # 순방향(김프)은 해외 출금(wdFx) + 국내 입금(depDom),
     # 역방향(역프)은 국내 출금(wdDom) + 해외 입금(depFx) 이 열려야 한다.
+    net_dom: str | None = Field(
+        None,
+        alias="netDom",
+        description=(
+            "**이 페어를 실제로 옮길 때 쓰는 네트워크** (국내 거래소 기준). "
+            "국내가 지원하는 망이 곧 제약이라 국내를 기준으로 잡는다 — "
+            "업비트·빗썸은 코인의 98% 가 망이 하나뿐이다. "
+            "위 네 필드는 **이 망에서의** 상태다. null 이면 망을 확인하지 못한 것"
+        ),
+    )
+
     dep_dom: bool | None = Field(
         None, alias="depDom", description="국내 거래소 입금 가능 여부 (3-state)"
     )
