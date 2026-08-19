@@ -374,9 +374,16 @@ curl -X POST "http://localhost:8000/refresh" -H "X-Refresh-Token: <토큰>"
 한 번의 refresh 는 **20회 안팎**의 호출로 끝나며, 바이낸스 기준 소모량은
 고정 **8 weight** (분당 6,000 한도의 0.13%)다.
 
-대신 바이낸스 호가는 **최우선 1단계만** 저장된다 — 슬리피지 계산에 쓸 깊이가
-없으므로 `/slippage`·`/arbitrage` 는 바이낸스 쪽에서 곧바로 `depth_exhausted`
-가 된다. 실제 호출 수는 응답의 `total_calls` 로 확인한다.
+바이낸스 호가는 기본적으로 **최우선 1단계만** 저장된다. 슬리피지 계산이
+필요한 코인 — 김프가 `DEPTH_WATCH_MIN_PERCENT` 이상이고 바이낸스 출금과
+국내 입금이 둘 다 열린 코인 — 만 골라 `GET /api/v3/depth` 를 추가로 부른다.
+대상은 `DEPTH_WATCH_MAX_COUNT`(기본 12개)로 묶이며, 실측상 평상시 0~2개다.
+선정 결과는 매 사이클 로그에 남는다.
+
+수집은 앱 내부 루프가 `COLLECT_INTERVAL_SECONDS`(기본 1초)마다 돌린다.
+`premium_archive` 적재와 입출금 상태 조회는 각각 `ARCHIVE_INTERVAL_SECONDS`,
+`WALLET_REFRESH_SECONDS`(기본 60초) 주기로 따로 돈다.
+실제 호출 수는 응답의 `total_calls` 로 확인한다.
 
 ---
 
@@ -1388,10 +1395,11 @@ curl "http://localhost:8000/history/status"
 - rate limit: **분당 6,000 weight** (IP 기준). 수집은 위 두 호출뿐이라
   refresh 1회당 **8 weight** 로 고정이다 — 1초 주기로 돌려도 분당 480,
   한도의 8% 다.
-- 심볼별 `GET /api/v3/depth` 는 **현재 어느 경로에서도 호출하지 않는다.**
-  커넥터의 `fetch_orderbook` 은 남아 있지만 호출자가 없다 (`limit=100` 기준
-  호출당 weight 5). 조회 API(`/orderbook`·`/slippage` 등)는 거래소를 부르지
-  않고 DB 스냅샷을 읽는다.
+- 심볼별 `GET /api/v3/depth` 는 **깊이 선별 대상에만** 쓴다 (`limit=100`
+  기준 호출당 weight 5). 상한 12개를 다 채워도 초당 68 weight = 분당 4,080
+  으로 한도의 68% 이고, 나머지는 재시도분과 `scripts/bulk_archive.py`(같은 IP)
+  몫으로 남긴다. 조회 API(`/orderbook`·`/slippage` 등)는 거래소를 부르지 않고
+  DB 스냅샷을 읽는다.
 
 ### 하나은행 (환율 — USD/KRW 고시 매매기준율)
 

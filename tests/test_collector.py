@@ -6,10 +6,14 @@
 from __future__ import annotations
 
 import math
+import time
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import func, select
 
+from app.core.config import settings
+from app.db.models import PremiumArchive
 from app.db.repository import SnapshotRow
 from app.exchanges.private.wallet_status import WalletStatus
 from app.models.bulk import BulkQuote
@@ -414,3 +418,110 @@ class TestApplyDepth:
         assert applied == 0
         assert rows["BTC"].asks == [[101.0, 1.0]]
         assert rows["BTC"].bids == [[99.0, 1.0]]
+
+
+class TestArchiveThrottle:
+    """premium_archive 는 라이브 수집보다 느리게 적재한다 (3-4 주기 가드)."""
+
+    async def _archive_count(self, db) -> int:
+        return (
+            await db.execute(select(func.count()).select_from(PremiumArchive))
+        ).scalar_one()
+
+    async def _refresh_once(self, service, db, monkeypatch) -> None:
+        """거래소 호출을 전부 대체해 수집 사이클 한 번을 돌린다."""
+        top = make_top(ask=100.0, bid=99.9)
+
+        async def domestic(eid, failures):
+            return eid, {"BTC": make_book(exchange=eid)}, {"BTC": 140_000.0}
+
+        async def binance(bases, failures):
+            return "binance", {"BTC": top}, {"BTC": 100.0}
+
+        async def futures(warnings):
+            return 1
+
+        async def wallet(eid, warnings):
+            return {"BTC": WalletStatus(deposit=True, withdrawal=True)}
+
+        async def rate(failures):
+            return SimpleNamespace(rate=1400.0, ts=1_700_000_000, round_no=1)
+
+        monkeypatch.setattr(service, "_domestic_market", domestic)
+        monkeypatch.setattr(service, "_binance_market", binance)
+        monkeypatch.setattr(service, "_binance_futures_count", futures)
+        monkeypatch.setattr(service, "_wallet", wallet)
+        monkeypatch.setattr(service, "_usdkrw_rate", rate)
+        await service.refresh(db)
+
+    async def test_archives_once_within_the_interval(self, db, monkeypatch) -> None:
+        """60초 안에 여러 번 수집해도 적재는 첫 회차 한 번만 일어난다."""
+        monkeypatch.setattr(settings, "archive_interval_seconds", 60.0)
+        service = CollectorService()
+
+        await self._refresh_once(service, db, monkeypatch)
+        after_first = await self._archive_count(db)
+        assert after_first > 0, "첫 사이클은 적재해야 한다"
+
+        for _ in range(3):
+            await self._refresh_once(service, db, monkeypatch)
+
+        assert await self._archive_count(db) == after_first
+
+    async def test_archives_again_after_interval_elapses(self, db, monkeypatch) -> None:
+        """주기가 지나면 다시 적재한다.
+
+        premium_archive 의 PK 는 (dom, fx, base, ts) 이고 ts 는 **초** 단위라,
+        같은 초에 두 번 적재하면 UPSERT 로 한 행이 된다 — 벽시계도 같이 밀어야
+        '다시 적재됐다'를 행 수로 확인할 수 있다.
+        """
+        monkeypatch.setattr(settings, "archive_interval_seconds", 60.0)
+        service = CollectorService()
+
+        await self._refresh_once(service, db, monkeypatch)
+        after_first = await self._archive_count(db)
+
+        # 마지막 적재 시각을 과거로 밀어 주기가 지난 상황을 만든다
+        service._last_archive_ts -= 61.0
+        real_time = time.time  # 패치 전 원본을 잡아둔다 (안 그러면 자기 자신을 부른다)
+        monkeypatch.setattr(collector_module.time, "time", lambda: real_time() + 61.0)
+        await self._refresh_once(service, db, monkeypatch)
+
+        assert await self._archive_count(db) > after_first
+
+
+class TestWalletCache:
+    """입출금 상태는 wallet_refresh_seconds 주기로만 새로 받는다 (3-4)."""
+
+    async def test_reuses_cache_within_the_interval(self, monkeypatch) -> None:
+        monkeypatch.setattr(settings, "wallet_refresh_seconds", 60.0)
+        service = CollectorService()
+        calls: list[str] = []
+
+        async def wallet(eid, warnings):
+            calls.append(eid)
+            return {"BTC": WalletStatus(deposit=True, withdrawal=True)}
+
+        monkeypatch.setattr(service, "_wallet", wallet)
+
+        # 1회차: 세 거래소 모두 실제 조회
+        service._wallet_cache = {}
+        await self._cycle(service)
+        assert len(calls) == 3
+
+        # 2·3회차: 캐시를 읽으므로 추가 호출이 없어야 한다
+        await self._cycle(service)
+        await self._cycle(service)
+        assert len(calls) == 3
+
+    async def _cycle(self, service) -> None:
+        """_refresh 의 1단계 wallet 분기만 떼어 흉내낸다."""
+        cycle_ts = time.monotonic()
+        refresh_wallet = (
+            cycle_ts - service._last_wallet_ts >= settings.wallet_refresh_seconds
+            or not service._wallet_cache
+        )
+        if refresh_wallet:
+            results = [await service._wallet(eid, []) for eid in ("upbit", "bithumb", "binance")]
+            service._wallet_cache = dict(zip(("upbit", "bithumb", "binance"), results))
+            service._last_wallet_ts = cycle_ts

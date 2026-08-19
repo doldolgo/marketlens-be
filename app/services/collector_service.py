@@ -67,6 +67,11 @@ _WALLET_FETCHERS = {
 }
 
 
+async def _completed(value: list) -> list:
+    """이미 가진 값을 await 가능한 형태로 감싼다 (캐시 경로용)."""
+    return value
+
+
 def _truncate(levels: list[OrderBookLevel], max_amount: float) -> list[list[float]]:
     """누적 체결 가능액이 max_amount 에 도달할 때까지의 단계만 남긴다.
 
@@ -91,6 +96,12 @@ class CollectorService:
         # (프로세스 안에서만 유효 — 다중 워커 배포 시에는 스케줄러 한 곳에서만
         # refresh 를 부르는 운영 규칙이 필요하다)
         self._refresh_lock = asyncio.Lock()
+        # 저빈도 작업의 마지막 실행 시각 (time.monotonic 기준).
+        # 라이브 수집은 1초마다 돌지만 아래 둘은 그 주기로 돌 이유가 없다.
+        self._last_archive_ts: float = 0.0
+        self._last_wallet_ts: float = 0.0
+        #: 거래소 → 입출금 상태. wallet_refresh_seconds 주기로만 갱신한다.
+        self._wallet_cache: dict[str, dict[str, WalletStatus] | None] = {}
 
     async def refresh(self, session: AsyncSession) -> RefreshResult:
         """모든 수집 대상을 가져와 DB 를 갱신한다. 동시 호출은 직렬화된다."""
@@ -105,10 +116,22 @@ class CollectorService:
         failures: list[RefreshFailure] = []
 
         # 1단계 — 입출금 상태 · 환율(하나은행) · 국내 호가를 동시에 모은다.
-        wallet_task = asyncio.gather(
-            *(self._wallet(eid, warnings) for eid in _WALLET_FETCHERS)
-        ) # 입출금 가능 여부 리스트
-        
+        #
+        # 입출금 상태는 분 단위로도 잘 안 바뀌는 값인데 조회는 비싸다(업비트·
+        # 바이낸스 모두 인증 호출). 1초 사이클마다 부르면 그 자체로 rate limit
+        # 을 갉아먹으므로 wallet_refresh_seconds 주기로만 새로 받고, 나머지
+        # 사이클은 캐시를 읽는다.
+        cycle_ts = time.monotonic()
+        refresh_wallet = (
+            cycle_ts - self._last_wallet_ts >= settings.wallet_refresh_seconds
+            or not self._wallet_cache
+        )
+        wallet_task = (
+            asyncio.gather(*(self._wallet(eid, warnings) for eid in _WALLET_FETCHERS))
+            if refresh_wallet
+            else _completed([self._wallet_cache.get(eid) for eid in _WALLET_FETCHERS])
+        )
+
         domestic_ids = domestic_exchange_ids()
         domestic_task = asyncio.gather(
             *(self._domestic_market(eid, failures) for eid in domestic_ids)
@@ -119,6 +142,9 @@ class CollectorService:
         wallets: dict[str, dict[str, WalletStatus] | None] = dict(
             zip(_WALLET_FETCHERS, wallet_results, strict=True)
         )
+        if refresh_wallet:
+            self._wallet_cache = wallets
+            self._last_wallet_ts = cycle_ts
 
         # 이번에 환율을 못 받았으면 DB 의 마지막 값으로 계산을 이어간다.
         # (환율은 분 단위로 급변하지 않으므로 낡은 값이 없는 것보다 낫다)
@@ -246,12 +272,25 @@ class CollectorService:
         stored_bases = await repository.list_snapshot_bases(session)
         orphans = sorted(stored_bases - intersection)
 
+        # premium_archive 는 라이브 수집보다 훨씬 느리게 적재한다.
+        # 1초마다 쌓으면 (국내 2 × 코인 245)로 하루 4,400만 행이 되어 DB 가
+        # 버티지 못한다. archive_interval_seconds 마다 한 번만 남긴다.
+        do_archive = (
+            cycle_ts - self._last_archive_ts >= settings.archive_interval_seconds
+        )
+        if do_archive:
+            self._last_archive_ts = cycle_ts
+
         archived = 0
         deleted = 0
         for base in orphans:
-            archived += await self._archive_stored(
-                session, base, usdkrw_rate_value, now_ts
-            )
+            # 짝을 잃은 코인의 마지막 김프는 이 기회를 놓치면 영영 못 남긴다.
+            # 그래도 주기 가드를 따른다 — 스냅샷 삭제는 아래에서 항상 수행되고,
+            # 이 코인은 이미 실시간 창에서 빠진 상태다.
+            if do_archive:
+                archived += await self._archive_stored(
+                    session, base, usdkrw_rate_value, now_ts
+                )
             deleted += await repository.delete_snapshots_by_base(session, base)
             await session.commit()  # ← 코인 하나가 끝날 때마다 즉시 반영
 
@@ -259,7 +298,7 @@ class CollectorService:
         #
         # 전부 모아 마지막에 한 번 커밋하면 사이클이 끝날 때까지 조회 API 가
         # 옛 값을 본다. 코인 단위로 끊으면 처리된 코인부터 곧바로 최신이 된다.
-        if usdkrw_rate_value is None:
+        if do_archive and usdkrw_rate_value is None:
             warnings.append(
                 "환율이 없어 이번 회차의 김프 기록(premium_archive)을 건너뜁니다."
             )
@@ -286,7 +325,7 @@ class CollectorService:
                     dw_failed_by_exchange[r.exchange] = True
 
             # 김프/역프 기록 — (국내 × 해외) 짝마다 한 줄.
-            if usdkrw_rate_value is not None:
+            if do_archive and usdkrw_rate_value is not None:
                 archived += await self._archive_rows(
                     session, base, coin_rows, usdkrw_rate_value, now_ts
                 )
