@@ -21,12 +21,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.errors import MarketDataNotFoundError
-from app.db import repository
-from app.db.models import MarketSnapshot
 from app.exchanges.registry import get_exchange
 from app.models.premium import PremiumDirection
 from app.models.scan import ScanEntry, ScanResult, SortOrder
 from app.models.ticker import PriceSide
+from app.services.live_store import (
+    AnySnapshot,
+    received_at_ms,
+    snapshots_or_db,
+)
 from app.services.premium_service import (
     exchange_name,
     premium_service,
@@ -45,7 +48,7 @@ SUSPICION_REASON = (
 
 
 def _pick(
-    snap: MarketSnapshot, side: PriceSide
+    snap: AnySnapshot, side: PriceSide
 ) -> tuple[float, float | None] | None:
     """스냅샷에서 원하는 side 의 (가격, 최우선 호가 잔량) 을 꺼낸다. 없으면 None.
 
@@ -68,9 +71,9 @@ class ScanService:
         base: str,
         direction: PremiumDirection,
         domestic_id: str,
-        dom_snap: MarketSnapshot,
+        dom_snap: AnySnapshot,
         domestic_side: PriceSide,
-        ovs_snap: MarketSnapshot,
+        ovs_snap: AnySnapshot,
         overseas_side: PriceSide,
         usd_krw_rate: float,
     ) -> ScanEntry | None:
@@ -130,14 +133,14 @@ class ScanService:
         limit: int = 10,
         order: SortOrder = SortOrder.ASC,
     ) -> ScanResult:
-        """전종목을 훑어 김프 1등과 역김프 1등을 찾는다. 데이터는 전부 DB.
+        """전종목을 훑어 김프 1등과 역김프 1등을 찾는다. 데이터는 전부 메모리.
 
         가격은 체결되는 쪽 호가를 쓴다 — 살 때 매도호가(ask), 팔 때 매수호가(bid).
 
         Args:
             session: DB 세션.
             domestic: 국내 기준 거래소 ID (업비트/빗썸 등). 생략하면 설정 기본값.
-            exchanges: 비교할 해외 거래소 ID 목록. 생략하면 DB 에 USDT 스냅샷이
+            exchanges: 비교할 해외 거래소 ID 목록. 생략하면 USDT 스냅샷이
                 있는 전체.
             min_liquidity_krw: 저장된 최우선 호가의 체결 가능 금액(잔량 × 가격)이
                 이보다 작으면 제외.
@@ -145,7 +148,7 @@ class ScanService:
             order: 목록 정렬 방향. ``asc`` 면 수익률 오름차순 (기본).
 
         Raises:
-            MarketDataNotFoundError: DB 에 스캔할 스냅샷이나 환율이 없는 경우.
+            MarketDataNotFoundError: 스캔할 스냅샷이나 환율이 없는 경우.
         """
         started = time.perf_counter()
 
@@ -153,9 +156,9 @@ class ScanService:
         rate = await resolve_usdkrw_rate(session)
 
         # 스냅샷 전체를 한 번에 읽어 국내(KRW)와 해외(USDT)로 나눈다.
-        snapshots = await repository.get_snapshots(session)
-        domestic_snaps: dict[str, MarketSnapshot] = {}
-        overseas_snaps: dict[str, dict[str, MarketSnapshot]] = {}
+        snapshots = await snapshots_or_db(session)
+        domestic_snaps: dict[str, AnySnapshot] = {}
+        overseas_snaps: dict[str, dict[str, AnySnapshot]] = {}
         for snap in snapshots:
             if (
                 snap.exchange == domestic_id
@@ -300,6 +303,7 @@ class ScanService:
         )
 
         return ScanResult(
+            data_received_at=received_at_ms(snapshots),
             order=order,
             dom=domestic_id,
             fx_list=overseas_ids,

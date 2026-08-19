@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# .env 백업본 — 평문 키가 들어있으므로 절대 커밋 금지
+.env.bak*
+.env.*.bak

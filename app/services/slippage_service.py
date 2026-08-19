@@ -23,6 +23,10 @@ from app.exchanges.registry import get_exchange
 from app.models.orderbook import OrderBook
 from app.models.slippage import FillLevel, OrderSide, SlippageResult
 from app.models.symbol import Symbol
+from app.services.live_store import (
+    received_at_ms,
+    require_snapshot_or_db,
+)
 from app.services.orderbook_walk import WalkResult, walk_by_amount, walk_by_quantity
 
 #: 기본 호가 깊이. 저장된 호가(수집 한도 내)를 사실상 전부 훑는 수준이다.
@@ -65,6 +69,7 @@ class SlippageService:
         amount: float | None,
         quantity: float | None,
         data_updated_at: int | None = None,
+        data_received_at: int | None = None,
     ) -> SlippageResult:
         """호가창과 요청으로 결과를 만든다."""
         is_buy = side is OrderSide.BUY
@@ -144,6 +149,7 @@ class SlippageService:
             top_level_amount=top.price * top.size,
             fills=self._build_fills(walk),
             data_updated_at=data_updated_at,
+            data_received_at=data_received_at,
             warnings=warnings,
         )
 
@@ -158,7 +164,7 @@ class SlippageService:
         quantity: float | None = None,
         depth: int = DEFAULT_DEPTH,
     ) -> SlippageResult:
-        """DB 스냅샷으로 거래소 한 곳의 슬리피지를 계산한다.
+        """메모리 스냅샷(없으면 DB)으로 거래소 한 곳의 슬리피지를 계산한다.
 
         Args:
             session: DB 세션.
@@ -171,7 +177,7 @@ class SlippageService:
 
         Raises:
             InvalidRequestError: amount / quantity 를 둘 다 주거나 둘 다 안 준 경우.
-            MarketDataNotFoundError: DB 에 스냅샷이 없거나, 저장된 마켓과 quote 가
+            MarketDataNotFoundError: 스냅샷이 없거나, 저장된 마켓과 quote 가
                 다른 심볼을 요청한 경우.
         """
         if (amount is None) == (quantity is None):
@@ -191,10 +197,10 @@ class SlippageService:
         # 거래소 ID 검증 + 표시용 이름. 메타데이터만 쓰고 API 호출은 하지 않는다.
         exchange = get_exchange(exchange_id)
 
-        snap = await repository.require_snapshot(session, exchange.id, symbol.base)
+        snap = await require_snapshot_or_db(session, exchange.id, symbol.base)
         if symbol.quote != snap.quote:
             raise MarketDataNotFoundError(
-                f"DB 에 {exchange.id} 거래소의 {symbol} 마켓이 없습니다. "
+                f"{exchange.id} 거래소에 {symbol} 마켓이 없습니다. "
                 f"{snap.base} 는 {snap.base}/{snap.quote} 마켓으로 저장되어 있습니다 — "
                 f"quote 를 {snap.quote} 로 바꿔 요청하세요.",
                 detail={
@@ -211,6 +217,7 @@ class SlippageService:
             amount=amount,
             quantity=quantity,
             data_updated_at=_epoch_ms(snap.updated_at),
+            data_received_at=received_at_ms([snap]),
         )
 
 

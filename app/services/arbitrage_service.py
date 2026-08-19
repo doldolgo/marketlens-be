@@ -35,7 +35,6 @@ from app.core.errors import (
     UnsupportedExchangeError,
 )
 from app.db import repository
-from app.db.models import MarketSnapshot
 from app.exchanges.registry import get_exchange
 from app.models.arbitrage import (
     ArbitrageFailure,
@@ -45,6 +44,12 @@ from app.models.arbitrage import (
 )
 from app.models.orderbook import OrderBook, OrderBookLevel
 from app.models.premium import PremiumDirection
+from app.services.live_store import (
+    AnySnapshot,
+    received_at_ms,
+    require_usdkrw_rate_or_db,
+    snapshots_or_db,
+)
 from app.services.orderbook_walk import WalkResult, walk_by_amount, walk_by_quantity
 
 #: 시뮬레이션에 쓸 호가 깊이 기본값. DB 에는 누적 체결 가능액이
@@ -93,7 +98,7 @@ def _fmt_amount(amount: float, currency: str) -> str:
 class _Venue:
     """비교 후보 한 곳 — 스냅샷과 요청 통화로 환산된 호가."""
 
-    snap: MarketSnapshot
+    snap: AnySnapshot
     #: depth 만큼 자른 호가 (거래소 원래 통화)
     book: OrderBook
     #: 요청 통화로 환산된 매도 호가 (오름차순)
@@ -134,7 +139,7 @@ class ArbitrageService:
 
     def _build_venues(
         self,
-        snapshots: list[MarketSnapshot],
+        snapshots: list[AnySnapshot],
         usdkrw_rate: float,
         *,
         currency: str,
@@ -282,7 +287,7 @@ class ArbitrageService:
         direction: PremiumDirection | None = None,
         depth: int = DEFAULT_DEPTH,
     ) -> ArbitrageResult:
-        """투입 금액에 대한 차익을 DB 스냅샷으로 계산한다.
+        """투입 금액에 대한 차익을 메모리 스냅샷(없으면 DB)으로 계산한다.
 
         Args:
             session: DB 세션.
@@ -301,7 +306,7 @@ class ArbitrageService:
 
         Raises:
             InvalidRequestError: 지원하지 않는 통화이거나 금액이 너무 작은 경우.
-            MarketDataNotFoundError: DB 에 스냅샷 또는 환율이 없는 경우.
+            MarketDataNotFoundError: 스냅샷 또는 환율이 없는 경우.
             NoArbitrageOpportunityError: 비교 가능한 거래소가 2곳 미만이거나,
                 자동 선택에서 최저 매수처와 최고 매도처가 같은 거래소인 경우.
         """
@@ -321,16 +326,16 @@ class ArbitrageService:
             [get_exchange(e).id for e in exchanges] if exchanges is not None else None
         )
 
-        snapshots = await repository.get_snapshots(session, base=base)
+        snapshots = await snapshots_or_db(session, base=base)
 
         if not snapshots:
             raise MarketDataNotFoundError(
-                f"DB 에 {base} 스냅샷이 없습니다. POST /refresh 로 데이터를 "
+                f"{base} 스냅샷이 없습니다. POST /refresh 로 데이터를 "
                 "수집했는지, 상장된 코인인지 확인하세요.",
                 detail={"base": base},
             )
         # 통일 환율 — 없거나 0 이하면 여기서 404 성격의 예외가 난다.
-        usdkrw = await repository.require_usdkrw_rate(session)
+        usdkrw = await require_usdkrw_rate_or_db(session)
 
         # 대상 거래소 필터. 명시적으로 요청했는데 스냅샷이 없으면 실패로 기록한다.
         failures: list[ArbitrageFailure] = []
@@ -471,6 +476,7 @@ class ArbitrageService:
         stamps = [v.snap.updated_at for v in venues if v.snap.updated_at is not None]
 
         return ArbitrageResult(
+            data_received_at=received_at_ms(snapshots),
             sym=base,
             direction=direction,
             input_amount_krw=input_krw,

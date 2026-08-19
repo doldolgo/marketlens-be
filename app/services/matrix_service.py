@@ -19,9 +19,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.errors import MarketDataNotFoundError
 from app.db import repository
-from app.db.models import MarketSnapshot
 from app.models.matrix import MatrixCoinEntry, MatrixDirection, MatrixResult
 from app.models.orderbook import OrderBookLevel
+from app.services.live_store import (
+    AnySnapshot,
+    received_at_ms,
+    require_usdkrw_rate_or_db,
+    snapshots_or_db,
+)
 from app.services.orderbook_walk import walk_by_amount, walk_by_quantity
 
 
@@ -94,21 +99,21 @@ class MatrixService:
     async def build(
         self, session: AsyncSession, *, amount_krw: float
     ) -> MatrixResult:
-        """DB 를 읽어 전 코인 매트릭스를 만든다."""
+        """메모리(없으면 DB)를 읽어 전 코인 매트릭스를 만든다."""
         started = time.perf_counter()
 
-        snapshots = await repository.get_snapshots(session)
+        snapshots = await snapshots_or_db(session)
 
         if not snapshots:
             raise MarketDataNotFoundError(
-                "DB 에 시세 스냅샷이 없습니다. 먼저 POST /refresh 로 수집하세요.",
+                "시세 스냅샷이 없습니다. 먼저 POST /refresh 로 수집하세요.",
             )
         # 통일 환율 — 모든 조합이 같은 은행 고시 USD/KRW 를 쓴다.
-        usdkrw = await repository.require_usdkrw_rate(session)
+        usdkrw = await require_usdkrw_rate_or_db(session)
 
         # 국내(KRW 가격)와 해외(USDT 가격)를 저장된 통화로 구분한다.
-        domestic: dict[str, dict[str, MarketSnapshot]] = {}
-        overseas: dict[str, dict[str, MarketSnapshot]] = {}
+        domestic: dict[str, dict[str, AnySnapshot]] = {}
+        overseas: dict[str, dict[str, AnySnapshot]] = {}
         for snap in snapshots:
             if snap.quote == settings.krw_reference_quote:
                 domestic.setdefault(snap.base, {})[snap.exchange] = snap
@@ -232,6 +237,7 @@ class MatrixService:
             )
 
         return MatrixResult(
+            data_received_at=received_at_ms(snapshots),
             amount_krw=amount_krw,
             coins=entries,
             scanned_coins=len(entries),

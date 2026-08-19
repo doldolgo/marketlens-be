@@ -12,8 +12,8 @@ class ExchangeRefreshStat(BaseModel):
     saved: int = Field(
         ...,
         description=(
-            "저장(UPSERT)한 코인 수. 이번 수집에 빠진 코인도 지우지 않는다 — "
-            "코인을 찾아 갱신만 하며, 낡은 행은 updated_at 으로 판별한다"
+            "이번 사이클이 **메모리에 적재한** 코인 수. DB 쓰기는 이 호출이 "
+            "하지 않는다 — 1분 주기 저장 루프가 따로 내린다"
         ),
     )
     wallet_status_available: bool = Field(
@@ -22,9 +22,6 @@ class ExchangeRefreshStat(BaseModel):
             "입출금 가능 여부를 채웠는지. False 면 키가 없거나 조회에 실패해 "
             "deposit_enabled / withdrawal_enabled 가 null 로 저장됐다"
         ),
-    )
-    mode: str = Field(
-        ..., description="`bulk`=전종목 일괄 조회, `per_symbol`=심볼별 조회"
     )
 
 
@@ -46,7 +43,11 @@ class RefreshFailure(BaseModel):
 
 
 class RefreshResult(BaseModel):
-    """POST /refresh 응답 — DB 에 무엇이 저장됐는지."""
+    """POST /refresh 응답 — 메모리에 무엇이 적재됐는지.
+
+    이 호출은 DB 를 건드리지 않는다. ``market_snapshots`` / ``premium_archive``
+    저장은 ``PERSIST_INTERVAL_SECONDS`` 주기의 별도 루프가 담당한다.
+    """
 
     snapshots: list[ExchangeRefreshStat] = Field(
         default_factory=list, description="거래소별 스냅샷 저장 결과"
@@ -54,26 +55,11 @@ class RefreshResult(BaseModel):
     usdkrw: UsdKrwRateInfo | None = Field(
         None,
         description=(
-            "저장한 통일 환율 (하나은행 USD/KRW 매매기준율). "
-            "이번 수집에 실패했으면 null — 계산은 DB 의 마지막 환율로 계속된다"
+            "이번에 받은 통일 환율 (하나은행 USD/KRW 매매기준율). "
+            "수집에 실패했으면 null — 계산은 직전 환율로 계속된다"
         ),
     )
-    total_saved: int = Field(0, description="저장한 전체 행 수")
-    deleted: int = Field(
-        0,
-        description=(
-            "짝을 잃어 market_snapshots 에서 지운 행 수 — 국내·해외 한쪽에만 "
-            "남아 김프를 계산할 수 없게 된 코인. 지우기 전 마지막 김프를 "
-            "premium_archive 에 남긴다"
-        ),
-    )
-    archived: int = Field(
-        0,
-        description=(
-            "이번 회차에 김프/역프 기록(premium_archive)으로 남긴 행 수 — "
-            "(국내 거래소 × 코인) 조합마다 한 줄"
-        ),
-    )
+    total_saved: int = Field(0, description="메모리에 적재한 전체 행 수")
 
     failures: list[RefreshFailure] = Field(
         default_factory=list, description="수집 실패 항목"

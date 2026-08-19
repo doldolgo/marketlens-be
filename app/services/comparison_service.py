@@ -19,10 +19,14 @@ from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import InvalidRequestError, MarketDataNotFoundError
-from app.db import repository
-from app.db.models import MarketSnapshot
 from app.exchanges.registry import get_exchange
 from app.models.comparison import ArbitrageSpread, ComparisonResult, ExchangeQuote
+from app.services.live_store import (
+    AnySnapshot,
+    received_at_ms,
+    snapshots_or_db,
+    usdkrw_rate_or_db,
+)
 
 #: 공통 통화로 환산 가능한 결제 통화. (수집기도 이 두 통화만 저장한다)
 _CONVERTIBLE = frozenset({"KRW", "USDT"})
@@ -37,7 +41,7 @@ class ComparisonService:
 
     def _conversion(
         self,
-        snap: MarketSnapshot,
+        snap: AnySnapshot,
         currency: str,
         usdkrw_rate: float | None,
     ) -> tuple[float, float | None]:
@@ -63,7 +67,7 @@ class ComparisonService:
         factor = usdkrw_rate if currency == "KRW" else 1.0 / usdkrw_rate
         return factor, usdkrw_rate
 
-    def _to_quote(self, snap: MarketSnapshot, factor: float) -> ExchangeQuote:
+    def _to_quote(self, snap: AnySnapshot, factor: float) -> ExchangeQuote:
         """스냅샷 한 행을 공통 통화로 환산한 ExchangeQuote 로 변환한다."""
         best_bid = float(snap.bids[0][0]) if snap.bids else None
         best_ask = float(snap.asks[0][0]) if snap.asks else None
@@ -124,7 +128,7 @@ class ComparisonService:
             common_currency: 환산 기준 통화 ("KRW" 또는 "USDT").
 
         Raises:
-            MarketDataNotFoundError: 비교할 스냅샷이 DB 에 하나도 없는 경우.
+            MarketDataNotFoundError: 비교할 스냅샷이 하나도 없는 경우.
         """
         started = time.perf_counter()
         currency = common_currency.upper()
@@ -135,7 +139,7 @@ class ComparisonService:
                 detail={"common_currency": currency},
             )
 
-        snapshots = await repository.get_snapshots(session, base=base)
+        snapshots = await snapshots_or_db(session, base=base)
 
         missing: list[str] = []
         if exchanges is not None:
@@ -147,14 +151,14 @@ class ComparisonService:
 
         if not snapshots:
             raise MarketDataNotFoundError(
-                f"DB 에 {base.upper()} 스냅샷이 없습니다. "
+                f"{base.upper()} 스냅샷이 없습니다. "
                 "POST /refresh 로 데이터를 수집했는지, 해당 거래소에 상장된 "
                 "코인인지 확인하세요.",
                 detail={"base": base.upper(), "missing_exchanges": missing},
             )
 
         # 통일 환율 — 아직 수집 전이면 None (환산이 필요할 때만 예외가 난다).
-        usdkrw_row = await repository.get_usdkrw_rate(session)
+        usdkrw_row = await usdkrw_rate_or_db(session)
         usdkrw_rate = usdkrw_row.rate if usdkrw_row is not None else None
 
         quotes: list[ExchangeQuote] = []
@@ -178,6 +182,7 @@ class ComparisonService:
         quotes.sort(key=lambda q: q.price)
 
         return ComparisonResult(
+            data_received_at=received_at_ms(snapshots),
             sym=base.upper(),
             common_currency=currency,
             usd_krw_rate=usdkrw_rate,

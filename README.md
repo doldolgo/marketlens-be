@@ -69,7 +69,7 @@ Swagger UI: http://localhost:8000/docs — 전 엔드포인트를 화면에서 �
 | **[docs/API.md](docs/API.md)** | 전체 API 명세 — 엔드포인트, 파라미터, 응답, 에러, 거래소 추가법 |
 | **[docs/DB.md](docs/DB.md)** | DB 구조 — 테이블·컬럼·단위, 읽기 뷰 |
 | **[docs/HISTORY.md](docs/HISTORY.md)** | 김프/역프 기록 시스템 — 조회 API, 대량 채우기, 운영 |
-| **[docs/DEPLOY.md](docs/DEPLOY.md)** | 배포 — EC2+RDS 초기 설정, crontab, 마이그레이션 |
+| **[docs/DEPLOY.md](docs/DEPLOY.md)** | 배포 — EC2+RDS 초기 설정, 수집 루프, 마이그레이션 |
 | **[docs/ROADMAP.md](docs/ROADMAP.md)** | 단계별 구현 계획 |
 
 ## 구조
@@ -113,7 +113,7 @@ ruff check . && ruff format .   # 커밋 전
 ## 배포
 
 `main` 머지 → GitHub Actions 가 EC2 에 자동 배포. DB 는 AWS RDS.
-초기 설정·crontab·백필·마이그레이션은 **[docs/DEPLOY.md](docs/DEPLOY.md)** 참고.
+초기 설정·수집 루프·백필·마이그레이션은 **[docs/DEPLOY.md](docs/DEPLOY.md)** 참고.
 
 ## 협업 규칙
 

@@ -1,7 +1,8 @@
-"""수집기 — 거래소 API 를 호출해 DB 를 갱신하는 유일한 곳.
+"""수집기 — 거래소 API 를 호출해 메모리와 DB 를 갱신하는 유일한 곳.
 
 ``POST /refresh`` 가 이 서비스를 부른다. 그 외의 모든 조회 API 는 거래소를
-직접 부르지 않고 여기서 저장한 DB 를 읽는다.
+직접 부르지 않고, 여기서 :mod:`app.services.live_store` 에 올려둔 메모리
+스냅샷을 읽는다 (재기동 직후 첫 사이클 전에는 DB 로 폴백한다).
 
 수집 대상
     1. 국내 거래소(업비트·빗썸)의 **KRW 전종목** — 현재가 + 호가 깊이
@@ -9,7 +10,9 @@
     3. 각 거래소의 **입출금 가능 여부** (업비트·바이낸스는 API 키 필요, 빗썸은 public)
     4. **환율** — 하나은행 고시 USD/KRW 매매기준율 (모든 원화 환산 통일)
 
-저장은 세 갈래다.
+저장은 네 갈래다.
+    - ``live_store`` (프로세스 메모리) — 조회 API 가 읽는 최신 시세.
+      사이클마다 **통째로 교체**한다.
     - ``market_snapshots`` — 코인을 찾아 **UPSERT 만** 한다 (삭제 없음).
       실시간 스프레드 창의 데이터.
     - ``premium_archive`` — 방금 갱신한 스냅샷에서 코인·시각·김프·역프만
@@ -25,7 +28,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -45,6 +51,7 @@ from app.exchanges.registry import domestic_exchange_ids, get_exchange
 from app.history import hana
 from app.history import service as history_service
 from app.history.service import premium_from_quotes
+from app.models.bulk import BulkQuote
 from app.models.orderbook import MarketType, OrderBook, OrderBookLevel
 from app.models.refresh import (
     ExchangeRefreshStat,
@@ -53,7 +60,14 @@ from app.models.refresh import (
     UsdKrwRateInfo,
 )
 from app.models.symbol import Symbol
+from app.services.live_store import LiveRate, LiveSnapshot, live_store
 
+
+logger = logging.getLogger(__name__)
+
+#: 스냅샷 UPSERT 한 문장의 최대 행 수 — asyncpg 파라미터 한도(32,767개) 보호.
+#: 행당 열이 11개라 이론 상한은 2,979행이다. 현재 실측 491행.
+_UPSERT_BATCH = 2_000
 
 #: 거래소 ID → 입출금 상태 조회 함수
 _WALLET_FETCHERS = {
@@ -61,6 +75,11 @@ _WALLET_FETCHERS = {
     "bithumb": fetch_bithumb_wallet_status,
     "binance": fetch_binance_wallet_status,
 }
+
+
+async def _completed(value: list) -> list:
+    """이미 가진 값을 await 가능한 형태로 감싼다 (캐시 경로용)."""
+    return value
 
 
 def _truncate(levels: list[OrderBookLevel], max_amount: float) -> list[list[float]]:
@@ -78,8 +97,35 @@ def _truncate(levels: list[OrderBookLevel], max_amount: float) -> list[list[floa
     return out
 
 
+@dataclass(slots=True)
+class _PendingPersist:
+    """수집 사이클이 관측했지만 **메모리에는 안 담기는** 값들.
+
+    저장 루프가 DB 를 채우려면 스냅샷 말고도 이 값들이 필요한데, 전부 그
+    회차에만 알 수 있는 것들이다 (상장 마켓 수는 교집합 밖 코인까지 세고,
+    입출금 실패 여부는 저장 시점이 아니라 관측 시점의 사실이다).
+    """
+
+    received_ts: int
+    listed_count: dict[str, int]
+    futures_market_count: int | None
+    dw_failed: dict[str, bool]
+    usdkrw_observation: hana.UsdKrwObservation | None
+    usdkrw_rate_value: float | None
+
+
+@dataclass(slots=True)
+class PersistResult:
+    """저장 루프 한 번의 결과 (로그·테스트용 — API 응답이 아니다)."""
+
+    saved: int = 0
+    archived: int = 0
+    deleted: int = 0
+    elapsed_ms: float = 0.0
+
+
 class CollectorService:
-    """거래소 → DB 단방향 수집."""
+    """거래소 → 메모리 수집 + 메모리 → DB 저장."""
 
     def __init__(self) -> None:
         # 동시 refresh 를 직렬화한다. 두 수집이 같은 행을 서로 다른 순서로
@@ -87,11 +133,38 @@ class CollectorService:
         # (프로세스 안에서만 유효 — 다중 워커 배포 시에는 스케줄러 한 곳에서만
         # refresh 를 부르는 운영 규칙이 필요하다)
         self._refresh_lock = asyncio.Lock()
+        # 저빈도 작업의 마지막 실행 시각 (time.monotonic 기준).
+        # 라이브 수집은 1초마다 돌지만 아래 둘은 그 주기로 돌 이유가 없다.
+        #
+        # **None = 아직 한 번도 안 했다.** 0.0 을 쓰면 안 된다 — monotonic 은
+        # 부팅 후 경과 시간이라 갓 부팅한 기계에서는 0 이 "아주 옛날"이 아니다.
+        # uptime 이 주기보다 짧으면 첫 회차가 통째로 건너뛰어진다.
+        self._last_archive_ts: float | None = None
+        self._last_wallet_ts: float = 0.0
+        #: 거래소 → 입출금 상태. wallet_refresh_seconds 주기로만 갱신한다.
+        self._wallet_cache: dict[str, dict[str, WalletStatus] | None] = {}
+        #: 마지막 수집 사이클이 관측한, 저장 루프가 필요로 하는 값들.
+        #: 아직 한 사이클도 안 돌았으면 None — 저장 루프는 그냥 넘어간다.
+        self._pending: _PendingPersist | None = None
 
     async def refresh(self, session: AsyncSession) -> RefreshResult:
-        """모든 수집 대상을 가져와 DB 를 갱신한다. 동시 호출은 직렬화된다."""
+        """모든 수집 대상을 가져와 **메모리**를 갱신한다. 동시 호출은 직렬화된다.
+
+        DB 는 건드리지 않는다 — :meth:`persist` 가 별도 주기로 내린다.
+        ``session`` 은 환율 수집 실패 시 DB 의 마지막 값을 읽는 데만 쓴다.
+        """
         async with self._refresh_lock:
             return await self._refresh(session)
+
+    async def persist(self, session: AsyncSession) -> PersistResult:
+        """메모리의 현재 시세를 DB 에 내린다. 수집과 상호 배제된다.
+
+        같은 락을 쓰는 이유 — 수집이 메모리를 통째로 교체하는 도중에 저장이
+        읽으면 반쪽짜리 상태가 DB 에 남는다. 저장이 1분에 한 번, 수집이 1초에
+        한 번이라 락 경합은 실질적으로 없다.
+        """
+        async with self._refresh_lock:
+            return await self._persist(session)
 
     async def _refresh(self, session: AsyncSession) -> RefreshResult:
         started = time.perf_counter()
@@ -101,10 +174,22 @@ class CollectorService:
         failures: list[RefreshFailure] = []
 
         # 1단계 — 입출금 상태 · 환율(하나은행) · 국내 호가를 동시에 모은다.
-        wallet_task = asyncio.gather(
-            *(self._wallet(eid, warnings) for eid in _WALLET_FETCHERS)
-        ) # 입출금 가능 여부 리스트
-        
+        #
+        # 입출금 상태는 분 단위로도 잘 안 바뀌는 값인데 조회는 비싸다(업비트·
+        # 바이낸스 모두 인증 호출). 1초 사이클마다 부르면 그 자체로 rate limit
+        # 을 갉아먹으므로 wallet_refresh_seconds 주기로만 새로 받고, 나머지
+        # 사이클은 캐시를 읽는다.
+        cycle_ts = time.monotonic()
+        refresh_wallet = (
+            cycle_ts - self._last_wallet_ts >= settings.wallet_refresh_seconds
+            or not self._wallet_cache
+        )
+        wallet_task = (
+            asyncio.gather(*(self._wallet(eid, warnings) for eid in _WALLET_FETCHERS))
+            if refresh_wallet
+            else _completed([self._wallet_cache.get(eid) for eid in _WALLET_FETCHERS])
+        )
+
         domestic_ids = domestic_exchange_ids()
         domestic_task = asyncio.gather(
             *(self._domestic_market(eid, failures) for eid in domestic_ids)
@@ -115,6 +200,9 @@ class CollectorService:
         wallets: dict[str, dict[str, WalletStatus] | None] = dict(
             zip(_WALLET_FETCHERS, wallet_results, strict=True)
         )
+        if refresh_wallet:
+            self._wallet_cache = wallets
+            self._last_wallet_ts = cycle_ts
 
         # 이번에 환율을 못 받았으면 DB 의 마지막 값으로 계산을 이어간다.
         # (환율은 분 단위로 급변하지 않으므로 낡은 값이 없는 것보다 낫다)
@@ -136,9 +224,10 @@ class CollectorService:
             domestic_bases |= set(books)
 
         binance_result, futures_market_count = await asyncio.gather(
-            self._binance_market(domestic_bases, usdkrw_rate_value, failures, warnings),
+            self._binance_market(domestic_bases, failures),
             self._binance_futures_count(warnings),
         )
+        binance_tops = binance_result[1]
 
         # 3단계 — DB 행 조립. 아직 저장하지 않는다.
         #
@@ -155,10 +244,8 @@ class CollectorService:
         #: 거래소 → 이번 회차 상장 마켓 수 (platform_status 용)
         listed_count: dict[str, int] = {}
 
-        for (eid, books, lasts), mode in [
-            *[(r, "bulk") for r in domestic_results],
-            (binance_result, "per_symbol"),
-        ]:
+        # 세 거래소 모두 전종목 일괄 조회다 — 심볼별로 도는 경로는 남아 있지 않다.
+        for eid, books, lasts in [*domestic_results, binance_result]:
             # 수집이 통째로 실패한 거래소는 DB 를 건드리지 않는다.
             # 기존 스냅샷이 남아 있고, 신선도는 updated_at 으로 판별한다.
             if not books:
@@ -171,24 +258,16 @@ class CollectorService:
                         exchange=eid,
                         saved=0,
                         wallet_status_available=wallets.get(eid) is not None,
-                        mode=mode,
                     )
                 )
                 continue
 
             wallet = wallets.get(eid)
-            rows = self._to_rows(
-                eid,
-                books,
-                lasts,
-                wallet,
-                # 바이낸스 호가는 USDT 기준이므로 최대 금액도 환산한다.
-                # (USDT≈USD 로 보고 은행 환율을 쓴다 — 자르는 깊이 기준일 뿐이라
-                #  1% 미만의 페그 오차는 결과에 의미 있는 차이를 만들지 않는다)
-                max_amount if eid != "binance" else self._usdt_amount(
-                    max_amount, usdkrw_rate_value
-                ),
-            )
+            if eid == "binance":
+                # bookTicker 는 1단계뿐이라 금액 기준으로 자를 깊이가 없다.
+                rows = self._tops_to_rows(eid, books, lasts, wallet, now_ts)
+            else:
+                rows = self._to_rows(eid, books, lasts, wallet, max_amount)
             rows_by_exchange[eid] = {r.base: r for r in rows}
             # 국내는 KRW 전종목 = 상장 현물 마켓 수. 바이낸스는 일괄 조회가
             # 준 USDT 전종목 수가 상장 마켓 수다 (호가는 교집합만 받는다).
@@ -198,8 +277,30 @@ class CollectorService:
                     exchange=eid,
                     saved=len(rows),
                     wallet_status_available=wallet is not None,
-                    mode=mode,
                 )
+            )
+
+        # 3.5단계 — 깊이 선별 조회.
+        #
+        # 바이낸스 일괄 조회는 최우선 1단계만 준다. 슬리피지 계산이 필요한
+        # 코인 — 김프가 벌어졌고 실제로 옮길 수 있는 코인 — 에 한해서만
+        # 심볼별 depth 를 추가로 받아 그 행의 호가를 덮어쓴다.
+        # 평상시 대상은 0~2개이므로 대부분의 사이클은 이 단계를 건너뛴다.
+        depth_targets = self._select_depth_targets(
+            {eid: rows_by_exchange.get(eid, {}) for eid in domestic_ids},
+            binance_tops,
+            usdkrw_rate_value,
+            wallets.get("binance"),
+        )
+        logger.info(
+            "깊이 조회 대상 %d개: %s", len(depth_targets), depth_targets or "-"
+        )
+        if depth_targets:
+            await self._apply_depth(
+                depth_targets,
+                rows_by_exchange.get("binance", {}),
+                usdkrw_rate_value,
+                failures,
             )
 
         # 4단계 — 교집합 / 합집합.
@@ -215,92 +316,77 @@ class CollectorService:
 
         intersection = domestic_union & overseas_union
 
-        # 5단계 — 짝을 잃은 코인 정리.
+        # 4.5단계 — **메모리 적재**. 조회 API 가 읽는 진실은 여기다.
         #
-        # 합집합에는 있지만 교집합에는 없는 코인 = 한쪽 시장에만 남은 코인이다.
-        # 김프를 계산할 수 없어 실시간 창에 띄울 수 없으므로, **DB 에 남아 있던
-        # 마지막 값으로 김프를 한 번 계산해 아카이브한 뒤** 스냅샷을 지운다.
-        #
-        # 합집합을 이번 회차 조회 결과로만 만들면 빠뜨리는 경우가 있다. 어제
-        # 업비트+바이낸스에 있다가 오늘 업비트에서 상폐된 코인은 국내 목록에도
-        # 없고, 바이낸스 호가도 (국내 상장분만 받으므로) 안 받아온다 — 이번
-        # 회차 어느 집합에도 안 잡히는데 DB 에는 남아 있다. 그래서 합집합의
-        # 실질은 **DB 에 행이 있는 코인 전체**로 잡는다.
-        stored_bases = await repository.list_snapshot_bases(session)
-        orphans = sorted(stored_bases - intersection)
-
-        archived = 0
-        deleted = 0
-        for base in orphans:
-            archived += await self._archive_stored(
-                session, base, usdkrw_rate_value, now_ts
-            )
-            deleted += await repository.delete_snapshots_by_base(session, base)
-            await session.commit()  # ← 코인 하나가 끝날 때마다 즉시 반영
-
-        # 6단계 — 교집합 갱신. **코인 하나마다 저장하고 커밋한다.**
-        #
-        # 전부 모아 마지막에 한 번 커밋하면 사이클이 끝날 때까지 조회 API 가
-        # 옛 값을 본다. 코인 단위로 끊으면 처리된 코인부터 곧바로 최신이 된다.
-        if usdkrw_rate_value is None:
-            warnings.append(
-                "환율이 없어 이번 회차의 김프 기록(premium_archive)을 건너뜁니다."
-            )
-
+        # 3.5단계(깊이 선별 조회)가 끝나 호가가 확정된 **뒤**에 넣는다 — 그
+        # 전에 넣으면 깊이가 반영 안 된 1단계짜리 호가가 노출된다.
+        # 담는 범위는 DB 와 같은 **교집합**이다. 한쪽 시장에만 남은 코인은
+        # 김프를 계산할 수 없어 실시간 창에 띄우지 않는다 (아래 5단계에서
+        # DB 에서도 지운다). 통째로 교체하므로 상폐 코인은 별도 삭제 로직
+        # 없이 자동으로 빠진다.
+        received_at = time.time()
+        live_now = datetime.now(timezone.utc)
+        live_snapshots: list[LiveSnapshot] = []
         saved_by_exchange: dict[str, int] = {eid: 0 for eid in rows_by_exchange}
         dw_failed_by_exchange: dict[str, bool] = {
             eid: False for eid in rows_by_exchange
         }
-
-        for base in sorted(intersection):
-            coin_rows = [
-                rows_by_exchange[eid][base]
-                for eid in rows_by_exchange
-                if base in rows_by_exchange[eid]
-            ]
-            if not coin_rows:
-                continue
-
-            # 있으면 갱신, 없으면 새로 추가 (UPSERT).
-            await repository.upsert_snapshots(session, coin_rows)
-            for r in coin_rows:
-                saved_by_exchange[r.exchange] += 1
-                if not (r.deposit_enabled and r.withdrawal_enabled):
-                    dw_failed_by_exchange[r.exchange] = True
-
-            # 김프/역프 기록 — (국내 × 해외) 짝마다 한 줄.
-            if usdkrw_rate_value is not None:
-                archived += await self._archive_rows(
-                    session, base, coin_rows, usdkrw_rate_value, now_ts
+        for eid, rows in rows_by_exchange.items():
+            for base, r in rows.items():
+                if base not in intersection:
+                    continue
+                live_snapshots.append(
+                    LiveSnapshot(
+                        exchange=r.exchange,
+                        base=r.base,
+                        native_symbol=r.native_symbol,
+                        quote=r.quote,
+                        price=r.price,
+                        asks=r.asks,
+                        bids=r.bids,
+                        deposit_enabled=r.deposit_enabled,
+                        withdrawal_enabled=r.withdrawal_enabled,
+                        price_timestamp=r.price_timestamp,
+                        updated_at=live_now,
+                    )
                 )
-
-            await session.commit()  # ← 코인 하나가 끝날 때마다 즉시 반영
-
-        # 7단계 — 거래소 단위 마무리 (플랫폼 상태 · 환율).
-        for eid in rows_by_exchange:
-            await repository.bump_platform_status(
-                session,
-                exchange=eid,
-                received_ts=now_ts,
-                spot_market_count=listed_count.get(eid, 0),
-                futures_market_count=(
-                    futures_market_count if eid == "binance" else 0
-                ),
-                dw_failed=dw_failed_by_exchange[eid],
+                saved_by_exchange[eid] += 1
+                if not (r.deposit_enabled and r.withdrawal_enabled):
+                    dw_failed_by_exchange[eid] = True
+        # 이번에 환율을 못 받았으면 None 을 넘겨 직전 값을 유지한다.
+        live_rate = (
+            LiveRate(
+                rate=float(usdkrw_observation.rate),
+                source_time=usdkrw_observation.ts,
+                round_no=usdkrw_observation.round_no,
+                updated_at=live_now,
             )
+            if usdkrw_observation is not None
+            else None
+        )
+        live_store.replace(live_snapshots, live_rate, received_at)
 
-        if usdkrw_observation is not None:
-            # 라이브 환율 단일 행(usdkrw_rate) 갱신 — 역행은 UPSERT 가드가 막는다.
-            await history_service.record_usdkrw_observation(session, usdkrw_observation)
-
-        await session.commit()
+        # 5단계 — 저장 루프에 넘길 관측값 기록.
+        #
+        # DB 쓰기는 이 사이클이 하지 않는다. 조회가 더 이상 DB 를 보지 않으므로
+        # 사이클이 쓰기를 기다릴 이유가 없다 (쓰기가 사이클 시간의 85% 였다).
+        # 스냅샷 자체는 live_store 에서 읽으면 되지만, **이번 회차에만 관측되는
+        # 값**(상장 마켓 수·선물 마켓 수·입출금 실패 여부·환율 고시)은 여기서
+        # 넘겨줘야 한다.
+        self._pending = _PendingPersist(
+            received_ts=now_ts,
+            listed_count=listed_count,
+            futures_market_count=futures_market_count,
+            dw_failed=dw_failed_by_exchange,
+            usdkrw_observation=usdkrw_observation,
+            usdkrw_rate_value=usdkrw_rate_value,
+        )
 
         for stat in stats:
             stat.saved = saved_by_exchange.get(stat.exchange, 0)
 
         return RefreshResult(
             snapshots=stats,
-            deleted=deleted,
             usdkrw=(
                 UsdKrwRateInfo(
                     rate=float(usdkrw_observation.rate),
@@ -311,11 +397,124 @@ class CollectorService:
                 else None
             ),
             total_saved=sum(s.saved for s in stats),
-            archived=archived,
             failures=failures,
             warnings=warnings,
             total_calls=sum(request_counts().values()) - calls_before,
             fetched_at=int(time.time() * 1000),
+            elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
+        )
+
+    # ------------------------------------------------------------------
+    # 저장 — 메모리 → DB (수집 사이클과 분리된 별도 주기)
+    # ------------------------------------------------------------------
+
+    async def _persist(self, session: AsyncSession) -> PersistResult:
+        """메모리의 현재 시세를 DB 에 기록한다.
+
+        수집 사이클에서 떼어낸 이유는 성능이다 — DB 쓰기가 사이클 시간의 85%
+        (2.6초 중 2.2초)를 차지했는데, 조회가 더 이상 DB 를 보지 않으므로
+        사이클이 이걸 기다릴 이유가 없다. DB 는 이제 **기록과 재기동 복구용**
+        이다.
+
+        여기서는 **마지막에 한 번만 커밋한다.** 코인마다 커밋하던 이유("사이클이
+        끝날 때까지 조회 API 가 옛 값을 본다")가 사라졌기 때문이다.
+        """
+        started = time.perf_counter()
+        pending = self._pending
+        if pending is None:
+            # 아직 한 사이클도 안 돌았다 (앱 기동 직후). 쓸 것이 없다.
+            return PersistResult()
+
+        snapshots = live_store.get_snapshots()
+        rows_by_base: dict[str, list[SnapshotRow]] = {}
+        for snap in snapshots:
+            rows_by_base.setdefault(snap.base, []).append(
+                SnapshotRow(
+                    exchange=snap.exchange,
+                    base=snap.base,
+                    native_symbol=snap.native_symbol,
+                    quote=snap.quote,
+                    price=snap.price,
+                    asks=snap.asks,
+                    bids=snap.bids,
+                    deposit_enabled=snap.deposit_enabled,
+                    withdrawal_enabled=snap.withdrawal_enabled,
+                    price_timestamp=snap.price_timestamp,
+                )
+            )
+
+        # premium_archive 는 append 전용이라 주기가 곧 DB 증가 속도다.
+        # 저장 주기와 손잡이를 따로 두고 여기서 한 번 더 가드한다.
+        cycle_ts = time.monotonic()
+        do_archive = (
+            self._last_archive_ts is None
+            or cycle_ts - self._last_archive_ts >= settings.archive_interval_seconds
+        )
+        if do_archive:
+            self._last_archive_ts = cycle_ts
+
+        now_ts = pending.received_ts
+        rate = pending.usdkrw_rate_value
+        if do_archive and rate is None:
+            logger.warning("환율이 없어 이번 회차의 김프 기록을 건너뜁니다.")
+
+        # 짝을 잃은 코인 정리 — 메모리에 없는데 DB 에 남아 있는 코인.
+        #
+        # 국내·해외 한쪽에만 남아 김프를 계산할 수 없게 된 코인이다. 지우기
+        # 전에 **DB 에 남아 있는 마지막 값**으로 김프를 한 번 아카이브한다 —
+        # 이 기회를 놓치면 상장폐지 시점의 기록이 영영 끊긴다.
+        stored_bases = await repository.list_snapshot_bases(session)
+        orphans = sorted(stored_bases - set(rows_by_base))
+        archived = 0
+        deleted = 0
+        for base in orphans:
+            if do_archive:
+                archived += await self._archive_stored(session, base, rate, now_ts)
+            deleted += await repository.delete_snapshots_by_base(session, base)
+
+        # 스냅샷 저장 — 코인마다 쪼개지 않고 한 문장으로 UPSERT 한다.
+        # (코인 단위로 끊던 이유였던 "조회가 옛 값을 본다"가 사라졌다)
+        # 다만 asyncpg 파라미터 한도(32,767개)가 있어 행 수 × 열 수로 묶는다.
+        all_rows = [row for rows in rows_by_base.values() for row in rows]
+        saved = 0
+        for i in range(0, len(all_rows), _UPSERT_BATCH):
+            saved += await repository.upsert_snapshots(
+                session, all_rows[i : i + _UPSERT_BATCH]
+            )
+
+        # 김프/역프 기록 — (국내 × 해외) 짝마다 한 줄.
+        if do_archive and rate is not None:
+            for base, coin_rows in rows_by_base.items():
+                archived += await self._archive_rows(
+                    session, base, coin_rows, rate, now_ts
+                )
+
+        # 플랫폼 상태 — 카운터가 저장 주기로 올라간다. 실패율은
+        # dw_fail_count / update_count 라 둘 다 같은 주기면 비율은 그대로다.
+        for eid, dw_failed in pending.dw_failed.items():
+            await repository.bump_platform_status(
+                session,
+                exchange=eid,
+                received_ts=now_ts,
+                spot_market_count=pending.listed_count.get(eid, 0),
+                futures_market_count=(
+                    pending.futures_market_count if eid == "binance" else 0
+                ),
+                dw_failed=dw_failed,
+            )
+
+        if pending.usdkrw_observation is not None:
+            # 라이브 환율 단일 행(usdkrw_rate) 갱신 — 역행은 UPSERT 가드가 막는다.
+            await history_service.record_usdkrw_observation(
+                session, pending.usdkrw_observation
+            )
+
+        await session.commit()
+
+        return PersistResult(
+            saved=saved,
+            archived=archived,
+            deleted=deleted,
             elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
         )
 
@@ -468,20 +667,20 @@ class CollectorService:
     async def _binance_market(
         self,
         domestic_bases: set[str],
-        usdkrw_rate: float | None,
         failures: list[RefreshFailure],
-        warnings: list[str],
-    ) -> tuple[str, dict[str, OrderBook], dict[str, float]]:
-        """바이낸스 USDT 마켓 — 국내 상장 코인만, 심볼별 depth 조회.
+    ) -> tuple[str, dict[str, BulkQuote], dict[str, float]]:
+        """바이낸스 USDT 마켓 — 전종목 일괄 조회 2회로 끝낸다.
 
-        바이낸스는 호가 깊이를 일괄로 주는 엔드포인트가 없어 심볼별로 부른다.
-        전종목 체결가(1회 호출)로 대상을 교집합으로 좁힌 뒤 동시 실행 수를
-        제한해 rate limit 을 지킨다.
+        체결가(``ticker/price``)와 최우선 호가(``ticker/bookTicker``)를 각각
+        1회씩 부른다. 심볼별 ``depth`` 조회는 코인 308개면 1,540 weight 인데,
+        이 두 번은 합쳐서 8 weight 다. 대신 받는 호가는 1단계뿐이라 슬리피지용
+        깊이는 없다 — 최우선 호가만 쓰는 ``/spreads`` 에는 영향이 없다.
         """
         exchange = get_exchange("binance")
         try:
-            quotes = await exchange.fetch_bulk_quotes(
-                settings.overseas_quote, need_book=False
+            prices, tops = await asyncio.gather(
+                exchange.fetch_bulk_quotes(settings.overseas_quote, need_book=False),
+                exchange.fetch_bulk_quotes(settings.overseas_quote, need_book=True),
             )
         except MarketLensError as exc:
             failures.append(
@@ -500,49 +699,124 @@ class CollectorService:
             )
             return "binance", {}, {}
 
-        lasts = {b: q.last for b, q in quotes.items() if q.last is not None}
-        targets = sorted(domestic_bases & set(lasts))
-        if usdkrw_rate is None:
-            warnings.append(
-                "USD/KRW 환율(하나은행 고시)을 얻지 못해 바이낸스 호가 저장 깊이를 "
-                "금액 기준으로 자르지 못했습니다. 조회된 전체 깊이를 저장합니다."
-            )
-
-        semaphore = asyncio.Semaphore(settings.refresh_concurrency)
-
-        async def one(base: str) -> tuple[str, OrderBook | None]:
-            async with semaphore:
-                try:
-                    book = await exchange.fetch_orderbook(
-                        Symbol(base=base, quote=settings.overseas_quote),
-                        depth=settings.binance_orderbook_depth,
-                        market_type=MarketType.SPOT,
-                    )
-                    return base, book
-                except MarketLensError as exc:
-                    failures.append(
-                        RefreshFailure(
-                            exchange="binance",
-                            sym=base,
-                            error_code=exc.code,
-                            message=exc.message,
-                        )
-                    )
-                    return base, None
-                except Exception as exc:  # noqa: BLE001
-                    failures.append(
-                        RefreshFailure(
-                            exchange="binance",
-                            sym=base,
-                            error_code="unexpected_error",
-                            message=f"{type(exc).__name__}: {exc}",
-                        )
-                    )
-                    return base, None
-
-        results = await asyncio.gather(*(one(b) for b in targets))
-        books = {base: book for base, book in results if book is not None}
+        lasts = {b: q.last for b, q in prices.items() if q.last is not None}
+        # 저장은 국내에 상장된 코인만 — 김프 계산에 짝이 없는 코인은 쓸모가 없다.
+        # (lasts 는 좁히지 않는다. 상장 마켓 수 집계에 전종목 수가 필요하다)
+        books = {b: q for b, q in tops.items() if b in domestic_bases}
         return "binance", books, lasts
+
+    def _select_depth_targets(
+        self,
+        domestic_rows: dict[str, dict[str, SnapshotRow]],
+        tops: dict[str, BulkQuote],
+        rate: float | None,
+        wallet_binance: dict[str, WalletStatus] | None,
+    ) -> list[str]:
+        """김프가 벌어졌고 실제로 옮길 수 있는 코인만 고른다.
+
+        김프 공식은 spread_service.py 의 fwd 와 동일하게 맞춘다:
+            fwd = (국내_bid / (해외_ask * 환율) - 1) * 100
+
+        입출금이 막힌 코인은 제외한다 — 옮길 수 없으면 슬리피지를 계산할 의미가
+        없고, 실제로 김프가 크게 벌어진 코인은 대부분 입금이 막혀서 벌어진다.
+        """
+        if rate is None or rate <= 0:
+            return []
+
+        cands: list[tuple[float, str]] = []
+        for base, q in tops.items():
+            if q.ask is None or q.ask <= 0:
+                continue
+            # 국내 여러 거래소 중 가장 높은 매수호가를 쓴다 (가장 유리한 매도처)
+            dom_bid = max(
+                (
+                    r.bids[0][0]
+                    for r in (rows.get(base) for rows in domestic_rows.values())
+                    if r and r.bids
+                ),
+                default=None,
+            )
+            if dom_bid is None:
+                continue
+
+            fwd = (dom_bid / (q.ask * rate) - 1) * 100
+            if fwd < settings.depth_watch_min_percent:
+                continue
+
+            # 해외 출금 + 국내 입금이 둘 다 되어야 실제로 옮길 수 있다
+            fx_status = wallet_binance.get(base) if wallet_binance else None
+            if not (fx_status and fx_status.withdrawal):
+                continue
+            dom_ok = any(
+                (r is not None and r.deposit_enabled)
+                for r in (rows.get(base) for rows in domestic_rows.values())
+            )
+            if not dom_ok:
+                continue
+
+            cands.append((fwd, base))
+
+        cands.sort(reverse=True)
+        return [b for _, b in cands[: settings.depth_watch_max_count]]
+
+    async def _apply_depth(
+        self,
+        bases: list[str],
+        binance_rows: dict[str, SnapshotRow],
+        usdkrw_rate: float | None,
+        failures: list[RefreshFailure],
+    ) -> int:
+        """선정된 코인의 바이낸스 깊이를 받아 1단계 호가를 덮어쓴다.
+
+        개별 실패는 기록만 하고 수집 전체는 계속한다 — 깊이는 부가 정보라
+        하나 못 받았다고 이번 회차를 통째로 버릴 이유가 없다.
+        """
+        exchange = get_exchange("binance")
+        # 바이낸스 호가는 USDT 기준이므로 자르는 기준 금액도 환산한다.
+        max_amount = self._usdt_amount(settings.orderbook_max_amount_krw, usdkrw_rate)
+
+        async def one(base: str) -> tuple[str, OrderBook] | None:
+            try:
+                book = await exchange.fetch_orderbook(
+                    Symbol(base=base, quote=settings.overseas_quote),
+                    depth=settings.binance_orderbook_depth,
+                    market_type=MarketType.SPOT,
+                )
+            except MarketLensError as exc:
+                failures.append(
+                    RefreshFailure(
+                        exchange="binance",
+                        sym=base,
+                        error_code=exc.code,
+                        message=exc.message,
+                    )
+                )
+                return None
+            except Exception as exc:  # noqa: BLE001 — 깊이 실패가 수집을 죽이면 안 된다
+                failures.append(
+                    RefreshFailure(
+                        exchange="binance",
+                        sym=base,
+                        error_code="unexpected_error",
+                        message=f"{type(exc).__name__}: {exc}",
+                    )
+                )
+                return None
+            return base, book
+
+        applied = 0
+        for result in await asyncio.gather(*(one(b) for b in bases)):
+            if result is None:
+                continue
+            base, book = result
+            row = binance_rows.get(base)
+            # 빈 호가로 덮어쓰면 최우선 호가마저 잃는다 — 받은 게 있을 때만 교체.
+            if row is None or not book.asks or not book.bids:
+                continue
+            row.asks = _truncate(book.asks, max_amount)
+            row.bids = _truncate(book.bids, max_amount)
+            applied += 1
+        return applied
 
     async def _binance_futures_count(self, warnings: list[str]) -> int | None:
         """바이낸스 USDT 선물의 상장 마켓 수 (일괄 조회 1회).
@@ -601,6 +875,46 @@ class CollectorService:
                     deposit_enabled=bool(status.deposit) if status else False,
                     withdrawal_enabled=bool(status.withdrawal) if status else False,
                     price_timestamp=book.timestamp,
+                )
+            )
+        return rows
+
+    def _tops_to_rows(
+        self,
+        exchange_id: str,
+        tops: dict[str, BulkQuote],
+        lasts: dict[str, float],
+        wallet: dict[str, WalletStatus] | None,
+        now_ts: int,
+    ) -> list[SnapshotRow]:
+        """최우선 호가 일괄 조회 결과를 DB 행으로 조립한다.
+
+        호가가 1단계뿐이라 _truncate 를 타지 않는다 (자를 것이 없다).
+        bookTicker 에는 체결 시각이 없으므로 수집 시각을 쓴다.
+        """
+        rows: list[SnapshotRow] = []
+        for base, q in tops.items():
+            if q.bid is None or q.ask is None or q.bid <= 0 or q.ask <= 0:
+                continue
+            price = lasts.get(base) or q.mid
+            if price is None or price <= 0:
+                continue
+
+            status = wallet.get(base) if wallet else None
+            rows.append(
+                SnapshotRow(
+                    exchange=exchange_id,
+                    base=base,
+                    native_symbol=q.native_symbol,
+                    quote=q.quote,
+                    price=price,
+                    asks=[[q.ask, q.ask_size or 0.0]],
+                    bids=[[q.bid, q.bid_size or 0.0]],
+                    # 확인 불가(키 없음/장애)는 null 이 아니라 보수적으로 False.
+                    deposit_enabled=bool(status.deposit) if status else False,
+                    withdrawal_enabled=bool(status.withdrawal) if status else False,
+                    # OrderBook.timestamp 와 같은 단위(epoch ms)로 맞춘다.
+                    price_timestamp=now_ts * 1000,
                 )
             )
         return rows

@@ -47,11 +47,14 @@
 ## 1. 아키텍처 — 데이터는 어디서 오나
 
 ```
-수집:  POST /refresh   →  거래소 공개 API 호출  →  PostgreSQL 에 저장
+수집:  POST /refresh   →  거래소 공개 API 호출  →  프로세스 메모리에 적재
+                                             (1분 주기 저장 루프 → PostgreSQL)
 조회:  그 외 모든 API  →  PostgreSQL 만 읽음     (거래소 직접 호출 없음)
 ```
 
-거래소를 실제로 호출하는 경로는 `POST /refresh` 하나뿐이다. 조회 API 의 응답
+거래소를 실제로 호출하는 경로는 `POST /refresh` 하나뿐이다. 조회 API 는 그
+결과가 담긴 **메모리**를 읽는다 (앱 재기동 직후 첫 사이클 전에는 DB 로 폴백한다).
+조회 API 의 응답
 속도는 거래소 상태와 무관하고, 조회를 아무리 많이 해도 거래소 rate limit 을
 소비하지 않는다. 대신 **조회 결과는 마지막 수집 시점의 스냅샷**이다.
 
@@ -99,14 +102,26 @@
 
 조회 API 는 데이터가 오래돼도 그대로 계산한다. 대신 응답마다 신선도 필드가 있다.
 
-| 필드 | 어디에 | 의미 |
+| 필드 | 범위 | 의미 |
 |---|---|---|
-| `data_updated_at` | 단일 스냅샷 기반 응답 (`/slippage` 등) | 그 스냅샷의 DB 갱신 시각 (epoch ms) |
+| **`data_received_at`** | **응답 전체** | 이 데이터를 **거래소에서 받은** 시각 (epoch ms) |
+| `fetched_at` | 응답 전체 | 서버가 **응답을 만든** 시각 |
+| `data_updated_at` | 코인별 (일부 모델) | 그 **코인 스냅샷**이 갱신된 시각 |
 | `data_oldest_at` / `data_newest_at` | 여러 스냅샷을 쓰는 응답 | 사용한 스냅샷 중 가장 오래된 / 최근 갱신 시각 |
 | `updated_at` | `/rate` | 환율의 DB 갱신 시각 |
 
-지금과의 차이가 크면 `POST /refresh` 로 갱신한다. 갱신 주기는 클라이언트
-(또는 스케줄러)가 정한다 — 서버가 알아서 갱신하지 않는다.
+**셋은 뜻이 다르다.** 신선도 판단의 기준은 `data_received_at` 이다 —
+`fetched_at` 은 수집이 멈춰 있어도 요청할 때마다 갱신되므로 신선도를 말해주지
+않는다. `data_received_at` 은 조회 API 전부 (`/spreads` `/matrix` `/arbitrage`
+`/slippage` `/premium` `/compare` `/premium/scan`)에 담긴다.
+
+값의 출처는 두 가지다. 평상시에는 마지막 수집 사이클의 수신 시각이고, 앱
+재기동 직후 첫 사이클 전(DB 폴백)에는 쓰인 스냅샷의 갱신 시각 중 **가장 오래된
+것**이다.
+
+**낡은 데이터도 그대로 내려간다 — 응답에서 걸러내지 않는다.** 수집이 멈췄을 때
+행을 빼 버리면 장애가 "데이터 없음"처럼 보인다. 낡았는지는 `data_received_at`
+과 `status` / `age` 로 소비자가 판단한다.
 
 테이블은 앱 기동 시 없으면 자동 생성된다 (`CREATE TABLE IF NOT EXISTS` 방식).
 
@@ -185,7 +200,7 @@ Adminer (http://localhost:8080): 시스템 `PostgreSQL`, 서버 `db`,
 
 | 엔드포인트 | 무엇을 하나 | 입력 | 대표 출력 |
 |---|---|---|---|
-| `POST /refresh` | **DB 갱신** — 거래소에서 수집해 저장 | 없음 | 거래소별 저장/삭제 수, 환율, 실패·경고 |
+| `POST /refresh` | **메모리 갱신** — 거래소에서 수집해 적재 (DB 저장은 별도 루프) | 없음 | 거래소별 적재 수, 환율, 실패·경고 |
 | `GET /health` | 서비스 생존 여부 | 없음 | `status`, `version` |
 | `GET /exchanges` | 지원 거래소 목록 | 없음 | 거래소 ID, 이름, 결제 통화 |
 | `GET /rate` | **USD/KRW 통일 환율 (저장값)** | 없음 | 하나은행 고시 매매기준율 + 고시 시각 |
@@ -292,24 +307,32 @@ DB 는 거래소당 한 마켓(국내 = KRW, 바이낸스 = USDT)만 저장하�
 
 ### POST /refresh
 
-**DB 갱신 — 이 백엔드에서 거래소 API 를 실제로 호출하는 유일한 엔드포인트.**
-나머지 모든 조회 API 는 여기서 저장한 DB 를 읽는다.
+**메모리 갱신 — 이 백엔드에서 거래소 API 를 실제로 호출하는 유일한 엔드포인트.**
+나머지 모든 조회 API 는 여기서 적재한 **프로세스 메모리**를 읽는다.
+
+> **이 호출은 DB 를 건드리지 않는다.** `market_snapshots` / `premium_archive` /
+> `platform_status` / `usdkrw_rate` 저장은 `PERSIST_INTERVAL_SECONDS`(기본 60초)
+> 주기의 **별도 루프**가 담당한다. DB 쓰기가 수집 사이클 시간의 85% 를
+> 차지했는데, 조회가 더 이상 DB 를 보지 않으므로 사이클이 그걸 기다릴 이유가
+> 없어졌다. DB 는 이제 **기록(premium_archive)과 재기동 직후 폴백**을 위해 남는다.
 
 #### 수집 대상
 
-| 데이터 | 출처 | 저장 위치 |
-|---|---|---|
-| KRW 전종목 현재가 + 호가 | 업비트 · 빗썸 (전종목 일괄 조회) | `market_snapshots` |
-| USDT 마켓 현재가 + 호가 | 바이낸스 (국내 상장 코인만, 심볼별 depth) | `market_snapshots` |
-| 입출금 가능 여부 | 업비트 · 바이낸스 (API 키 필요) · 빗썸 (public) | `market_snapshots` |
-| USD/KRW 환율 (하나은행 고시 매매기준율) | 하나은행 | `usdkrw_rate` |
-| 김프/역프 기록 (갱신 직후 계산) | — | `premium_archive` |
-| 플랫폼 수신 상태·실패율 카운터 | — | `platform_status` |
+| 데이터 | 출처 | 적재 위치 (조회용) | 저장 위치 (저장 루프) |
+|---|---|---|---|
+| KRW 전종목 현재가 + 호가 | 업비트 · 빗썸 (전종목 일괄 조회) | 메모리 | `market_snapshots` |
+| USDT 마켓 현재가 + 호가 | 바이낸스 (국내 상장 코인만, 심볼별 depth) | 메모리 | `market_snapshots` |
+| 입출금 가능 여부 | 업비트 · 바이낸스 (API 키 필요) · 빗썸 (public) | 메모리 | `market_snapshots` |
+| USD/KRW 환율 (하나은행 고시 매매기준율) | 하나은행 | 메모리 | `usdkrw_rate` |
+| 김프/역프 기록 | — | — | `premium_archive` |
+| 플랫폼 수신 상태·실패율 카운터 | — | — | `platform_status` |
 
 - 가격·호가는 **환산 없이 그 거래소 통화 그대로** 저장된다.
 - 호가는 `ORDERBOOK_MAX_AMOUNT_KRW`(기본 10억원)의 체결을 커버하는 깊이까지만
   저장된다. 바이낸스 호가는 USDT 기준이므로 통일 환율로 환산한 금액을 쓴다.
-- 이번 수집에 없는 코인도 지우지 않는다 — 코인을 찾아 갱신만 하며, 낡은 행은 `updated_at` 으로 판별한다.
+- 메모리는 사이클마다 **통째로 교체**된다 — 상장폐지 코인은 다음 사이클에
+  자동으로 빠진다. DB 쪽은 저장 루프가 코인을 찾아 갱신만 하고, 김프를 계산할
+  수 없게 된 코인만 지운다.
 - API 키가 없으면 입출금 가능 여부만 null 로 저장되고 나머지는 정상 수집된다
   (`warnings` 에 표시).
 - 부분 실패를 허용한다 — 개별 거래소·심볼 조회 실패는 `failures` 에 담기고
@@ -337,45 +360,65 @@ curl -X POST "http://localhost:8000/refresh" -H "X-Refresh-Token: <토큰>"
 ```json
 {
   "snapshots": [
-    { "exchange": "upbit", "saved": 189,
-      "wallet_status_available": true, "mode": "bulk" },
-    { "exchange": "bithumb", "saved": 313,
-      "wallet_status_available": true, "mode": "bulk" },
-    { "exchange": "binance", "saved": 202,
-      "wallet_status_available": false, "mode": "per_symbol" }
+    { "exchange": "upbit", "saved": 199,
+      "wallet_status_available": true },
+    { "exchange": "bithumb", "saved": 292,
+      "wallet_status_available": true },
+    { "exchange": "binance", "saved": 294,
+      "wallet_status_available": false }
   ],
   "usdkrw": { "rate": 1418.4, "source_time": 1786627013, "round_no": 732 },
-  "archived": 391,
-  "total_saved": 704,
+  "total_saved": 785,
   "failures": [],
   "warnings": [
     "binance 입출금 상태를 건너뜀 — BINANCE_API_KEY / BINANCE_SECRET_KEY 가 비어 있습니다. (해당 거래소의 deposit_enabled / withdrawal_enabled 는 null)"
   ],
-  "total_calls": 215,
+  "total_calls": 21,
   "fetched_at": 1786370137000,
-  "elapsed_ms": 2841.55
+  "elapsed_ms": 1679.32
 }
 ```
 
 | 필드 | 설명 |
 |---|---|
-| `snapshots[].saved` | 저장(UPSERT)한 코인 수 — 이번 수집에 없는 코인도 지우지 않는다 |
+| `snapshots[].saved` | **메모리에 적재한** 코인 수 (DB 쓰기 수가 아니다) |
 | `snapshots[].wallet_status_available` | 입출금 가능 여부를 채웠는지. false 면 키가 없거나 조회 실패 → null 저장 |
-| `snapshots[].mode` | `bulk`=전종목 일괄 조회 (업비트·빗썸), `per_symbol`=심볼별 조회 (바이낸스) |
-| `usdkrw` | 저장한 통일 환율 (하나은행 고시). 이번 수집 실패 시 null — 계산은 DB 의 마지막 환율로 계속 |
-| `archived` | 이번 회차에 남긴 김프/역프 기록 수 — (국내 거래소 × 코인)당 한 줄 |
+| `usdkrw` | 이번에 받은 통일 환율 (하나은행 고시). 수집 실패 시 null — 계산은 직전 환율로 계속 |
+| `total_saved` | 메모리에 적재한 전체 행 수 |
 | `failures` | 수집하지 못한 항목 (`exchange`, `sym`, `error_code`, `message`) |
 | `warnings` | 키 없음, 환율 조회 실패 등 주의 사항 |
 | `total_calls` | 이번 갱신에서 나간 **거래소 HTTP 호출 수** (실측) |
 
 #### 호출 비용과 주기
 
-업비트·빗썸은 전종목 일괄 조회라 호출이 몇 회로 끝나지만, 바이낸스는 depth 를
-일괄로 주는 엔드포인트가 없어 **국내 상장 교집합 코인마다 1회씩** 호출한다
-(동시 실행 수는 `REFRESH_CONCURRENCY`, 기본 20 으로 제한). 한 번의 refresh 가
-대략 **200회 안팎**의 호출을 만들므로, 초 단위로 반복 호출하면 거래소
-rate limit (바이낸스 분당 6,000 weight, 업비트 그룹당 초당 10회)에 걸릴 수 있다.
+세 거래소 모두 전종목 일괄 조회다. 바이낸스도 심볼별 depth 를 부르지 않고
+체결가(`ticker/price`)와 최우선 호가(`ticker/bookTicker`)를 1회씩만 가져온다.
+한 번의 refresh 는 **20회 안팎**의 호출로 끝나며, 바이낸스 기준 소모량은
+고정 **8 weight** (분당 6,000 한도의 0.13%)다.
+
+바이낸스 호가는 기본적으로 **최우선 1단계만** 저장된다. 슬리피지 계산이
+필요한 코인 — 김프가 `DEPTH_WATCH_MIN_PERCENT` 이상이고 바이낸스 출금과
+국내 입금이 둘 다 열린 코인 — 만 골라 `GET /api/v3/depth` 를 추가로 부른다.
+대상은 `DEPTH_WATCH_MAX_COUNT`(기본 12개)로 묶이며, 실측상 평상시 0~2개다.
+선정 결과는 매 사이클 로그에 남는다.
+
+#### 백그라운드 루프
+
+앱은 프로세스 안에서 루프 **두 개**를 돌린다.
+
+| 루프 | 주기 설정 | 기본값 | 하는 일 |
+|---|---|---|---|
+| 수집 | `COLLECT_INTERVAL_SECONDS` | 1초 | 거래소 → **메모리** |
+| 저장 | `PERSIST_INTERVAL_SECONDS` | 60초 | 메모리 → **DB** |
+
+`premium_archive` 적재는 저장 루프 **안에서** `ARCHIVE_INTERVAL_SECONDS`
+(기본 60초)로 한 번 더 가드한다 — 스냅샷은 행 수가 고정된 현재 상태 미러지만
+아카이브는 append 전용이라 주기가 곧 DB 증가 속도이기 때문에 손잡이를 따로 둔다.
+입출금 상태 조회는 `WALLET_REFRESH_SECONDS`(기본 60초) 주기로 따로 돈다.
 실제 호출 수는 응답의 `total_calls` 로 확인한다.
+
+⚠️ 두 루프 모두 프로세스 안에 있다 — uvicorn 워커를 2 이상으로 늘리면 중복
+수집·중복 저장이 된다 (락이 프로세스 안에서만 유효하다).
 
 ---
 
@@ -576,6 +619,7 @@ curl "http://localhost:8000/compare?sym=ETH&common_currency=USDT"
     "absolute": 9397.94,
     "percent": 0.0104
   },
+  "data_received_at": 1786370137012,
   "data_oldest_at": 1786370137012,
   "data_newest_at": 1786370137012,
   "fetched_at": 1786370950000,
@@ -628,6 +672,7 @@ curl "http://localhost:8000/premium?sym=XRP"
   "rev": { "direction": "rev", "premiums": [ "..." ] },
   "best_direction": "rev",
   "best_premium_percent": 0.0145,
+  "data_received_at": 1786370137012,
   "data_oldest_at": 1786370137012,
   "data_newest_at": 1786370137012,
   "fetched_at": 1786370950000,
@@ -719,6 +764,7 @@ curl "http://localhost:8000/premium/rev?sym=BTC"
     }
   ],
   "failures": [],
+  "data_received_at": 1786370137012,
   "data_oldest_at": 1786370137012,
   "data_newest_at": 1786370137012,
   "fetched_at": 1786370950000,
@@ -735,6 +781,7 @@ curl "http://localhost:8000/premium/rev?sym=BTC"
 | `usd_krw_rate` / `rate_updated_at` | 적용 환율 — 통일 환율(하나은행 고시)과 그 DB 저장 시각 |
 | `premiums` | 해외 거래소별 결과. **수익률 내림차순** |
 | `failures` | 스냅샷이 없거나 가격을 뽑지 못한 거래소 (부분 실패 허용) |
+| `data_received_at` | 이 데이터를 거래소에서 받은 시각 (응답 전체) |
 | `data_oldest_at` / `data_newest_at` | 사용한 스냅샷의 갱신 시각 범위 |
 
 ##### `premiums[]` 필드
@@ -850,6 +897,7 @@ SCAN_EXCLUDED_BASES='["AI","PROS"]' uvicorn app.main:app
   "best_rev": { "...": "같은 형태" },
   "top_fwd": [],
   "top_rev": [],
+  "data_received_at": 1786370137012,
   "data_oldest_at": 1786370137012,
   "data_newest_at": 1786370137012,
   "warnings": ["..."],
@@ -998,6 +1046,7 @@ curl "http://localhost:8000/slippage/binance?symbol=BTC/USDT&amount=50000"
       "cumulative_amount": 52581166.0, "cumulative_average": 91446053.0 }
   ],
   "data_updated_at": 1786370137012,
+  "data_received_at": 1786370137012,
   "warnings": []
 }
 ```
@@ -1015,6 +1064,7 @@ curl "http://localhost:8000/slippage/binance?symbol=BTC/USDT&amount=50000"
 | `levels_consumed` / `depth_exhausted` / `depth_available` | 소진 단계 수 / 호가 부족 여부 / 저장된 단계 수 |
 | `fills` | 단계별 체결 내역 |
 | `data_updated_at` | 이 계산에 쓴 스냅샷의 DB 갱신 시각 — 오래됐으면 `POST /refresh` |
+| `data_received_at` | 이 데이터를 거래소에서 받은 시각 (응답 전체) |
 
 ##### `fills` — 업비트 호가창 툴팁과 같은 값
 
@@ -1106,6 +1156,7 @@ curl "http://localhost:8000/matrix?amount_krw=100000000"
   "scanned_combinations": 391,
   "dom_list": ["bithumb", "upbit"],
   "fx_list": ["binance"],
+  "data_received_at": 1786370137012,
   "data_oldest_at": 1786370137012,
   "data_newest_at": 1786370137012,
   "warnings": [
@@ -1225,6 +1276,7 @@ curl "http://localhost:8000/arbitrage?sym=XRP&amount=5000&currency=USDT&exchange
   "candidates": [ "..." ],
   "failures": [],
   "warnings": ["거래 수수료·출금 수수료·코인 전송 시간이 반영되지 않은 이론값입니다."],
+  "data_received_at": 1786370137012,
   "data_oldest_at": 1786370137012,
   "data_newest_at": 1786370137012,
   "fetched_at": 1786370950000,
@@ -1380,13 +1432,18 @@ curl "http://localhost:8000/history/status"
 
 | 용도 | 엔드포인트 | 비고 |
 |---|---|---|
-| USDT 전종목 현재가 | `GET /api/v3/ticker/price` | 1회 호출로 전종목. 국내 상장 코인과의 **교집합**을 계산해 depth 대상 결정 |
-| 심볼별 호가 | `GET /api/v3/depth?symbol=...&limit=100` | 교집합 코인마다 1회. `limit` 은 설정 `BINANCE_ORDERBOOK_DEPTH` (허용값 5/10/20/50/100/500/1000), 동시 실행은 `REFRESH_CONCURRENCY` (기본 20)로 제한 |
+| USDT 전종목 현재가 | `GET /api/v3/ticker/price` | 1회 호출로 전종목. weight 4 |
+| USDT 전종목 최우선 호가 | `GET /api/v3/ticker/bookTicker` | 1회 호출로 전종목의 `bid`/`ask` + 잔량. weight 4. 저장은 국내 상장 코인과의 **교집합**만 |
 
 - Base URL: `https://api.binance.com` (설정 `BINANCE_SPOT_BASE_URL`)
-- rate limit: **분당 6,000 weight** (IP 기준). `depth limit=100` 은 호출당
-  weight 5 — 교집합 200종목이면 refresh 1회에 약 1,000 weight 를 쓴다.
-  refresh 를 분당 수 회 이상 돌리지 않는 것이 안전하다.
+- rate limit: **분당 6,000 weight** (IP 기준). 수집은 위 두 호출뿐이라
+  refresh 1회당 **8 weight** 로 고정이다 — 1초 주기로 돌려도 분당 480,
+  한도의 8% 다.
+- 심볼별 `GET /api/v3/depth` 는 **깊이 선별 대상에만** 쓴다 (`limit=100`
+  기준 호출당 weight 5). 상한 12개를 다 채워도 초당 68 weight = 분당 4,080
+  으로 한도의 68% 이고, 나머지는 재시도분과 `scripts/bulk_archive.py`(같은 IP)
+  몫으로 남긴다. 조회 API(`/orderbook`·`/slippage` 등)는 거래소를 부르지 않고
+  DB 스냅샷을 읽는다.
 
 ### 하나은행 (환율 — USD/KRW 고시 매매기준율)
 

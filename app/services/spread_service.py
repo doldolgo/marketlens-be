@@ -1,4 +1,4 @@
-"""스프레드 테이블 서비스 — DB 스냅샷 기반.
+"""스프레드 테이블 서비스 — 메모리 스냅샷 기반.
 
 (국내 거래소 × 해외 거래소 × 코인) 페어마다 김프(fwd)와 역프(rev)를
 **한 행에 함께** 계산한다. FE 스프레드 탭이 이 결과를 그대로 그린다.
@@ -9,8 +9,9 @@
 유동성(liqDom / liqFx)은 최우선 호가의 체결 가능 금액이다. 슬리피지 추정용이라
 매수·매도 양쪽 중 **작은 쪽**을 USD(T) 기준으로 담는다.
 
-거래소를 직접 호출하지 않는다. ``POST /refresh`` 가 저장해둔
-``market_snapshots`` / ``usdkrw_rate`` 를 읽어서만 계산한다.
+거래소를 직접 호출하지 않는다. 수집 사이클이 메모리(:mod:`app.services.live_store`)
+에 올려둔 최신 스냅샷·환율을 읽어서만 계산한다 (재기동 직후 첫 사이클 전에는
+DB 로 폴백한다).
 """
 
 from __future__ import annotations
@@ -22,9 +23,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.errors import MarketDataNotFoundError
-from app.db import repository
-from app.db.models import MarketSnapshot
 from app.models.spread import FeedStatus, SpreadRow, SpreadsResult
+from app.services.live_store import (
+    AnySnapshot,
+    received_at_ms,
+    require_usdkrw_rate_or_db,
+    snapshots_or_db,
+)
 
 
 def _top_level(levels: list) -> tuple[float, float] | None:
@@ -49,13 +54,13 @@ def _age_seconds(*stamps: datetime | None) -> float:
 
 
 class SpreadService:
-    """전 페어의 김프/역프를 FE SpreadRow 형태로 만든다. 데이터는 전부 DB."""
+    """전 페어의 김프/역프를 FE SpreadRow 형태로 만든다. 데이터는 전부 메모리."""
 
     def _build_row(
         self,
         base: str,
-        dom_snap: MarketSnapshot,
-        fx_snap: MarketSnapshot,
+        dom_snap: AnySnapshot,
+        fx_snap: AnySnapshot,
         rate: float,
         stale_after: float,
     ) -> SpreadRow:
@@ -107,17 +112,17 @@ class SpreadService:
         """모든 (국내 × 해외 × 코인) 페어의 스프레드 행을 만든다.
 
         Raises:
-            MarketDataNotFoundError: 스냅샷이나 환율이 DB 에 없는 경우.
+            MarketDataNotFoundError: 스냅샷이나 환율이 없는 경우.
         """
         started = time.perf_counter()
 
-        snapshots = await repository.get_snapshots(session)
+        snapshots = await snapshots_or_db(session)
         # 통일 환율 — 모든 페어가 같은 은행 고시 USD/KRW 를 쓴다.
-        usdkrw_rate = await repository.require_usdkrw_rate(session)
+        usdkrw_rate = await require_usdkrw_rate_or_db(session)
 
         # 국내(KRW)와 해외(USDT) 스냅샷으로 나눈다.
-        domestic: dict[str, dict[str, MarketSnapshot]] = {}
-        overseas: dict[str, dict[str, MarketSnapshot]] = {}
+        domestic: dict[str, dict[str, AnySnapshot]] = {}
+        overseas: dict[str, dict[str, AnySnapshot]] = {}
         for snap in snapshots:
             if snap.quote == settings.krw_reference_quote:
                 domestic.setdefault(snap.exchange, {})[snap.base] = snap
@@ -159,6 +164,7 @@ class SpreadService:
         return SpreadsResult(
             rate=usdkrw_rate.rate,
             rows=rows,
+            data_received_at=received_at_ms(snapshots),
             fetched_at=int(time.time() * 1000),
             elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
         )

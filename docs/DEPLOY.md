@@ -46,14 +46,35 @@ HISTORY_BASES=["BTC"]                   # 변동 이력을 수집할 코인 (선
   psql 로 하거나, DB GUI 의 **SSH 터널**(Host=EC2, DB=RDS 엔드포인트)로 접속한다.
 - 업비트 입출금 상태를 쓰려면 업비트 Open API 에 **EC2 의 IP** 도 등록해야 한다.
 
-## 주기 작업 (crontab)
+## 주기 작업 (앱 내부 루프)
 
-시세·이력 갱신은 자동이 아니다 — EC2 crontab 으로 주기 호출한다:
+시세·호가·환율 갱신은 **앱이 스스로 돈다.** be 컨테이너가 뜨면 수집 루프가
+`COLLECT_INTERVAL_SECONDS`(기본 1초) 간격으로 사이클을 반복한다. 별도 스케줄러도
+crontab 도 필요 없다.
+
+김프/역프 기록(`premium_archive`)과 입출금 상태 조회는 라이브보다 느리게 돈다 —
+각각 `ARCHIVE_INTERVAL_SECONDS`, `WALLET_REFRESH_SECONDS`(기본 60초) 주기다.
+
+### ⚠️ 기존 crontab 은 반드시 제거할 것
+
+예전에는 EC2 crontab 이 매분 `POST /refresh` 를 불렀다. 그대로 두면 앱 내부
+루프와 **이중으로 수집**한다. 배포 후 EC2 에서 지운다:
 
 ```bash
-# 라이브 시세·호가·환율 갱신 (매분) — 김프/역프 기록과 플랫폼 상태도 함께 쌓인다
-* * * * * curl -s -X POST -H "X-Refresh-Token: <토큰>" http://localhost:8000/refresh > /dev/null
+crontab -l                      # 먼저 확인
+crontab -e                      # /refresh 를 부르는 줄을 지운다
+crontab -l | grep refresh       # 아무것도 안 나와야 한다
 ```
+
+crontab 방식은 `curl ... > /dev/null` 로 실패를 전부 버려서, 실제로 8시간
+결측이 났는데도 아무도 알지 못했다. 앱 내부 루프는 실패를 로그로 남기고
+연속 실패 시 백오프(최대 60초)를 건다.
+
+### ⚠️ uvicorn 워커는 1개여야 한다
+
+수집 루프가 프로세스 안에 있으므로 `--workers 2` 이상으로 띄우면 워커마다
+루프가 돌아 중복 수집이 된다. 현재 `Dockerfile` 은 워커 옵션이 없어 단일
+프로세스다 — 늘릴 거라면 수집을 별도 프로세스로 떼야 한다.
 
 ## 김프 기록 대량 채우기 (배포 후 최초 1회)
 
