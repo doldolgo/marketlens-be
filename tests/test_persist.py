@@ -59,7 +59,9 @@ async def test_persist_writes_what_memory_holds(db, monkeypatch):
     # 플랫폼 상태와 환율도 저장 루프가 함께 내린다.
     statuses = (await db.execute(select(PlatformStatus))).scalars().all()
     assert {s.exchange for s in statuses} == {"upbit", "bithumb", "binance"}
-    assert (await db.get(UsdKrwRate, 1)).rate == 1400.0
+    rates = (await db.execute(select(UsdKrwRate))).scalars().all()
+    assert {r.exchange for r in rates} == {"upbit", "bithumb"}
+    assert all(r.ask == 1400.0 and r.bid == 1400.0 for r in rates)
 
 
 async def test_many_collects_produce_one_db_write(db, monkeypatch):

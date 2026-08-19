@@ -26,11 +26,11 @@ class ExchangeRefreshStat(BaseModel):
 
 
 class UsdKrwRateInfo(BaseModel):
-    """저장한 통일 환율 (하나은행 고시 USD/KRW 매매기준율)."""
+    """이번에 관측한 한 국내 거래소의 KRW-USDT 환율."""
 
-    rate: float = Field(..., description="USD 1달러당 원화 (매매기준율)")
-    source_time: int = Field(..., description="은행 고시 시각 (epoch 초)")
-    round_no: int = Field(..., description="당일 고시 회차")
+    exchange: str = Field(..., description="국내 거래소 ID (upbit / bithumb)")
+    ask: float = Field(..., description="KRW-USDT 최우선 매도호가 — 김프 계산에 쓴다")
+    bid: float = Field(..., description="KRW-USDT 최우선 매수호가 — 역프 계산에 쓴다")
 
 
 class RefreshFailure(BaseModel):
@@ -52,11 +52,11 @@ class RefreshResult(BaseModel):
     snapshots: list[ExchangeRefreshStat] = Field(
         default_factory=list, description="거래소별 스냅샷 저장 결과"
     )
-    usdkrw: UsdKrwRateInfo | None = Field(
-        None,
+    usdkrw: list[UsdKrwRateInfo] = Field(
+        default_factory=list,
         description=(
-            "이번에 받은 통일 환율 (하나은행 USD/KRW 매매기준율). "
-            "수집에 실패했으면 null — 계산은 직전 환율로 계속된다"
+            "이번에 관측한 거래소별 KRW-USDT 환율. 어떤 거래소의 USDT 호가를 "
+            "못 받았으면 그 거래소는 빠진다 — 계산은 직전 환율로 계속된다"
         ),
     )
     total_saved: int = Field(0, description="메모리에 적재한 전체 행 수")

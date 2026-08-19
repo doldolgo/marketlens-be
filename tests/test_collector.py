@@ -20,6 +20,7 @@ from app.models.bulk import BulkQuote
 from app.models.orderbook import MarketType, OrderBook, OrderBookLevel
 import app.services.collector_service as collector_module
 from app.services.collector_service import CollectorService, _truncate
+from app.services.live_store import LiveRate
 
 NOW_MS = 1_700_000_000_000
 
@@ -279,7 +280,12 @@ class TestSelectDepthTargets:
         self.service = CollectorService()
 
     def select(self, domestic_rows, tops, wallet, rate=RATE):
-        return self.service._select_depth_targets(domestic_rows, tops, rate, wallet)
+        rates = (
+            {eid: LiveRate(exchange=eid, ask=rate, bid=rate) for eid in domestic_rows}
+            if rate is not None
+            else {}
+        )
+        return self.service._select_depth_targets(domestic_rows, tops, rates, wallet)
 
     def case(self, *, fwd_percent: float, fx_wd: bool = True, dom_dep: bool = True):
         """원하는 김프율이 나오도록 국내 매수호가를 역산해 한 코인짜리 입력을 만든다."""
@@ -323,7 +329,7 @@ class TestSelectDepthTargets:
         assert out == [f"C{i:02d}" for i in range(19, 7, -1)]
 
     def test_no_rate_selects_nothing(self) -> None:
-        """환율이 없으면 김프를 계산할 수 없다 — 조용히 건너뛴다."""
+        """환율(KRW-USDT 호가)이 없으면 김프를 계산할 수 없다 — 조용히 건너뛴다."""
         assert self.select(*self.case(fwd_percent=10.0), rate=None) == []
 
     def test_uses_highest_domestic_bid_across_exchanges(self) -> None:
@@ -383,7 +389,9 @@ class TestApplyDepth:
         failures: list = []
 
         # 1,000,000 KRW ÷ 환율 1400 ≈ 714 USDT → 101 원어치씩이면 전 단계를 다 담는다
-        applied = await self.service._apply_depth(["BTC"], rows, 1400.0, failures)
+        applied = await self.service._apply_depth(
+            ["BTC"], rows, LiveRate(exchange="upbit", ask=1400.0, bid=1400.0), failures
+        )
 
         assert applied == 1
         assert failures == []
@@ -400,7 +408,9 @@ class TestApplyDepth:
         rows = {"BTC": self.binance_row()}
         failures: list = []
 
-        applied = await self.service._apply_depth(["BTC"], rows, 1400.0, failures)
+        applied = await self.service._apply_depth(
+            ["BTC"], rows, LiveRate(exchange="upbit", ask=1400.0, bid=1400.0), failures
+        )
 
         assert applied == 0
         assert len(failures) == 1
@@ -418,7 +428,9 @@ class TestApplyDepth:
         self.patch_exchange(monkeypatch, fetch)
         rows = {"BTC": self.binance_row()}
 
-        applied = await self.service._apply_depth(["BTC"], rows, 1400.0, [])
+        applied = await self.service._apply_depth(
+            ["BTC"], rows, LiveRate(exchange="upbit", ask=1400.0, bid=1400.0), []
+        )
 
         assert applied == 0
         assert rows["BTC"].asks == [[101.0, 1.0]]
@@ -442,7 +454,17 @@ class TestArchiveThrottle:
         top = make_top(ask=100.0, bid=99.9)
 
         async def domestic(eid, failures):
-            return eid, {"BTC": make_book(exchange=eid)}, {"BTC": 140_000.0}
+            # KRW 전종목 응답에는 USDT 도 들어 있다 — 수집기는 여기서 환율을 뽑는다.
+            books = {
+                "BTC": make_book(exchange=eid),
+                "USDT": make_book(
+                    base="USDT",
+                    exchange=eid,
+                    bids=levels((1400.0, 1000.0)),
+                    asks=levels((1400.0, 1000.0)),
+                ),
+            }
+            return eid, books, {"BTC": 140_000.0, "USDT": 1400.0}
 
         async def binance(bases, failures):
             return "binance", {"BTC": top}, {"BTC": 100.0}
@@ -453,14 +475,10 @@ class TestArchiveThrottle:
         async def wallet(eid, warnings):
             return {"BTC": WalletStatus(deposit=True, withdrawal=True)}
 
-        async def rate(failures):
-            return SimpleNamespace(rate=1400.0, ts=1_700_000_000, round_no=1)
-
         monkeypatch.setattr(service, "_domestic_market", domestic)
         monkeypatch.setattr(service, "_binance_market", binance)
         monkeypatch.setattr(service, "_binance_futures_count", futures)
         monkeypatch.setattr(service, "_wallet", wallet)
-        monkeypatch.setattr(service, "_usdkrw_rate", rate)
         await service.refresh(db)
         await service.persist(db)
 

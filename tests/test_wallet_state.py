@@ -26,7 +26,7 @@ from app.exchanges.private.wallet_status import WalletStatus
 from app.models.bulk import BulkQuote
 from app.services.arbitrage_service import arbitrage_service
 from app.services.collector_service import CollectorService
-from app.services.live_store import live_store
+from app.services.live_store import LiveRate, live_store
 from app.services.matrix_service import matrix_service
 
 
@@ -128,7 +128,10 @@ class TestUnknownNeverReadsAsOpen:
             row = snapshot_row("upbit", "BTC", 200_000.0, deposit=deposit)
             row.bids = rich.bids
             return service._select_depth_targets(
-                {"upbit": {"BTC": row}}, tops, 1400.0, wallet_binance
+                {"upbit": {"BTC": row}},
+                tops,
+                {"upbit": LiveRate(exchange="upbit", ask=1400.0, bid=1400.0)},
+                wallet_binance,
             )
 
         assert targets(True) == ["BTC"], "열려 있으면 대상이다 (대조군)"
@@ -280,13 +283,14 @@ class TestSpreadsCarriesThreeStates:
     async def test_memory_path(self, client, db) -> None:
         import time as _time
 
-        from conftest import NOW_MS, live_snapshot
-
-        from app.services.live_store import LiveRate
+        from conftest import live_snapshot
 
         live_store.replace(
             [live_snapshot(r) for r in self._rows()],
-            LiveRate(rate=FX_RATE, source_time=NOW_MS // 1000, round_no=100),
+            {
+                eid: LiveRate(exchange=eid, ask=FX_RATE, bid=FX_RATE)
+                for eid in ("upbit", "bithumb")
+            },
             _time.time(),
         )
 

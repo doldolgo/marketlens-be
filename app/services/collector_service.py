@@ -8,7 +8,7 @@
     1. 국내 거래소(업비트·빗썸)의 **KRW 전종목** — 현재가 + 호가 깊이
     2. 바이낸스의 USDT 마켓 중 **국내에 상장된 코인** — 현재가 + 호가 깊이
     3. 각 거래소의 **입출금 가능 여부** (업비트·바이낸스는 API 키 필요, 빗썸은 public)
-    4. **환율** — 하나은행 고시 USD/KRW 매매기준율 (모든 원화 환산 통일)
+    4. **환율** — 국내 거래소별 KRW-USDT 최우선 호가 (추가 호출 없이 1에서 추출)
 
 저장은 네 갈래다.
     - ``live_store`` (프로세스 메모리) — 조회 API 가 읽는 최신 시세.
@@ -48,8 +48,6 @@ from app.exchanges.private.wallet_status import (
     fetch_upbit_wallet_status,
 )
 from app.exchanges.registry import domestic_exchange_ids, get_exchange
-from app.history import hana
-from app.history import service as history_service
 from app.history.service import premium_from_quotes
 from app.models.bulk import BulkQuote
 from app.models.orderbook import MarketType, OrderBook, OrderBookLevel
@@ -110,8 +108,8 @@ class _PendingPersist:
     listed_count: dict[str, int]
     futures_market_count: int | None
     dw_failed: dict[str, bool]
-    usdkrw_observation: hana.UsdKrwObservation | None
-    usdkrw_rate_value: float | None
+    #: 국내 거래소 → 이번 회차의 KRW-USDT 환율 (ask/bid).
+    usdkrw_rates: dict[str, LiveRate]
 
 
 @dataclass(slots=True)
@@ -173,7 +171,7 @@ class CollectorService:
         warnings: list[str] = []
         failures: list[RefreshFailure] = []
 
-        # 1단계 — 입출금 상태 · 환율(하나은행) · 국내 호가를 동시에 모은다.
+        # 1단계 — 입출금 상태 · 국내 호가를 동시에 모은다.
         #
         # 입출금 상태는 분 단위로도 잘 안 바뀌는 값인데 조회는 비싸다(업비트·
         # 바이낸스 모두 인증 호출). 1초 사이클마다 부르면 그 자체로 rate limit
@@ -194,8 +192,8 @@ class CollectorService:
         domestic_task = asyncio.gather(
             *(self._domestic_market(eid, failures) for eid in domestic_ids)
         )
-        wallet_results, domestic_results, usdkrw_observation = await asyncio.gather(
-            wallet_task, domestic_task, self._usdkrw_rate(failures)
+        wallet_results, domestic_results = await asyncio.gather(
+            wallet_task, domestic_task
         )
         wallets: dict[str, dict[str, WalletStatus] | None] = dict(
             zip(_WALLET_FETCHERS, wallet_results, strict=True)
@@ -204,19 +202,29 @@ class CollectorService:
             self._wallet_cache = wallets
             self._last_wallet_ts = cycle_ts
 
-        # 이번에 환율을 못 받았으면 DB 의 마지막 값으로 계산을 이어간다.
-        # (환율은 분 단위로 급변하지 않으므로 낡은 값이 없는 것보다 낫다)
-        usdkrw_rate_value: float | None = (
-            float(usdkrw_observation.rate) if usdkrw_observation is not None else None
-        )
-        if usdkrw_rate_value is None:
-            stored_usdkrw = await repository.get_usdkrw_rate(session)
-            if stored_usdkrw is not None and stored_usdkrw.rate > 0:
-                usdkrw_rate_value = stored_usdkrw.rate
-                warnings.append(
-                    "환율 수집에 실패해 DB 의 마지막 환율로 계산했습니다 "
-                    "(failures 참고)."
+        # 1.5단계 — 환율. **거래소 추가 호출 없이** 위에서 받은 KRW 전종목
+        # 호가에서 KRW-USDT 를 그대로 뽑아 쓴다 (USDT 도 KRW 마켓 종목이다).
+        #
+        # 이번에 못 받은 거래소는 직전 값을 유지한다 — live_store.replace 가
+        # 환율만은 덮어쓰기(update)로 처리하고, 메모리가 비었으면(재기동 직후)
+        # 아래에서 DB 의 마지막 값으로 메운다.
+        observed_rates = self._usdt_rates(domestic_results)
+        usdkrw_rates: dict[str, LiveRate] = dict(live_store.get_usdkrw_rates())
+        if not usdkrw_rates:
+            # 재기동 직후 — 메모리가 비었으면 DB 의 마지막 환율로 시작한다.
+            usdkrw_rates = {
+                eid: LiveRate(
+                    exchange=eid, ask=row.ask, bid=row.bid, updated_at=row.updated_at
                 )
+                for eid, row in (await repository.get_usdkrw_rates(session)).items()
+            }
+        usdkrw_rates.update(observed_rates)
+        missing_fx = [eid for eid in domestic_ids if eid not in usdkrw_rates]
+        if missing_fx:
+            warnings.append(
+                f"KRW-USDT 호가가 없어 환율을 못 구한 거래소: {', '.join(missing_fx)} "
+                "(해당 국내 거래소의 김프 계산은 이번 회차에 빠진다)."
+            )
 
         # 2단계 — 바이낸스. 국내에 상장된 코인만 조회한다.
         domestic_bases: set[str] = set()
@@ -289,7 +297,7 @@ class CollectorService:
         depth_targets = self._select_depth_targets(
             {eid: rows_by_exchange.get(eid, {}) for eid in domestic_ids},
             binance_tops,
-            usdkrw_rate_value,
+            usdkrw_rates,
             wallets.get("binance"),
         )
         logger.info(
@@ -299,7 +307,7 @@ class CollectorService:
             await self._apply_depth(
                 depth_targets,
                 rows_by_exchange.get("binance", {}),
-                usdkrw_rate_value,
+                usdkrw_rates.get(settings.krw_reference_exchange),
                 failures,
             )
 
@@ -358,18 +366,8 @@ class CollectorService:
                 # 1.000 에 붙어 지표로 죽어 있었다.
                 if r.deposit_enabled is None or r.withdrawal_enabled is None:
                     dw_failed_by_exchange[eid] = True
-        # 이번에 환율을 못 받았으면 None 을 넘겨 직전 값을 유지한다.
-        live_rate = (
-            LiveRate(
-                rate=float(usdkrw_observation.rate),
-                source_time=usdkrw_observation.ts,
-                round_no=usdkrw_observation.round_no,
-                updated_at=live_now,
-            )
-            if usdkrw_observation is not None
-            else None
-        )
-        live_store.replace(live_snapshots, live_rate, received_at)
+        # 이번에 관측한 거래소만 넘긴다 — 빠진 거래소는 직전 값이 유지된다.
+        live_store.replace(live_snapshots, observed_rates, received_at)
 
         # 5단계 — 저장 루프에 넘길 관측값 기록.
         #
@@ -383,8 +381,7 @@ class CollectorService:
             listed_count=listed_count,
             futures_market_count=futures_market_count,
             dw_failed=dw_failed_by_exchange,
-            usdkrw_observation=usdkrw_observation,
-            usdkrw_rate_value=usdkrw_rate_value,
+            usdkrw_rates=usdkrw_rates,
         )
 
         for stat in stats:
@@ -392,15 +389,10 @@ class CollectorService:
 
         return RefreshResult(
             snapshots=stats,
-            usdkrw=(
-                UsdKrwRateInfo(
-                    rate=float(usdkrw_observation.rate),
-                    source_time=usdkrw_observation.ts,
-                    round_no=usdkrw_observation.round_no,
-                )
-                if usdkrw_observation is not None
-                else None
-            ),
+            usdkrw=[
+                UsdKrwRateInfo(exchange=eid, ask=r.ask, bid=r.bid)
+                for eid, r in sorted(observed_rates.items())
+            ],
             total_saved=sum(s.saved for s in stats),
             failures=failures,
             warnings=warnings,
@@ -460,8 +452,8 @@ class CollectorService:
             self._last_archive_ts = cycle_ts
 
         now_ts = pending.received_ts
-        rate = pending.usdkrw_rate_value
-        if do_archive and rate is None:
+        rates = pending.usdkrw_rates
+        if do_archive and not rates:
             logger.warning("환율이 없어 이번 회차의 김프 기록을 건너뜁니다.")
 
         # 짝을 잃은 코인 정리 — 메모리에 없는데 DB 에 남아 있는 코인.
@@ -475,7 +467,7 @@ class CollectorService:
         deleted = 0
         for base in orphans:
             if do_archive:
-                archived += await self._archive_stored(session, base, rate, now_ts)
+                archived += await self._archive_stored(session, base, rates, now_ts)
             deleted += await repository.delete_snapshots_by_base(session, base)
 
         # 스냅샷 저장 — 코인마다 쪼개지 않고 한 문장으로 UPSERT 한다.
@@ -489,10 +481,10 @@ class CollectorService:
             )
 
         # 김프/역프 기록 — (국내 × 해외) 짝마다 한 줄.
-        if do_archive and rate is not None:
+        if do_archive and rates:
             for base, coin_rows in rows_by_base.items():
                 archived += await self._archive_rows(
-                    session, base, coin_rows, rate, now_ts
+                    session, base, coin_rows, rates, now_ts
                 )
 
         # 플랫폼 상태 — 카운터가 저장 주기로 올라간다. 실패율은
@@ -509,10 +501,11 @@ class CollectorService:
                 dw_failed=dw_failed,
             )
 
-        if pending.usdkrw_observation is not None:
-            # 라이브 환율 단일 행(usdkrw_rate) 갱신 — 역행은 UPSERT 가드가 막는다.
-            await history_service.record_usdkrw_observation(
-                session, pending.usdkrw_observation
+        # 라이브 환율 행(usdkrw_rate) 갱신 — 거래소당 한 행.
+        # 재기동 직후 메모리가 빈 상태에서 계산을 이어가는 데 쓰인다.
+        for eid, live_rate in rates.items():
+            await repository.upsert_usdkrw_rate(
+                session, exchange=eid, ask=live_rate.ask, bid=live_rate.bid
             )
 
         await session.commit()
@@ -533,10 +526,14 @@ class CollectorService:
         session: AsyncSession,
         base: str,
         coin_rows: list[SnapshotRow],
-        rate: float,
+        rates: dict[str, LiveRate],
         now_ts: int,
     ) -> int:
-        """방금 만든 행들로 (국내 × 해외) 짝마다 김프/역프를 기록한다."""
+        """방금 만든 행들로 (국내 × 해외) 짝마다 김프/역프를 기록한다.
+
+        환율은 **그 행의 국내 거래소 것**을 쓴다 — 환율이 없는 국내 거래소는
+        이번 회차 기록에서 빠진다 (틀린 환율로 남기느니 비우는 편이 낫다).
+        """
         overseas = [r for r in coin_rows if r.exchange not in domestic_exchange_ids()]
         archive_rows = [
             {
@@ -549,12 +546,18 @@ class CollectorService:
             }
             for dom in coin_rows
             if dom.exchange in domestic_exchange_ids() and dom.bids and dom.asks
+            and (dom_rate := rates.get(dom.exchange)) is not None
             for fx in overseas
             if fx.bids
             and fx.asks
             and (
                 premium := premium_from_quotes(
-                    dom.bids[0][0], dom.asks[0][0], fx.bids[0][0], fx.asks[0][0], rate
+                    dom.bids[0][0],
+                    dom.asks[0][0],
+                    fx.bids[0][0],
+                    fx.asks[0][0],
+                    dom_rate.ask,
+                    dom_rate.bid,
                 )
             )
             is not None
@@ -567,7 +570,7 @@ class CollectorService:
         self,
         session: AsyncSession,
         base: str,
-        rate: float | None,
+        rates: dict[str, LiveRate],
         now_ts: int,
     ) -> int:
         """지우기 직전, **DB 에 남아 있는 마지막 값**으로 김프를 한 줄 남긴다.
@@ -576,7 +579,7 @@ class CollectorService:
         김프를 계산할 수 있다. 그 마지막 값을 기록으로 남기고 지운다 —
         기록/통계 창에서 상장폐지·페어 소멸 시점이 끊기지 않게 하려는 것이다.
         """
-        if rate is None:
+        if not rates:
             return 0
         snaps = await repository.get_snapshots(session, base=base)
         rows = [
@@ -594,7 +597,7 @@ class CollectorService:
             )
             for s in snaps
         ]
-        return await self._archive_rows(session, base, rows, rate, now_ts)
+        return await self._archive_rows(session, base, rows, rates, now_ts)
 
     async def _wallet(
         self, exchange_id: str, warnings: list[str]
@@ -648,27 +651,32 @@ class CollectorService:
         lasts = {b: q.last for b, q in quotes.items() if q.last is not None}
         return exchange_id, books, lasts
 
-    async def _usdkrw_rate(
-        self, failures: list[RefreshFailure]
-    ) -> hana.UsdKrwObservation | None:
-        """하나은행 최신 고시 USD/KRW 매매기준율.
+    @staticmethod
+    def _usdt_rates(
+        domestic_results: list[tuple[str, dict[str, OrderBook], dict[str, float]]],
+    ) -> dict[str, LiveRate]:
+        """국내 호가 응답에서 거래소별 KRW-USDT 최우선 호가를 뽑아낸다.
 
-        예전에는 국내 거래소별 KRW-USDT 시세를 환율로 썼지만, 그 값에는
-        테더 프리미엄이 섞여 있다. 지금은 은행 고시 환율 하나로 통일한다.
-        (0 이하 값은 hana 모듈이 파싱 단계에서 걸러 예외로 만든다)
+        **거래소 추가 호출이 0회**인 이유 — USDT 도 KRW 마켓 종목이라 이미
+        받아온 전종목 호가 안에 들어 있다. 김프 계산 대상 코인 목록(교집합)에는
+        넣지 않고 환율로만 쓴다 (바이낸스에 USDT/USDT 마켓은 없다).
+
+        호가가 비었거나 0 이하인 거래소는 결과에서 빠진다 — 호출부가 직전 값을
+        유지한다.
         """
-        try:
-            return await hana.fetch_latest()
-        except Exception as exc:  # noqa: BLE001 — 환율 실패가 수집 전체를 죽이면 안 된다
-            failures.append(
-                RefreshFailure(
-                    exchange="hana",
-                    sym="USD/KRW",
-                    error_code="usdkrw_fetch_failed",
-                    message=f"{type(exc).__name__}: {exc}",
-                )
+        rates: dict[str, LiveRate] = {}
+        now = datetime.now(timezone.utc)
+        for exchange_id, books, _ in domestic_results:
+            book = books.get(settings.overseas_quote)  # KRW 마켓의 "USDT" 종목
+            if book is None or not book.asks or not book.bids:
+                continue
+            ask, bid = book.asks[0].price, book.bids[0].price
+            if ask <= 0 or bid <= 0:
+                continue
+            rates[exchange_id] = LiveRate(
+                exchange=exchange_id, ask=ask, bid=bid, updated_at=now
             )
-            return None
+        return rates
 
     async def _binance_market(
         self,
@@ -729,38 +737,37 @@ class CollectorService:
         self,
         domestic_rows: dict[str, dict[str, SnapshotRow]],
         tops: dict[str, BulkQuote],
-        rate: float | None,
+        rates: dict[str, LiveRate],
         wallet_binance: dict[str, WalletStatus] | None,
     ) -> list[str]:
         """김프가 벌어졌고 실제로 옮길 수 있는 코인만 고른다.
 
         김프 공식은 spread_service.py 의 fwd 와 동일하게 맞춘다:
-            fwd = (국내_bid / (해외_ask * 환율) - 1) * 100
+            fwd = (국내_bid / (해외_ask * 그 거래소 USDT ask) - 1) * 100
+
+        국내 거래소마다 환율(테더 프리미엄)이 다르므로 거래소별로 계산하고 가장
+        큰 김프를 그 코인의 값으로 쓴다 — 어느 한 곳에서라도 벌어졌으면 깊이를
+        볼 가치가 있다.
 
         입출금이 막힌 코인은 제외한다 — 옮길 수 없으면 슬리피지를 계산할 의미가
         없고, 실제로 김프가 크게 벌어진 코인은 대부분 입금이 막혀서 벌어진다.
         """
-        if rate is None or rate <= 0:
+        if not rates:
             return []
 
         cands: list[tuple[float, str]] = []
         for base, q in tops.items():
             if q.ask is None or q.ask <= 0:
                 continue
-            # 국내 여러 거래소 중 가장 높은 매수호가를 쓴다 (가장 유리한 매도처)
-            dom_bid = max(
+            fwd = max(
                 (
-                    r.bids[0][0]
-                    for r in (rows.get(base) for rows in domestic_rows.values())
-                    if r and r.bids
+                    (rows[base].bids[0][0] / (q.ask * rates[eid].ask) - 1) * 100
+                    for eid, rows in domestic_rows.items()
+                    if eid in rates and base in rows and rows[base].bids
                 ),
                 default=None,
             )
-            if dom_bid is None:
-                continue
-
-            fwd = (dom_bid / (q.ask * rate) - 1) * 100
-            if fwd < settings.depth_watch_min_percent:
+            if fwd is None or fwd < settings.depth_watch_min_percent:
                 continue
 
             # 해외 출금 + 국내 입금이 둘 다 되어야 실제로 옮길 수 있다
@@ -783,7 +790,7 @@ class CollectorService:
         self,
         bases: list[str],
         binance_rows: dict[str, SnapshotRow],
-        usdkrw_rate: float | None,
+        usdkrw_rate: LiveRate | None,
         failures: list[RefreshFailure],
     ) -> int:
         """선정된 코인의 바이낸스 깊이를 받아 1단계 호가를 덮어쓴다.
@@ -793,7 +800,11 @@ class CollectorService:
         """
         exchange = get_exchange("binance")
         # 바이낸스 호가는 USDT 기준이므로 자르는 기준 금액도 환산한다.
-        max_amount = self._usdt_amount(settings.orderbook_max_amount_krw, usdkrw_rate)
+        # 방향이 없는 **자르는 기준값**이라 기준 국내 거래소의 ask 하나로 족하다.
+        max_amount = self._usdt_amount(
+            settings.orderbook_max_amount_krw,
+            usdkrw_rate.ask if usdkrw_rate is not None else None,
+        )
 
         async def one(base: str) -> tuple[str, OrderBook] | None:
             try:

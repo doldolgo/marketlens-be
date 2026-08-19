@@ -68,7 +68,9 @@ def _stable_settings(monkeypatch):
 UPBIT_PRICES = {"BTC": 100_000_000.0, "ETH": 5_000_000.0, "XRP": 1_400.0}
 BITHUMB_PRICES = {"BTC": 100_100_000.0, "XRP": 1_402.0}
 BINANCE_PRICES = {"BTC": 71_000.0, "ETH": 3_550.0, "XRP": 0.99, "SOL": 150.0}
-#: 통일 환율 (하나은행 고시 USD/KRW 매매기준율) — 모든 계산이 이 하나를 쓴다.
+#: 환율 (국내 거래소 KRW-USDT 호가). 기본 시드는 ask == bid == FX_RATE 로 심는다
+#: — 방향별 환율을 도입하기 전(단일 환율)과 값이 정확히 같아야 하기 때문이다.
+#: 방향 분리를 확인하는 테스트는 ask/bid 를 직접 벌려서 쓴다.
 FX_RATE = 1400.0
 
 #: 호가 한 단계의 체결 가능 금액 (원화 환산). 슬리피지 기대값 계산이 쉽도록 고정.
@@ -132,11 +134,26 @@ async def seed_rows(session, exchange: str, rows: list[SnapshotRow]) -> None:
     await session.commit()
 
 
-async def seed_usdkrw_rate(session, rate: float = FX_RATE) -> None:
-    """통일 환율(usdkrw_rate 단일 행)을 심는다."""
-    await repository.upsert_usdkrw_rate(
-        session, rate=rate, source_time=NOW_MS // 1000, round_no=100
-    )
+async def seed_usdkrw_rate(
+    session,
+    rate: float = FX_RATE,
+    *,
+    ask: float | None = None,
+    bid: float | None = None,
+    exchanges: tuple[str, ...] = ("upbit", "bithumb"),
+) -> None:
+    """거래소별 KRW-USDT 환율 행을 심는다.
+
+    기본은 ask == bid == rate — 단일 환율 시절과 결과가 같아야 하는 회귀
+    시나리오용이다. ask/bid 를 따로 주면 방향별 분리를 확인할 수 있다.
+    """
+    for exchange in exchanges:
+        await repository.upsert_usdkrw_rate(
+            session,
+            exchange=exchange,
+            ask=rate if ask is None else ask,
+            bid=rate if bid is None else bid,
+        )
     await session.commit()
 
 
@@ -260,7 +277,9 @@ def live_snapshot(
     )
 
 
-def seed_live_standard(rate: float = FX_RATE) -> float:
+def seed_live_standard(
+    rate: float = FX_RATE, *, ask: float | None = None, bid: float | None = None
+) -> float:
     """seed_standard 와 **같은 시세**를 메모리에 심는다.
 
     DB 폴백 경로와 메모리 경로가 같은 결과를 내는지 대조하는 데 쓴다.
@@ -282,7 +301,14 @@ def seed_live_standard(rate: float = FX_RATE) -> float:
     received_at = time.time()
     live_store.replace(
         [live_snapshot(r) for r in rows],
-        LiveRate(rate=rate, source_time=NOW_MS // 1000, round_no=100),
+        {
+            eid: LiveRate(
+                exchange=eid,
+                ask=rate if ask is None else ask,
+                bid=rate if bid is None else bid,
+            )
+            for eid in ("upbit", "bithumb")
+        },
         received_at,
     )
     return received_at
@@ -320,8 +346,6 @@ async def refresh_once(
     ``wallet_fails=True`` 면 지갑 조회가 실패한 상황을 만든다 — 수집기는 이때
     입출금을 **확인 불가(None)** 로 둬야 한다.
     """
-    from types import SimpleNamespace
-
     from app.exchanges.private.wallet_status import WalletStatus
     from app.models.bulk import BulkQuote
     from app.models.orderbook import MarketType, OrderBook, OrderBookLevel
@@ -340,10 +364,27 @@ async def refresh_once(
             latency_ms=1.0,
         )
 
-    async def domestic(eid, failures):
-        return eid, {b: book(b, eid) for b in domestic_bases}, dict.fromkeys(
-            domestic_bases, 140_000.0
+    def usdt_book(exchange: str) -> OrderBook:
+        """KRW-USDT 호가 — 수집기가 여기서 환율을 뽑는다 (추가 호출 없음)."""
+        return OrderBook(
+            exchange=exchange,
+            symbol="USDT/KRW",
+            native_symbol="KRW-USDT",
+            market_type=MarketType.SPOT,
+            base="USDT",
+            quote="KRW",
+            bids=[OrderBookLevel(price=FX_RATE, size=1000.0)],
+            asks=[OrderBookLevel(price=FX_RATE, size=1000.0)],
+            timestamp=1_700_000_000_000,
+            latency_ms=1.0,
         )
+
+    async def domestic(eid, failures):
+        books = {b: book(b, eid) for b in domestic_bases}
+        books["USDT"] = usdt_book(eid)
+        lasts = dict.fromkeys(domestic_bases, 140_000.0)
+        lasts["USDT"] = FX_RATE
+        return eid, books, lasts
 
     async def binance(bases, failures):
         tops = {
@@ -372,12 +413,8 @@ async def refresh_once(
             return dict(wallet_status)
         return {b: WalletStatus(deposit=True, withdrawal=True) for b in domestic_bases}
 
-    async def rate(failures):
-        return SimpleNamespace(rate=1400.0, ts=1_700_000_000, round_no=1)
-
     monkeypatch.setattr(service, "_domestic_market", domestic)
     monkeypatch.setattr(service, "_binance_market", binance)
     monkeypatch.setattr(service, "_binance_futures_count", futures)
     monkeypatch.setattr(service, "_wallet", wallet)
-    monkeypatch.setattr(service, "_usdkrw_rate", rate)
     await service.refresh(db)

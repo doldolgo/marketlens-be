@@ -51,8 +51,14 @@ def _candle_ts(candle: dict) -> int:
     return int(dt.replace(tzinfo=timezone.utc).timestamp())
 
 
-async def _get_candles(market: str, *, count: int, to_ts: int | None) -> list[dict]:
-    """초봉 한 페이지를 가져온다. to_ts(epoch 초, exclusive) 이전 count 개."""
+async def _get_candles(
+    market: str, *, count: int, to_ts: int | None, path: str = "seconds"
+) -> list[dict]:
+    """캔들 한 페이지를 가져온다. to_ts(epoch 초, exclusive) 이전 count 개.
+
+    ``path`` 는 ``/v1/candles/`` 뒤에 붙는다 ("seconds" 또는 "minutes/1").
+    응답 모양(``candle_date_time_utc`` · ``trade_price``)은 단위와 무관하게 같다.
+    """
     params: dict[str, str | int] = {"market": market, "count": count}
     if to_ts is not None:
         params["to"] = (
@@ -68,7 +74,7 @@ async def _get_candles(market: str, *, count: int, to_ts: int | None) -> list[di
         try:
             record_call("upbit")
             response = await client.get(
-                f"{settings.upbit_base_url}/v1/candles/seconds", params=params
+                f"{settings.upbit_base_url}/v1/candles/{path}", params=params
             )
             if response.status_code == 429 or response.status_code >= 500:
                 # 레이트리밋·서버 오류는 일시적일 가능성이 크다 — 쉬고 재시도.
@@ -94,6 +100,7 @@ async def fetch_seconds_range(
     end_ts: int,
     *,
     pace: float = DEFAULT_PACE,
+    path: str = "seconds",
 ) -> list[tuple[int, Decimal]]:
     """[start_ts, end_ts) 구간의 초봉을 전부 모아 (epoch 초, 체결가) 오름차순으로.
 
@@ -109,7 +116,9 @@ async def fetch_seconds_range(
     cursor = end_ts
 
     while cursor > start_ts:
-        candles = await _get_candles(market, count=MAX_COUNT, to_ts=cursor)
+        candles = await _get_candles(
+            market, count=MAX_COUNT, to_ts=cursor, path=path
+        )
         if not candles:
             break  # 3개월 보관 한계 또는 상장 이전 — 더 과거는 없다
 
@@ -126,3 +135,21 @@ async def fetch_seconds_range(
         await asyncio.sleep(pace)
 
     return sorted(collected.items())
+
+
+async def fetch_minutes_range(
+    base: str,
+    start_ts: int,
+    end_ts: int,
+    *,
+    pace: float = DEFAULT_PACE,
+) -> list[tuple[int, Decimal]]:
+    """[start_ts, end_ts) 구간의 **1분봉** 종가를 (epoch 초, 가격) 오름차순으로.
+
+    초봉과 페이지네이션 방식이 같아 같은 루프를 쓴다. 분봉은 보관 기간이 훨씬
+    길고(초봉은 롤링 3개월) 요청 수가 1/60 이라, 환율(KRW-USDT)처럼 초 단위
+    해상도가 필요 없는 축을 긴 구간에 걸쳐 받을 때 쓴다.
+    """
+    return await fetch_seconds_range(
+        base, start_ts, end_ts, pace=pace, path="minutes/1"
+    )

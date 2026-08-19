@@ -37,21 +37,38 @@ def _snap(exchange: str, base: str, price: float = 100.0) -> LiveSnapshot:
 def test_replace_swaps_the_whole_set():
     """이전 사이클에만 있던 코인은 사라진다 (상폐 코인 자동 제거)."""
     store = LiveStore()
-    store.replace([_snap("upbit", "BTC"), _snap("upbit", "DOGE")], None, time.time())
+    store.replace([_snap("upbit", "BTC"), _snap("upbit", "DOGE")], {}, time.time())
     assert {s.base for s in store.get_snapshots()} == {"BTC", "DOGE"}
 
     # 다음 사이클에 DOGE 가 빠졌다 = 상장폐지.
-    store.replace([_snap("upbit", "BTC")], None, time.time())
+    store.replace([_snap("upbit", "BTC")], {}, time.time())
     assert {s.base for s in store.get_snapshots()} == {"BTC"}
     assert store.get_snapshot("upbit", "DOGE") is None
 
 
-def test_replace_keeps_previous_rate_when_none():
-    """환율 수집만 실패한 사이클은 직전 환율을 유지한다."""
+def test_replace_keeps_previous_rate_when_missing():
+    """USDT 호가만 못 받은 사이클은 그 거래소의 직전 환율을 유지한다.
+
+    스냅샷은 통째로 교체되지만 환율은 덮어쓰기다 — 다른 거래소의 환율이
+    들어와도 빠진 거래소 값이 지워지면 안 된다.
+    """
     store = LiveStore()
-    store.replace([_snap("upbit", "BTC")], LiveRate(rate=1400.0), time.time())
-    store.replace([_snap("upbit", "BTC")], None, time.time())
-    assert store.require_usdkrw_rate().rate == 1400.0
+    store.replace(
+        [_snap("upbit", "BTC")],
+        {
+            "upbit": LiveRate(exchange="upbit", ask=1401.0, bid=1400.0),
+            "bithumb": LiveRate(exchange="bithumb", ask=1403.0, bid=1399.0),
+        },
+        time.time(),
+    )
+    # 이번 사이클엔 업비트만 들어왔다.
+    store.replace(
+        [_snap("upbit", "BTC")],
+        {"upbit": LiveRate(exchange="upbit", ask=1402.0, bid=1401.0)},
+        time.time(),
+    )
+    assert store.get_usdkrw_rate("upbit").ask == 1402.0
+    assert store.get_usdkrw_rate("bithumb").ask == 1403.0
 
 
 def test_get_snapshots_filters_like_repository():
@@ -59,7 +76,7 @@ def test_get_snapshots_filters_like_repository():
     store = LiveStore()
     store.replace(
         [_snap("upbit", "BTC"), _snap("bithumb", "BTC"), _snap("upbit", "ETH")],
-        None,
+        {},
         time.time(),
     )
     assert len(store.get_snapshots(exchange="upbit")) == 2
@@ -69,19 +86,23 @@ def test_get_snapshots_filters_like_repository():
 
 def test_require_snapshot_raises_when_missing():
     store = LiveStore()
-    store.replace([_snap("upbit", "BTC")], None, time.time())
+    store.replace([_snap("upbit", "BTC")], {}, time.time())
     with pytest.raises(MarketDataNotFoundError):
         store.require_snapshot("upbit", "DOGE")
 
 
-def test_require_usdkrw_rate_raises_when_missing_or_zero():
+def test_get_usdkrw_rate_is_per_exchange():
     store = LiveStore()
-    with pytest.raises(MarketDataNotFoundError):
-        store.require_usdkrw_rate()
+    assert store.get_usdkrw_rate("upbit") is None
 
-    store.replace([], LiveRate(rate=0.0), time.time())
-    with pytest.raises(MarketDataNotFoundError):
-        store.require_usdkrw_rate()
+    store.replace(
+        [],
+        {"upbit": LiveRate(exchange="upbit", ask=1401.0, bid=1400.0)},
+        time.time(),
+    )
+    assert store.get_usdkrw_rate("upbit").bid == 1400.0
+    assert store.get_usdkrw_rate("bithumb") is None
+    assert set(store.get_usdkrw_rates()) == {"upbit"}
 
 
 def test_is_empty_and_received_at():
@@ -90,7 +111,11 @@ def test_is_empty_and_received_at():
     assert store.received_at is None
 
     at = time.time()
-    store.replace([_snap("upbit", "BTC")], LiveRate(rate=1400.0), at)
+    store.replace(
+        [_snap("upbit", "BTC")],
+        {"upbit": LiveRate(exchange="upbit", ask=1401.0, bid=1400.0)},
+        at,
+    )
     assert not store.is_empty()
     assert store.received_at == at
 
@@ -99,7 +124,8 @@ def test_updated_at_is_timezone_aware():
     """naive 로 새면 spread_service._age_seconds() 의 보정 분기를 타게 된다."""
     snap = _snap("upbit", "BTC")
     assert snap.updated_at.tzinfo is not None
-    assert LiveRate(rate=1400.0).updated_at.tzinfo is not None
+    rate = LiveRate(exchange="upbit", ask=1401.0, bid=1400.0)
+    assert rate.updated_at.tzinfo is not None
 
 
 # ── 콜드스타트 폴백 ─────────────────────────────────────────────────
@@ -198,7 +224,10 @@ async def test_refresh_fills_memory_with_the_intersection(db, monkeypatch):
     assert live_store.received_at is not None
     # 한쪽 시장에만 있는 코인은 김프를 계산할 수 없어 담지 않는다.
     assert {s.base for s in live_store.get_snapshots()} == {"BTC"}
-    assert live_store.require_usdkrw_rate().rate == 1400.0
+    # 환율은 KRW 전종목 응답 안의 KRW-USDT 호가에서 나온다 (추가 호출 없음).
+    assert live_store.get_usdkrw_rate("upbit").ask == 1400.0
+    # USDT 자체는 김프 계산 대상 코인으로 들어가면 안 된다.
+    assert "USDT" not in {s.base for s in live_store.get_snapshots()}
 
 
 async def test_refresh_drops_delisted_coins_from_memory(db, monkeypatch):

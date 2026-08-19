@@ -26,10 +26,13 @@ from app.core.errors import MarketDataNotFoundError
 from app.exchanges.private.network_match import Verdict, choose, from_json
 from app.models.spread import FeedStatus, SpreadRow, SpreadsResult
 from app.services.live_store import (
+    AnyRate,
     AnySnapshot,
+    rate_for,
     received_at_ms,
     require_usdkrw_rate_or_db,
     snapshots_or_db,
+    usdkrw_rates_or_db,
 )
 
 
@@ -106,7 +109,7 @@ class SpreadService:
         base: str,
         dom_snap: AnySnapshot,
         fx_snap: AnySnapshot,
-        rate: float,
+        rate: AnyRate,
         stale_after: float,
     ) -> SpreadRow:
         """페어 하나의 행을 만든다. 호가가 비어 있으면 status=fail."""
@@ -140,13 +143,19 @@ class SpreadService:
                 net_dom=net_dom,
             )
 
-        # /premium 과 동일한 공식 — fwd: 해외 ask 로 사서 국내 bid 에 판다
-        fwd = (dom_bid[0] / (fx_ask[0] * rate) - 1) * 100
-        # rev: 국내 ask 로 사서 해외 bid 에 판다
-        rev = (fx_bid[0] * rate / dom_ask[0] - 1) * 100
+        # 환율은 **이 행의 국내 거래소** KRW-USDT 호가이고, 방향마다 다르다 —
+        # 김프는 원화로 USDT 를 사므로 ask, 역프는 USDT 를 원화로 파므로 bid.
+        rate_ask = rate_for(rate, buy_usdt=True)
+        rate_bid = rate_for(rate, buy_usdt=False)
 
-        # 최우선 호가 유동성 — 양쪽(매수·매도) 중 작은 쪽, USD(T) 환산
-        liq_dom = min(dom_bid[0] * dom_bid[1], dom_ask[0] * dom_ask[1]) / rate
+        # /premium 과 동일한 공식 — fwd: 해외 ask 로 사서 국내 bid 에 판다
+        fwd = (dom_bid[0] / (fx_ask[0] * rate_ask) - 1) * 100
+        # rev: 국내 ask 로 사서 해외 bid 에 판다
+        rev = (fx_bid[0] * rate_bid / dom_ask[0] - 1) * 100
+
+        # 최우선 호가 유동성 — 양쪽(매수·매도) 중 작은 쪽, USD(T) 환산.
+        # 방향이 없는 표시값이라 원화를 USDT 로 바꾸는 쪽(ask) 하나로 통일한다.
+        liq_dom = min(dom_bid[0] * dom_bid[1], dom_ask[0] * dom_ask[1]) / rate_ask
         liq_fx = min(fx_bid[0] * fx_bid[1], fx_ask[0] * fx_ask[1])
 
         return SpreadRow(
@@ -160,6 +169,8 @@ class SpreadService:
             age=age,
             liq_dom=liq_dom,
             liq_fx=liq_fx,
+            rate_ask=rate_ask,
+            rate_bid=rate_bid,
             dep_dom=dep_dom,
             wd_dom=wd_dom,
             dep_fx=dep_fx,
@@ -176,8 +187,13 @@ class SpreadService:
         started = time.perf_counter()
 
         snapshots = await snapshots_or_db(session)
-        # 통일 환율 — 모든 페어가 같은 은행 고시 USD/KRW 를 쓴다.
-        usdkrw_rate = await require_usdkrw_rate_or_db(session)
+        # 환율 — 행마다 그 행의 국내 거래소 KRW-USDT 호가를 쓴다.
+        # 기준 거래소 값은 응답 최상위 표시용으로만 쓰므로 여기서 한 번 확보한다
+        # (없으면 여기서 404 — 기준 거래소 환율조차 없으면 볼 수 있는 게 없다).
+        reference_rate = await require_usdkrw_rate_or_db(
+            session, settings.krw_reference_exchange
+        )
+        usdkrw_rates = await usdkrw_rates_or_db(session)
 
         # 국내(KRW)와 해외(USDT) 스냅샷으로 나눈다.
         domestic: dict[str, dict[str, AnySnapshot]] = {}
@@ -203,7 +219,12 @@ class SpreadService:
 
         rows: list[SpreadRow] = []
         for dom_ex in sorted(domestic):
-            rate = usdkrw_rate.rate
+            rate = usdkrw_rates.get(dom_ex)
+            if rate is None:
+                # 이 국내 거래소의 USDT 호가를 한 번도 못 받았다. 다른 거래소
+                # 환율로 대신 계산하면 그 거래소의 테더 프리미엄이 섞이므로
+                # 아예 내보내지 않는다.
+                continue
             for fx_ex in sorted(overseas):
                 if fx_ex == dom_ex:
                     continue
@@ -221,7 +242,7 @@ class SpreadService:
         rows.sort(key=lambda r: (r.sym, r.dom, r.fx))
 
         return SpreadsResult(
-            rate=usdkrw_rate.rate,
+            rate=rate_for(reference_rate, buy_usdt=True),
             rows=rows,
             data_received_at=received_at_ms(snapshots),
             fetched_at=int(time.time() * 1000),

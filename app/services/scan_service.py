@@ -4,8 +4,8 @@
 
 거래소를 직접 호출하지 않는다. ``POST /refresh`` 가 저장해둔
 ``market_snapshots`` 에서 **국내(KRW) 전종목 × 해외(USDT) 스냅샷의 교집합**을
-돌며 두 방향의 수익률을 조합마다 계산한다. 환율은 통일 환율(``usdkrw_rate``,
-하나은행 고시 USD/KRW 매매기준율) 하나다.
+돌며 두 방향의 수익률을 조합마다 계산한다. 환율은 기준 국내 거래소의
+KRW-USDT 호가이며, 김프는 ask · 역프는 bid 를 쓴다.
 
 수익률 계산식은 `/premium/fwd` · `/premium/rev` 와 **완전히 동일**하다.
 가격은 체결되는 쪽 호가를 쓴다 — 살 때 매도호가(ask), 팔 때 매수호가(bid).
@@ -27,6 +27,7 @@ from app.models.scan import ScanEntry, ScanResult, SortOrder
 from app.models.ticker import PriceSide
 from app.services.live_store import (
     AnySnapshot,
+    rate_for,
     received_at_ms,
     snapshots_or_db,
 )
@@ -153,7 +154,7 @@ class ScanService:
         started = time.perf_counter()
 
         domestic_id = premium_service.resolve_domestic(domestic)
-        rate = await resolve_usdkrw_rate(session)
+        rate = await resolve_usdkrw_rate(session, domestic_id)
 
         # 스냅샷 전체를 한 번에 읽어 국내(KRW)와 해외(USDT)로 나눈다.
         snapshots = await snapshots_or_db(session)
@@ -239,7 +240,9 @@ class ScanService:
                         resolve_side(is_buy=not is_fwd),
                         overseas,
                         resolve_side(is_buy=is_fwd),
-                        rate.rate,
+                        # 방향마다 환전 방향이 다르다 — 김프는 원화로 USDT 를
+                        # 사고(ask), 역프는 USDT 를 원화로 판다(bid).
+                        rate_for(rate, buy_usdt=is_fwd),
                     )
                     if entry is None:
                         continue
@@ -307,7 +310,7 @@ class ScanService:
             order=order,
             dom=domestic_id,
             fx_list=overseas_ids,
-            usd_krw_rate=rate.rate,
+            usd_krw_rate=rate_for(rate, buy_usdt=True),
             rate_updated_at=_epoch_ms(rate.updated_at),
             scanned_coins=len(coins),
             scanned_pairs=pairs,

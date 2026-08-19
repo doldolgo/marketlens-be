@@ -7,7 +7,7 @@ KST 시각으로 보여주는 읽기 전용 뷰를 같이 만들어 둔다. 뷰�
 
     v_premium_archive   김프/역프 기록 — time_kst 로 "2026-08-14 09:00:00" 표기
     v_platform_status   플랫폼 상태 — 마지막 수신 시각(KST) + 입출금 실패율
-    v_usdkrw_rate       라이브 환율 (고시 시각 포함)
+    v_usdkrw_rate       라이브 환율 — 국내 거래소별 KRW-USDT ask/bid
 
 PostgreSQL 전용이다 (테스트용 SQLite 에서는 만들지 않는다).
 """
@@ -45,9 +45,10 @@ VIEW_DDL: list[str] = [
     """,
     """
     CREATE OR REPLACE VIEW v_usdkrw_rate AS
-    SELECT rate AS usd_krw,
-           round_no,
-           to_timestamp(source_time) AT TIME ZONE 'Asia/Seoul' AS published_kst,
+    SELECT exchange,
+           ask,
+           bid,
+           round((ask - bid)::numeric, 4) AS spread,
            updated_at
     FROM usdkrw_rate
     """,
@@ -56,6 +57,9 @@ VIEW_DDL: list[str] = [
 #: 이전 구조(압축 이력)의 뷰·테이블 — 앱 기동 시 있으면 정리한다.
 #: (테이블 자동 생성은 "없는 것만 만들기"라 옛것을 지워주지 않는다)
 CLEANUP_DDL: list[str] = [
+    # 환율 뷰는 컬럼 구성이 바뀌었다 — CREATE OR REPLACE 는 컬럼이 달라지면
+    # 실패하므로 아래 VIEW_DDL 이 다시 만들기 전에 지운다.
+    "DROP VIEW IF EXISTS v_usdkrw_rate",
     "DROP VIEW IF EXISTS v_price_points",
     "DROP VIEW IF EXISTS v_fx_points",
     "DROP VIEW IF EXISTS v_price_chunks",
@@ -88,18 +92,27 @@ CLEANUP_DDL: list[str] = [
     "ALTER COLUMN withdrawal_enabled DROP DEFAULT",
     # 옛 이름 정리 — 환율 테이블 fx_rate → usdkrw_rate.
     # (`fx` 는 해외 거래소를 가리키는 이름이라 환율에는 쓰지 않는다)
-    # 뷰가 테이블을 참조하므로 뷰부터 지운다.
     "DROP VIEW IF EXISTS v_fx_rate",
-    # 이 시점엔 create_all 이 usdkrw_rate 를 이미 만들어 둔 상태라 RENAME 은
-    # 못 쓴다. 옛 테이블이 남아 있으면 한 행을 옮겨 담고 지운다.
+    "DROP TABLE IF EXISTS fx_rate",
+]
+
+#: create_all **보다 먼저** 실행되는 DDL — 테이블 모양 자체가 바뀐 경우.
+#: create_all 은 "없는 테이블만 만들기"라 이미 있는 테이블의 컬럼을 갈아주지
+#: 않는다. 옛 모양이 남아 있으면 여기서 지워야 새 모양으로 다시 만들어진다.
+PRE_CREATE_DDL: list[str] = [
+    # usdkrw_rate: 하나은행 단일 행(id/rate/source_time/round_no)
+    #            → 거래소별 행(exchange/ask/bid).
+    # 담긴 값이 은행 고시라 옮겨 담을 것이 없다 — 통째로 버리고 다시 만든다.
+    # (다음 refresh 가 1초 안에 새 값을 채운다)
     """
     DO $$
     BEGIN
-        IF to_regclass('public.fx_rate') IS NOT NULL THEN
-            INSERT INTO usdkrw_rate (id, rate, source_time, round_no, updated_at)
-            SELECT id, rate, source_time, round_no, updated_at FROM fx_rate
-            ON CONFLICT (id) DO NOTHING;
-            DROP TABLE fx_rate;
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'usdkrw_rate' AND column_name = 'rate'
+        ) THEN
+            DROP VIEW IF EXISTS v_usdkrw_rate;
+            DROP TABLE usdkrw_rate;
         END IF;
     END $$
     """,

@@ -72,10 +72,6 @@ class Settings(BaseSettings):
     #: 해외 거래소 마켓의 호가 통화 (바이낸스 USDT 마켓).
     overseas_quote: str = "USDT"
 
-    # ── 환율 (하나은행 고시 USD/KRW) ─────────────────────────────────
-    #: 하나은행 고시환율 조회 베이스 URL. 모든 원화 환산이 이 환율로 통일된다.
-    hana_base_url: str = "https://www.kebhana.com"
-
     # ── 김프/역프 기록 (premium_archive) ─────────────────────────────
     #: 대량 업데이트(scripts/bulk_archive.py)의 기본 대상 코인 목록 —
     #: CLI --bases 를 생략하면 이 값을 쓴다. 실시간 기록은 refresh 가

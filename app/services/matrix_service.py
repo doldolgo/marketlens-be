@@ -23,9 +23,10 @@ from app.models.matrix import MatrixCoinEntry, MatrixDirection, MatrixResult
 from app.models.orderbook import OrderBookLevel
 from app.services.live_store import (
     AnySnapshot,
+    rate_for,
     received_at_ms,
-    require_usdkrw_rate_or_db,
     snapshots_or_db,
+    usdkrw_rates_or_db,
 )
 from app.services.orderbook_walk import walk_by_amount, walk_by_quantity
 
@@ -108,8 +109,12 @@ class MatrixService:
             raise MarketDataNotFoundError(
                 "시세 스냅샷이 없습니다. 먼저 POST /refresh 로 수집하세요.",
             )
-        # 통일 환율 — 모든 조합이 같은 은행 고시 USD/KRW 를 쓴다.
-        usdkrw = await require_usdkrw_rate_or_db(session)
+        # 환율 — 조합의 **국내 거래소** KRW-USDT 호가를 쓴다.
+        usdkrw_rates = await usdkrw_rates_or_db(session)
+        if not usdkrw_rates:
+            raise MarketDataNotFoundError(
+                "KRW-USDT 환율이 없습니다. 먼저 POST /refresh 로 수집하세요.",
+            )
 
         # 국내(KRW 가격)와 해외(USDT 가격)를 저장된 통화로 구분한다.
         domestic: dict[str, dict[str, AnySnapshot]] = {}
@@ -139,17 +144,26 @@ class MatrixService:
             best_rev: MatrixDirection | None = None
 
             for dom in dom_snaps.values():
+                rate = usdkrw_rates.get(dom.exchange)
+                if rate is None:
+                    # 이 국내 거래소의 USDT 호가가 없다 — 다른 거래소 환율을
+                    # 빌려 쓰면 남의 테더 프리미엄이 섞이므로 건너뛴다.
+                    continue
                 dom_bids = repository.levels_from_json(dom.bids)
                 dom_asks = repository.levels_from_json(dom.asks)
-                rate = usdkrw.rate
 
                 for ovs in ovs_snaps.values():
                     combinations += 1
+                    # 해외에서 **사는** 쪽(김프)은 원화로 USDT 를 사서 들어가므로
+                    # ask, 해외에서 **파는** 쪽(역프)은 받은 USDT 를 원화로 파므로
+                    # bid 로 환산한다.
                     ovs_asks_krw = _to_krw(
-                        repository.levels_from_json(ovs.asks), rate
+                        repository.levels_from_json(ovs.asks),
+                        rate_for(rate, buy_usdt=True),
                     )
                     ovs_bids_krw = _to_krw(
-                        repository.levels_from_json(ovs.bids), rate
+                        repository.levels_from_json(ovs.bids),
+                        rate_for(rate, buy_usdt=False),
                     )
 
                     # 김프 — 해외 매수 → 국내 매도.

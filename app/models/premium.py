@@ -97,7 +97,8 @@ class PremiumResult(BaseModel):
     usd_krw_rate: float = Field(
         ...,
         description=(
-            "적용한 통일 환율 — 하나은행 고시 USD/KRW 매매기준율 (DB `usdkrw_rate`). "
+            "적용한 환율 — 이 방향에 실제로 쓴 KRW-USDT 호가 (DB `usdkrw_rate`). "
+            "김프면 매도호가(ask), 역프면 매수호가(bid). "
             "해외 USDT 가격에 이 값을 곱해 원화 환산한다 (USDT≈USD 페그 전제)"
         ),
     )

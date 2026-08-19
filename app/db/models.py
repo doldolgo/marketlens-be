@@ -10,9 +10,9 @@
     **코인을 찾아 UPSERT 만 한다** — 지웠다 다시 만들지 않으며, 이번 수집에
     빠진 코인도 삭제하지 않는다 (신선도는 updated_at 으로 판별).
 
-``usdkrw_rate`` — 단 한 행
-    하나은행 고시 USD/KRW **매매기준율** (최신 고시). 모든 원화 환산이
-    이 값 하나로 통일된다.
+``usdkrw_rate`` — 국내 거래소당 한 행
+    그 거래소 KRW-USDT 마켓의 최우선 호가 (ask/bid). 모든 원화 환산이
+    이 값을 쓰며, **방향(김프/역프)에 따라 ask 와 bid 를 갈라 쓴다**.
 
 **기록 (기록/통계 창 담당)** — 계속 쌓이는 append 전용.
 
@@ -112,18 +112,26 @@ class MarketSnapshot(Base):
 
 
 class UsdKrwRate(Base):
-    """통일 환율 — 하나은행 고시 USD/KRW 매매기준율의 최신 값 **한 행**."""
+    """환율 — **국내 거래소별** KRW-USDT 최우선 호가 한 쌍.
+
+    원화 ↔ 달러 전환은 은행이 아니라 국내 거래소의 USDT 마켓에서 일어난다.
+    그래서 환율도 그 마켓의 호가로 잡고, **방향별로 다른 값**을 쓴다.
+
+        김프(원화 → USDT 매수) → ``ask``
+        역프(USDT → 원화 매도) → ``bid``
+
+    거래소마다 테더 프리미엄이 다르므로 행도 거래소마다 따로 둔다 (업비트 김프는
+    업비트 USDT 호가로, 빗썸 김프는 빗썸 USDT 호가로 계산한다).
+    """
 
     __tablename__ = "usdkrw_rate"
 
-    #: 항상 1. 단일 행을 강제하기 위한 고정 PK.
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
-    #: USD 1달러당 원화 (하나은행 매매기준율)
-    rate: Mapped[float] = mapped_column(Float)
-    #: 은행이 이 환율을 고시한 시각 (epoch 초)
-    source_time: Mapped[int] = mapped_column(BigInteger, default=0)
-    #: 당일 고시 회차 (하루 1,300~2,000회 갱신된다)
-    round_no: Mapped[int] = mapped_column(Integer, default=0)
+    #: 국내 거래소 ID (upbit / bithumb)
+    exchange: Mapped[str] = mapped_column(String(32), primary_key=True)
+    #: KRW-USDT 최우선 **매도**호가 — 원화로 USDT 를 살 때 체결되는 값
+    ask: Mapped[float] = mapped_column(Float)
+    #: KRW-USDT 최우선 **매수**호가 — USDT 를 원화로 팔 때 체결되는 값
+    bid: Mapped[float] = mapped_column(Float)
     #: 이 행을 마지막으로 갱신한 시각
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

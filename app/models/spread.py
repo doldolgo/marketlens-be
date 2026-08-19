@@ -80,6 +80,28 @@ class SpreadRow(BaseModel):
         description="해외 최우선 호가 유동성 (USDT) — 매수·매도 양쪽 중 작은 쪽",
     )
 
+    # ── 이 행이 실제로 쓴 환율 ───────────────────────────────────────────
+    #
+    # **국내 거래소마다 다르다** (테더 프리미엄이 거래소별로 붙는다). 최상위
+    # ``rate`` 는 기준 거래소의 표시용 값일 뿐이므로, 행의 fwd/rev 를 손으로
+    # 검산하려면 이 두 값을 써야 한다.
+    rate_ask: float = Field(
+        0.0,
+        alias="rateAsk",
+        description=(
+            "이 행의 국내 거래소 KRW-USDT **매도호가** — fwd(김프) 계산에 쓴 환율. "
+            "원화로 USDT 를 살 때 체결되는 값. status=fail 이면 0"
+        ),
+    )
+    rate_bid: float = Field(
+        0.0,
+        alias="rateBid",
+        description=(
+            "이 행의 국내 거래소 KRW-USDT **매수호가** — rev(역프) 계산에 쓴 환율. "
+            "USDT 를 원화로 팔 때 체결되는 값. status=fail 이면 0"
+        ),
+    )
+
     # ── 입출금 가능 여부 — **3-state 다** ────────────────────────────────
     #
     #   true  : 확인했고 열려 있음
@@ -124,9 +146,9 @@ class SpreadsResult(BaseModel):
     rate: float = Field(
         ...,
         description=(
-            "기준 USDT/KRW 환율 (기준 국내 거래소 저장값). "
-            "usd × rate 로 원화 환산에 쓴다. 계산 자체는 각 행의 국내 거래소 "
-            "자기 환율을 쓴다"
+            "기준 KRW-USDT 환율 — **기준 국내 거래소의 최우선 매도호가(ask)**. "
+            "헤더 표시·대략적인 원화 환산용이다. 각 행의 fwd/rev 는 그 행의 국내 "
+            "거래소 환율(rateAsk/rateBid)로 계산하므로 이 값과 다를 수 있다"
         ),
     )
     rows: list[SpreadRow] = Field(

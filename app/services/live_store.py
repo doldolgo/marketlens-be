@@ -70,11 +70,15 @@ class LiveSnapshot:
 
 @dataclass(slots=True)
 class LiveRate:
-    """메모리에 들고 있는 통일 환율. :class:`app.db.models.UsdKrwRate` 와 같은 속성."""
+    """메모리에 들고 있는 한 거래소의 KRW-USDT 환율.
 
-    rate: float
-    source_time: int = 0
-    round_no: int = 0
+    :class:`app.db.models.UsdKrwRate` 와 같은 속성이라 계산 코드는 둘을 구분하지
+    않는다.
+    """
+
+    exchange: str
+    ask: float
+    bid: float
     updated_at: datetime = field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
@@ -82,8 +86,18 @@ class LiveRate:
 
 #: 조회 서비스가 다루는 스냅샷. 메모리든 DB 든 속성이 같아 계산 코드는 구분하지 않는다.
 AnySnapshot = LiveSnapshot | MarketSnapshot
-#: 조회 서비스가 다루는 통일 환율. 위와 같은 이유로 둘을 구분하지 않는다.
+#: 조회 서비스가 다루는 환율. 위와 같은 이유로 둘을 구분하지 않는다.
 AnyRate = LiveRate | UsdKrwRate
+
+
+def rate_for(rate: AnyRate, *, buy_usdt: bool) -> float:
+    """원화 ↔ USDT 환전 한 번에 쓸 호가 한 값.
+
+    환전도 체결되는 쪽 호가를 쓴다 — 다른 계산과 같은 원칙이다.
+        원화로 USDT 를 **산다** → 매도호가(ask)
+        USDT 를 원화로 **판다** → 매수호가(bid)
+    """
+    return rate.ask if buy_usdt else rate.bid
 
 
 class LiveStore:
@@ -92,7 +106,8 @@ class LiveStore:
     def __init__(self) -> None:
         #: (거래소, 코인) → 스냅샷
         self._snapshots: dict[tuple[str, str], LiveSnapshot] = {}
-        self._rate: LiveRate | None = None
+        #: 국내 거래소 → KRW-USDT 환율
+        self._rates: dict[str, LiveRate] = {}
         self._received_at: float | None = None
 
     # ------------------------------------------------------------------
@@ -102,7 +117,7 @@ class LiveStore:
     def replace(
         self,
         snapshots: list[LiveSnapshot],
-        rate: LiveRate | None,
+        rates: dict[str, LiveRate],
         received_at: float,
     ) -> None:
         """이번 사이클 결과로 **통째로** 교체한다.
@@ -113,19 +128,20 @@ class LiveStore:
 
         Args:
             snapshots: 이번 사이클이 조립한 스냅샷 전체.
-            rate: 통일 환율. ``None`` 이면 직전 값을 유지한다 (환율은 분
-                단위로 급변하지 않아 낡은 값이 없는 것보다 낫다).
+            rates: 이번 사이클이 관측한 거래소별 KRW-USDT 환율. 스냅샷과 달리
+                **통째로 갈아끼우지 않고 덮어쓴다** — 이번에 USDT 호가를 못 받은
+                거래소는 직전 값을 유지한다 (환율은 초 단위로 급변하지 않아
+                낡은 값이 없는 것보다 낫다).
             received_at: 거래소 응답 조립이 끝난 시각 (epoch 초).
         """
         self._snapshots = {(s.exchange, s.base): s for s in snapshots}
-        if rate is not None:
-            self._rate = rate
+        self._rates.update(rates)
         self._received_at = received_at
 
     def clear(self) -> None:
         """메모리를 비운다 (테스트에서 콜드스타트 상태를 만들 때 쓴다)."""
         self._snapshots = {}
-        self._rate = None
+        self._rates = {}
         self._received_at = None
 
     # ------------------------------------------------------------------
@@ -160,19 +176,13 @@ class LiveStore:
             )
         return snap
 
-    def get_usdkrw_rate(self) -> LiveRate | None:
-        """통일 환율(USD/KRW 매매기준율). 아직 수집 전이면 None."""
-        return self._rate
+    def get_usdkrw_rate(self, exchange: str) -> LiveRate | None:
+        """한 거래소의 KRW-USDT 환율. 아직 수집 전이면 None."""
+        return self._rates.get(exchange)
 
-    def require_usdkrw_rate(self) -> LiveRate:
-        """통일 환율을 가져오되, 없거나 0 이하면 도메인 예외를 던진다."""
-        rate = self._rate
-        if rate is None or rate.rate <= 0:
-            raise MarketDataNotFoundError(
-                "메모리에 USD/KRW 환율이 없습니다. "
-                "POST /refresh 로 수집했는지 확인하세요.",
-            )
-        return rate
+    def get_usdkrw_rates(self) -> dict[str, LiveRate]:
+        """거래소 → KRW-USDT 환율 전체. 아직 수집 전이면 빈 dict."""
+        return dict(self._rates)
 
     @property
     def received_at(self) -> float | None:
@@ -227,25 +237,33 @@ async def require_snapshot_or_db(
     return live_store.require_snapshot(exchange, base)
 
 
-async def usdkrw_rate_or_db(session: AsyncSession) -> AnyRate | None:
-    """통일 환율. 메모리에 없으면 DB 로 폴백한다. 양쪽 다 없으면 None.
+async def usdkrw_rate_or_db(session: AsyncSession, exchange: str) -> AnyRate | None:
+    """한 거래소의 환율. 메모리에 없으면 DB 로 폴백한다. 양쪽 다 없으면 None.
 
     스냅샷과 달리 ``is_empty()`` 가 아니라 **환율 유무**로 판단한다 — 첫
-    사이클에서 하나은행 고시만 실패하면 스냅샷은 있는데 환율만 없는 상태가
+    사이클에서 그 거래소 USDT 호가만 빠지면 스냅샷은 있는데 환율만 없는 상태가
     되고, 그때 DB 의 마지막 환율을 쓰는 편이 404 보다 낫다.
     """
-    rate = live_store.get_usdkrw_rate()
+    rate = live_store.get_usdkrw_rate(exchange)
     if rate is None:
-        return await repository.get_usdkrw_rate(session)
+        return await repository.get_usdkrw_rate(session, exchange)
     return rate
 
 
-async def require_usdkrw_rate_or_db(session: AsyncSession) -> AnyRate:
-    """통일 환율. 없거나 0 이하면 :class:`MarketDataNotFoundError`."""
-    rate = live_store.get_usdkrw_rate()
-    if rate is None or rate.rate <= 0:
-        return await repository.require_usdkrw_rate(session)
+async def require_usdkrw_rate_or_db(session: AsyncSession, exchange: str) -> AnyRate:
+    """한 거래소의 환율. 없거나 0 이하면 :class:`MarketDataNotFoundError`."""
+    rate = live_store.get_usdkrw_rate(exchange)
+    if rate is None or rate.ask <= 0 or rate.bid <= 0:
+        return await repository.require_usdkrw_rate(session, exchange)
     return rate
+
+
+async def usdkrw_rates_or_db(session: AsyncSession) -> dict[str, AnyRate]:
+    """거래소별 환율 전체. 메모리가 비어 있으면 DB 로 폴백한다."""
+    rates = live_store.get_usdkrw_rates()
+    if not rates:
+        return dict(await repository.get_usdkrw_rates(session))
+    return dict(rates)
 
 
 def received_at_ms(snapshots: Sequence[AnySnapshot]) -> int | None:

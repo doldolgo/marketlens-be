@@ -139,40 +139,30 @@ async def upsert_exchange_snapshots(
 async def upsert_usdkrw_rate(
     session: AsyncSession,
     *,
-    rate: float,
-    source_time: int,
-    round_no: int,
+    exchange: str,
+    ask: float,
+    bid: float,
 ) -> None:
-    """통일 환율(하나은행 USD/KRW 매매기준율) 단일 행을 갱신한다.
+    """한 국내 거래소의 KRW-USDT 환율 행(ask/bid)을 갱신한다.
 
-    예전의 거래소별 KRW-USDT 환율(``krw_rates``)을 대체한다 — 이제 모든
-    원화 환산 계산이 이 한 행을 쓴다.
+    거래소마다 테더 프리미엄이 달라 행을 따로 둔다. 값은 그 거래소 USDT
+    마켓의 최우선 호가이며, 김프는 ask · 역프는 bid 를 쓴다.
 
-    UPSERT 의 WHERE 절로 **더 오래된 고시가 최신 값을 덮어쓰는 것을 막는다**
-    (수집 경로가 겹칠 때의 역전 방지). 같은 고시 시각의
-    재수신은 허용해 값이 항상 최소한 갱신 가능 상태를 유지한다.
+    역행 가드가 없는 이유 — 호가에는 "고시 회차" 같은 순번이 없고, 이 함수를
+    부르는 경로가 수집 사이클 하나뿐이라 역전될 여지가 없다.
     """
     dialect = session.get_bind().dialect.name
     stmt = (pg_insert if dialect == "postgresql" else sqlite_insert)(UsdKrwRate).values(
-        [
-            {
-                "id": 1,
-                "rate": rate,
-                "source_time": source_time,
-                "round_no": round_no,
-            }
-        ]
+        [{"exchange": exchange, "ask": ask, "bid": bid}]
     )
     await session.execute(
         stmt.on_conflict_do_update(
-            index_elements=["id"],
+            index_elements=["exchange"],
             set_={
-                "rate": stmt.excluded.rate,
-                "source_time": stmt.excluded.source_time,
-                "round_no": stmt.excluded.round_no,
+                "ask": stmt.excluded.ask,
+                "bid": stmt.excluded.bid,
                 "updated_at": func.now(),
             },
-            where=UsdKrwRate.source_time <= stmt.excluded.source_time,
         )
     )
 
@@ -593,18 +583,25 @@ async def require_snapshot(
     return snap
 
 
-async def get_usdkrw_rate(session: AsyncSession) -> UsdKrwRate | None:
-    """통일 환율(USD/KRW 매매기준율). 아직 수집 전이면 None."""
-    return await session.get(UsdKrwRate, 1)
+async def get_usdkrw_rate(session: AsyncSession, exchange: str) -> UsdKrwRate | None:
+    """한 거래소의 KRW-USDT 환율. 아직 수집 전이면 None."""
+    return await session.get(UsdKrwRate, exchange)
 
 
-async def require_usdkrw_rate(session: AsyncSession) -> UsdKrwRate:
-    """통일 환율을 가져오되, 없거나 0 이하면 도메인 예외를 던진다."""
-    rate = await get_usdkrw_rate(session)
-    if rate is None or rate.rate <= 0:
+async def get_usdkrw_rates(session: AsyncSession) -> dict[str, UsdKrwRate]:
+    """거래소 → KRW-USDT 환율 전체. 아직 수집 전이면 빈 dict."""
+    rows = (await session.execute(select(UsdKrwRate))).scalars().all()
+    return {r.exchange: r for r in rows}
+
+
+async def require_usdkrw_rate(session: AsyncSession, exchange: str) -> UsdKrwRate:
+    """한 거래소의 환율을 가져오되, 없거나 0 이하면 도메인 예외를 던진다."""
+    rate = await get_usdkrw_rate(session, exchange)
+    if rate is None or rate.ask <= 0 or rate.bid <= 0:
         raise MarketDataNotFoundError(
-            "DB 에 USD/KRW 환율이 없습니다. "
+            f"DB 에 {exchange} 거래소의 KRW-USDT 환율이 없습니다. "
             "POST /refresh 로 수집했는지 확인하세요.",
+            detail={"exchange": exchange},
         )
     return rate
 

@@ -6,7 +6,7 @@
 동작 순서
     1. 요청받은 코인의 스냅샷을 DB 에서 전부 읽는다 (거래소 필터 적용).
     2. 각 행의 가격(마지막 체결가)을 공통 통화로 환산한다.
-       - KRW 기준: USDT 행에 통일 환율(하나은행 고시 USD/KRW)을 곱한다.
+       - KRW 기준: USDT 행에 기준 국내 거래소의 KRW-USDT 매도호가를 곱한다.
        - USDT 기준: KRW 행을 같은 통일 환율로 나눈다.
     3. 최저 매수처 / 최고 매도처를 찾아 스프레드를 계산한다.
 """
@@ -18,11 +18,13 @@ from datetime import datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.errors import InvalidRequestError, MarketDataNotFoundError
 from app.exchanges.registry import get_exchange
 from app.models.comparison import ArbitrageSpread, ComparisonResult, ExchangeQuote
 from app.services.live_store import (
     AnySnapshot,
+    rate_for,
     received_at_ms,
     snapshots_or_db,
     usdkrw_rate_or_db,
@@ -48,7 +50,8 @@ class ComparisonService:
         """(환산 계수, 적용 환율) 을 구한다.
 
         계수를 원래 통화 가격에 곱하면 공통 통화 가격이 된다.
-        환율은 통일 환율(하나은행 고시 USD/KRW) 하나다.
+        환율은 기준 국내 거래소의 KRW-USDT **매도호가(ask)** 다 — 여기는
+        방향이 없는 단순 비교 화면이라 원화로 USDT 를 사는 쪽 하나로 통일한다.
 
         Raises:
             MarketDataNotFoundError: 환산이 필요한데 DB 에 유효한 환율이 없는 경우.
@@ -60,7 +63,7 @@ class ComparisonService:
         # ZeroDivisionError 500 대신 명확한 404 가 나가도록 방어한다.
         if usdkrw_rate is None or usdkrw_rate <= 0:
             raise MarketDataNotFoundError(
-                "DB 에 유효한 USD/KRW 환율이 없어 통화를 환산할 수 없습니다. "
+                "DB 에 유효한 KRW-USDT 환율이 없어 통화를 환산할 수 없습니다. "
                 "먼저 POST /refresh 로 수집하세요.",
                 detail={"exchange": snap.exchange, "quote": snap.quote},
             )
@@ -157,9 +160,11 @@ class ComparisonService:
                 detail={"base": base.upper(), "missing_exchanges": missing},
             )
 
-        # 통일 환율 — 아직 수집 전이면 None (환산이 필요할 때만 예외가 난다).
-        usdkrw_row = await usdkrw_rate_or_db(session)
-        usdkrw_rate = usdkrw_row.rate if usdkrw_row is not None else None
+        # 환율 — 아직 수집 전이면 None (환산이 필요할 때만 예외가 난다).
+        usdkrw_row = await usdkrw_rate_or_db(session, settings.krw_reference_exchange)
+        usdkrw_rate = (
+            rate_for(usdkrw_row, buy_usdt=True) if usdkrw_row is not None else None
+        )
 
         quotes: list[ExchangeQuote] = []
         oldest: datetime | None = None
