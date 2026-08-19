@@ -151,6 +151,7 @@ class TestEndpoint:
         assert set(row) == {
             "sym", "dom", "fx", "fwd", "rev", "usd",
             "spark", "status", "age", "liqDom", "liqFx",
+            "rateAsk", "rateBid",
             "depDom", "wdDom", "depFx", "wdFx", "netDom",
         }
         assert row["status"] in ("ok", "stale", "fail")

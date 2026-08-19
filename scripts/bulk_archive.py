@@ -5,13 +5,17 @@
 한 번에 계산해 테이블 형식 그대로 저장한다.
 
     가격: 업비트 초봉 + 바이낸스 1초봉 (플랫폼이 지원하는 최소 간격)
-    환율: 하나은행 고시 (--usdkrw-stride 간격 샘플링, 기본 30회차 ≈ 20분)
+    환율: 업비트 KRW-USDT **분봉** 종가 (초봉의 1/60 호출로 같은 구간을 덮는다)
     계산: 종가 기준 김프/역프 — 셋 중 하나라도 변한 초마다 한 줄
+
+    ⚠️ 캔들에는 호가가 없어 **과거 ask1/bid1 은 복원 불가**다. 백필 구간은
+    환율도 종가 하나를 쓰므로 fwd/rev 가 대칭으로 나온다 — 라이브 기록
+    (방향별 ask/bid)과 성질이 다르다.
 
 사용 예 (EC2 의 marketlens-be 디렉토리에서):
 
     python -m scripts.bulk_archive --bases BTC
-    python -m scripts.bulk_archive --bases BTC,ETH --days 92 --usdkrw-stride 15
+    python -m scripts.bulk_archive --bases BTC,ETH --days 92
 
 동작 원칙
     - 하루(UTC) 단위로 수집→계산→저장→커밋한다. 중단돼도 재실행하면
@@ -60,19 +64,16 @@ async def main() -> None:
         help="며칠 전까지를 목표 구간으로 할지 (기본 92 — 업비트 초봉 보관 한계)",
     )
     parser.add_argument(
-        "--usdkrw-stride",
-        type=int,
-        default=30,
-        help="환율 고시 샘플링 간격 (N회차마다 1건, 기본 30 ≈ 20분 간격)",
-    )
-    parser.add_argument(
         "--pace-upbit", type=float, default=0.2, help="업비트 요청 간격 초"
     )
     parser.add_argument(
         "--pace-binance", type=float, default=0.1, help="바이낸스 요청 간격 초"
     )
     parser.add_argument(
-        "--usdkrw-pace", type=float, default=0.35, help="하나은행 요청 간격 초"
+        "--usdkrw-pace",
+        type=float,
+        default=0.2,
+        help="환율(KRW-USDT 분봉) 요청 간격 초 — 업비트 한도를 같이 쓴다",
     )
     args = parser.parse_args()
 
@@ -97,12 +98,11 @@ async def main() -> None:
         usdkrw_events = await service.collect_usdkrw_events(
             target_start,
             now_ts,
-            stride=args.usdkrw_stride,
             pace=args.usdkrw_pace,
             log=_log,
         )
         if not usdkrw_events:
-            _log("환율을 하나도 수집하지 못해 중단합니다 (하나은행 조회 실패?)")
+            _log("환율을 하나도 수집하지 못해 중단합니다 (KRW-USDT 분봉 조회 실패?)")
             return
 
         for base in bases:

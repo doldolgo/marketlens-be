@@ -91,7 +91,9 @@ class ArbitrageResult(BaseModel):
     usd_krw_rate: float = Field(
         ...,
         description=(
-            "적용한 통일 환율 — 하나은행 고시 USD/KRW 매매기준율 (DB `usdkrw_rate`). "
+            "표시용 기준 환율 — 기준 국내 거래소의 KRW-USDT **매도호가** "
+            "(DB `usdkrw_rate`). 실제 체결 시뮬레이션은 매수측/매도측에 각각 "
+            "맞는 호가(ask/bid)를 적용하므로 이 값 하나로 검산되지 않는다. "
             "해외 USDT 가격에 이 값을 곱해 원화 환산한다 (USDT≈USD 페그 전제)"
         ),
     )

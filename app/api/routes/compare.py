@@ -27,8 +27,9 @@ router = APIRouter(prefix="/compare", tags=["compare"])
         "비교한다.\n\n"
         "거래소를 직접 호출하지 않고 **DB 스냅샷만 읽는다.** 데이터가 오래됐으면 "
         "`data_oldest_at` 으로 알 수 있고, `POST /refresh` 로 갱신한다.\n\n"
-        "환율은 DB 의 통일 환율(`usdkrw_rate`, 하나은행 고시 USD/KRW) 하나다 — "
-        "KRW 환산은 이 환율을 곱하고, USDT 환산은 이 환율로 나눈다.\n\n"
+        "환율은 DB 의 `usdkrw_rate` — **기준 국내 거래소의 KRW-USDT 매도호가**다. "
+        "KRW 환산은 이 환율을 곱하고, USDT 환산은 이 환율로 나눈다. "
+        "(방향이 없는 비교 화면이라 한쪽 호가로 통일한다)\n\n"
         "`spread` 는 수수료·출금비용·전송시간을 반영하지 않은 이론적 가격차다."
     ),
 )

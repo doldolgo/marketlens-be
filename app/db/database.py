@@ -72,6 +72,16 @@ async def init_db() -> None:
     """테이블이 없으면 만들고, 사람이 읽는 뷰를 갱신한다. 앱 기동 시 호출된다."""
     engine = get_engine()
     async with engine.begin() as conn:
+        # 테이블 **모양**이 바뀐 경우의 정리는 create_all 보다 먼저 해야 한다 —
+        # create_all 은 "없는 테이블만 만들기"라 옛 모양이 남아 있으면 그대로 둔다.
+        if conn.dialect.name == "postgresql":
+            from sqlalchemy import text
+
+            from app.db.views import PRE_CREATE_DDL
+
+            for ddl in PRE_CREATE_DDL:
+                await conn.execute(text(ddl))
+
         await conn.run_sync(Base.metadata.create_all)
         # 읽기 전용 뷰 — epoch 초를 연도 포함 KST 시각으로 보여준다.
         # 이전 구조(압축 이력·krw_rates)의 잔재도 이때 정리한다.

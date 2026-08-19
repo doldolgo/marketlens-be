@@ -42,7 +42,7 @@ class ScanEntry(BaseModel):
         ...,
         description=(
             "해외 가격 (USDT). 김프면 매도호가(ask), 역김프면 매수호가(bid). "
-            "원화 환산은 usd_krw_rate 를 곱하면 된다"
+            "원화 환산 환율은 방향마다 다르다 — 김프는 KRW-USDT ask, 역프는 bid"
         ),
     )
 
@@ -87,7 +87,8 @@ class ScanResult(BaseModel):
     usd_krw_rate: float = Field(
         ...,
         description=(
-            "적용한 통일 환율 — 하나은행 고시 USD/KRW 매매기준율 (DB `usdkrw_rate`). "
+            "표시용 기준 환율 — 기준 국내 거래소의 KRW-USDT **매도호가** "
+            "(DB `usdkrw_rate`). 실제 계산은 김프=ask · 역프=bid 로 갈라 쓴다. "
             "해외 USDT 가격에 이 값을 곱해 원화 환산한다 (USDT≈USD 페그 전제)"
         ),
     )

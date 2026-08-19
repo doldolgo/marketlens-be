@@ -30,7 +30,8 @@ class TestPremiumFormulas:
         # 국내 bid 100,100,000 / 해외 ask 71,000×1400 = 99,400,000 → 김프 약 +0.7%
         result = service.premium_from_quotes(
             dom_bid=100_100_000, dom_ask=100_200_000,
-            fx_bid=70_900, fx_ask=71_000, rate=1400.0,
+            fx_bid=70_900, fx_ask=71_000,
+            fx_ask_rate=1400.0, fx_bid_rate=1400.0,
         )
         assert result is not None
         fwd, rev = result
@@ -38,9 +39,23 @@ class TestPremiumFormulas:
         assert rev == pytest.approx((70_900 * 1400 / 100_200_000 - 1) * 100)
         assert fwd > 0 and rev < 0  # 국내가 비싼 시나리오
 
+    def test_quotes_formula_uses_each_direction_own_rate(self) -> None:
+        """환율 스프레드가 벌어지면 양방향 모두 더 보수적으로 나온다."""
+        args = dict(
+            dom_bid=100_100_000, dom_ask=100_200_000, fx_bid=70_900, fx_ask=71_000
+        )
+        tight = service.premium_from_quotes(**args, fx_ask_rate=1400.0, fx_bid_rate=1400.0)
+        wide = service.premium_from_quotes(**args, fx_ask_rate=1410.0, fx_bid_rate=1390.0)
+
+        assert wide[0] < tight[0]  # 김프: USDT 를 비싸게 산다
+        assert wide[1] < tight[1]  # 역프: USDT 를 싸게 판다
+        assert wide[0] == pytest.approx((100_100_000 / (71_000 * 1410) - 1) * 100)
+        assert wide[1] == pytest.approx((70_900 * 1390 / 100_200_000 - 1) * 100)
+
     def test_quotes_formula_rejects_invalid(self) -> None:
-        assert service.premium_from_quotes(0, 1, 1, 1, 1) is None
-        assert service.premium_from_quotes(1, 1, 1, 1, 0) is None
+        assert service.premium_from_quotes(0, 1, 1, 1, 1, 1) is None
+        assert service.premium_from_quotes(1, 1, 1, 1, 0, 1) is None
+        assert service.premium_from_quotes(1, 1, 1, 1, 1, 0) is None
 
     def test_closes_formula_is_symmetric(self) -> None:
         """종가 기준은 양방향이 같은 가격을 쓰므로 역수 관계다."""

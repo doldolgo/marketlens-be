@@ -60,7 +60,8 @@ class ComparisonResult(BaseModel):
     usd_krw_rate: float | None = Field(
         None,
         description=(
-            "적용한 통일 환율 — 하나은행 고시 USD/KRW 매매기준율 (DB `usdkrw_rate`). "
+            "적용한 환율 — 기준 국내 거래소의 KRW-USDT **매도호가** "
+            "(DB `usdkrw_rate`). 방향 없는 비교 화면이라 한쪽 호가로 통일한다. "
             "아직 수집 전이면 null"
         ),
     )

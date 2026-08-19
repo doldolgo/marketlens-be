@@ -1,12 +1,14 @@
-"""환율 라우터 — DB 에 저장된 통일 환율(USD/KRW) 조회.
+"""환율 라우터 — DB 에 저장된 KRW-USDT 환율 조회 (국내 거래소별).
 
-거래소를 직접 호출하지 않는다. ``POST /refresh`` 가 ``usdkrw_rate`` 테이블에 저장해둔 **하나은행 고시 매매기준율**을 읽어서
-반환할 뿐이다.
+거래소를 직접 호출하지 않는다. ``POST /refresh`` 가 ``usdkrw_rate`` 테이블에
+저장해둔 **국내 거래소별 KRW-USDT 최우선 호가**를 읽어서 반환할 뿐이다.
 
-예전에는 국내 거래소별 KRW-USDT 마켓 시세를 환율로 썼지만, 그 값에는
-테더 프리미엄이 섞여 있어 "은행 환율 기준 김프" 와 어긋난다. 지금은 모든
-계산이 이 은행 고시 환율 하나로 통일됐다. 과거 환율이 필요하면
-``GET /history/premium``(김프 기록)을 쓴다.
+원화 ↔ 달러 전환은 은행이 아니라 국내 거래소의 USDT 마켓에서 일어난다. 그래서
+환율도 그 마켓의 호가로 잡고, **방향별로 다른 값**을 쓴다 — 김프는 ask(원화로
+USDT 매수), 역프는 bid(USDT 를 원화로 매도). 테더 프리미엄은 노이즈가 아니라
+실제로 치르는 비용이며, 거래소마다 다르므로 행도 거래소마다 따로 둔다.
+
+과거 환율이 필요하면 ``GET /history/premium``(김프 기록)을 쓴다.
 
 테스트 예시:
     http://3.34.104.16:8000/rate        (배포 서버)
@@ -23,6 +25,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.errors import MarketDataNotFoundError
 from app.db import repository
 from app.db.database import get_session
 
@@ -33,19 +36,28 @@ def _epoch_ms(dt: datetime | None) -> int | None:
     return int(dt.timestamp() * 1000) if dt is not None else None
 
 
-class RateResponse(BaseModel):
-    """저장된 통일 환율 (하나은행 고시 USD/KRW 매매기준율)."""
+class ExchangeRate(BaseModel):
+    """한 국내 거래소의 KRW-USDT 환율."""
 
-    rate: float = Field(..., description="USD 1달러당 원화 (매매기준율)")
-    source: str = Field(
-        "hana", description="환율 출처 — 하나은행 고시환율로 고정"
+    exchange: str = Field(..., description="국내 거래소 ID (upbit / bithumb)")
+    ask: float = Field(
+        ...,
+        description="최우선 매도호가 — 원화로 USDT 를 살 때 체결. **김프 계산에 쓴다**",
     )
-    source_time: int = Field(
-        ..., description="은행이 이 환율을 고시한 시각 (epoch 초)"
+    bid: float = Field(
+        ...,
+        description="최우선 매수호가 — USDT 를 원화로 팔 때 체결. **역프 계산에 쓴다**",
     )
-    round_no: int = Field(..., description="당일 고시 회차")
     updated_at: int | None = Field(
         ..., description="이 환율을 DB 에 저장한 시각 (epoch ms) — 데이터 신선도 기준"
+    )
+
+
+class RateResponse(BaseModel):
+    """저장된 KRW-USDT 환율 (국내 거래소별)."""
+
+    rates: list[ExchangeRate] = Field(
+        default_factory=list, description="국내 거래소별 환율. 거래소 ID 순 정렬"
     )
     fetched_at: int = Field(..., description="이 응답을 만든 시각 (epoch ms)")
 
@@ -53,29 +65,39 @@ class RateResponse(BaseModel):
 @router.get(
     "",
     response_model=RateResponse,
-    summary="USD/KRW 환율 조회 (DB 저장값)",
+    summary="KRW-USDT 환율 조회 (DB 저장값, 거래소별)",
     description=(
-        "원화 환산에 쓰는 **통일 환율**을 DB 에서 조회한다.\n\n"
-        "값은 **하나은행 고시 USD/KRW 매매기준율**이다. 은행은 하루 "
-        "1,300~2,000회 고시하며, `POST /refresh` 가 "
-        "최신 고시를 저장한다. `source_time` 이 은행 고시 시각, `updated_at` "
-        "이 저장 시각이다.\n\n"
-        "### 예전과 달라진 점\n\n"
-        "이전 버전은 국내 거래소별 `KRW-USDT` 마켓 시세를 환율로 썼다. "
-        "그 값에는 **테더 프리미엄**이 섞여 있어 거래소마다 다르고, 은행 환율 "
-        "기준의 김프와 어긋난다. 지금은 은행 고시 환율 하나로 통일됐고 "
-        "`exchange` 파라미터도 없어졌다.\n\n"
+        "원화 환산에 쓰는 환율을 DB 에서 조회한다.\n\n"
+        "값은 **국내 거래소 KRW-USDT 마켓의 최우선 호가**다. `POST /refresh` 가 "
+        "국내 KRW 전종목 호가를 받을 때 함께 들어오는 값이라 별도 조회가 없다.\n\n"
+        "### 왜 ask 와 bid 가 따로인가\n\n"
+        "환전도 체결되는 쪽 호가에서 일어난다. 김프(해외 매수 → 국내 매도)는 "
+        "원화로 USDT 를 **사서** 시작하므로 `ask`, 역프(국내 매수 → 해외 매도)는 "
+        "받은 USDT 를 원화로 **팔아서** 끝나므로 `bid` 를 쓴다. "
+        "`ask > bid` 이므로 양방향 모두 스프레드만큼 보수적으로 나온다.\n\n"
+        "### 왜 거래소별인가\n\n"
+        "테더 프리미엄이 거래소마다 다르다. 업비트 김프는 업비트 USDT 호가로, "
+        "빗썸 김프는 빗썸 USDT 호가로 계산해야 실제 실행 수익률에 맞는다.\n\n"
         "과거 김프/역프 기록은 `GET /history/premium` 으로 조회한다."
     ),
 )
 async def get_rate(
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> RateResponse:
-    row = await repository.require_usdkrw_rate(session)
+    rows = await repository.get_usdkrw_rates(session)
+    if not rows:
+        raise MarketDataNotFoundError(
+            "DB 에 KRW-USDT 환율이 없습니다. POST /refresh 로 수집했는지 확인하세요.",
+        )
     return RateResponse(
-        rate=row.rate,
-        source_time=row.source_time,
-        round_no=row.round_no,
-        updated_at=_epoch_ms(row.updated_at),
+        rates=[
+            ExchangeRate(
+                exchange=row.exchange,
+                ask=row.ask,
+                bid=row.bid,
+                updated_at=_epoch_ms(row.updated_at),
+            )
+            for _, row in sorted(rows.items())
+        ],
         fetched_at=int(time.time() * 1000),
     )

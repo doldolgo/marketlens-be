@@ -12,8 +12,9 @@
     4. 그 수량을 매도처의 bids 에 훑어 **받을 수 있는 금액**을 구한다.
     5. 두 금액의 차이가 차익이다.
 
-환산 규칙은 다른 조회 API 와 같다 — 모든 거래소가 **통일 환율**
-(하나은행 고시 USD/KRW) 하나로 환산된다.
+환산 규칙은 다른 조회 API 와 같다 — 환율은 국내 거래소의 KRW-USDT 호가이고,
+**환전도 체결되는 쪽 호가를 쓴다**. 그래서 같은 거래소라도 그 곳에서 사는지
+파는지에 따라 적용 환율이 갈린다 (매수측 ask, 매도측 bid).
 
 `/premium` 과의 차이: 프리미엄은 최우선 호가 한 점만 보지만 여기서는 호가창을
 실제로 소진시킨다. 금액이 커질수록 결과가 프리미엄보다 나빠진다.
@@ -45,10 +46,13 @@ from app.models.arbitrage import (
 from app.models.orderbook import OrderBook, OrderBookLevel
 from app.models.premium import PremiumDirection
 from app.services.live_store import (
+    AnyRate,
     AnySnapshot,
+    rate_for,
     received_at_ms,
     require_usdkrw_rate_or_db,
     snapshots_or_db,
+    usdkrw_rates_or_db,
 )
 from app.services.orderbook_walk import WalkResult, walk_by_amount, walk_by_quantity
 
@@ -101,14 +105,16 @@ class _Venue:
     snap: AnySnapshot
     #: depth 만큼 자른 호가 (거래소 원래 통화)
     book: OrderBook
-    #: 요청 통화로 환산된 매도 호가 (오름차순)
+    #: 요청 통화로 환산된 매도 호가 (오름차순) — **여기서 살 때** 기준 환율
     asks: list[OrderBookLevel]
-    #: 요청 통화로 환산된 매수 호가 (내림차순)
+    #: 요청 통화로 환산된 매수 호가 (내림차순) — **여기서 팔 때** 기준 환율
     bids: list[OrderBookLevel]
-    #: 원래 통화 → 요청 통화 계수
-    to_currency: float
-    #: 원래 통화 → KRW 계수 (응답의 *_krw 필드용)
-    to_krw: float
+    #: 원래 통화 → 요청 통화 계수 (매수측 / 매도측)
+    to_currency_buy: float
+    to_currency_sell: float
+    #: 원래 통화 → KRW 계수 (응답의 *_krw 필드용, 매수측 / 매도측)
+    to_krw_buy: float
+    to_krw_sell: float
     quote: VenueQuote
 
     @property
@@ -125,22 +131,31 @@ class _Venue:
 class ArbitrageService:
     """DB 스냅샷으로 투입 금액에 대한 실제 차익을 계산한다."""
 
-    def _factor(self, quote: str, target: str, rate: float) -> float:
+    def _factor(self, quote: str, target: str, rate: AnyRate, *, is_buy: bool) -> float:
         """``quote`` 통화 가격에 곱하면 ``target`` 통화 가격이 되는 계수.
 
-        국내(KRW) ↔ 스테이블코인(USDT) 사이만 환산한다. 환율은 통일 환율
-        (하나은행 고시 USD/KRW) 하나다 — USDT≈USD 페그를 전제로 한다.
+        국내(KRW) ↔ 스테이블코인(USDT) 사이만 환산한다. 환전도 체결되는 쪽
+        호가를 쓰므로 **어느 쪽 호가를 환산하느냐에 따라 값이 다르다**:
+
+            USDT 마켓에서 산다  → 원화로 USDT 를 사야 한다      → ask
+            USDT 마켓에서 판다  → 받은 USDT 를 원화로 판다      → bid
+            KRW 마켓에서 산다   → USDT 를 팔아 원화를 마련한다  → bid
+            KRW 마켓에서 판다   → 받은 원화로 USDT 를 산다      → ask
+
+        ``ask == bid`` 로 고정하면 예전의 단일 환율 계산과 정확히 같아진다.
         """
         if quote == target:
             return 1.0
         if quote == settings.krw_reference_quote:
-            return 1.0 / rate  # KRW → USDT
-        return rate  # USDT → KRW
+            # KRW 가격 → USDT 표시
+            return 1.0 / rate_for(rate, buy_usdt=not is_buy)
+        # USDT 가격 → KRW 표시
+        return rate_for(rate, buy_usdt=is_buy)
 
     def _build_venues(
         self,
         snapshots: list[AnySnapshot],
-        usdkrw_rate: float,
+        usdkrw_rates: dict[str, AnyRate],
         *,
         currency: str,
         depth: int,
@@ -148,8 +163,13 @@ class ArbitrageService:
     ) -> list[_Venue]:
         """스냅샷들을 요청 통화로 환산된 비교 후보로 바꾼다.
 
+        환율은 **국내 거래소 것**을 쓴다 — 국내 거래소 자신은 자기 KRW-USDT
+        호가로, 해외 거래소는 기준 국내 거래소의 호가로 환산한다 (해외 거래소에는
+        원화가 없어 자기 환율이라는 게 없다).
+
         호가가 비어 있는 스냅샷은 후보에서 빼고 ``failures`` 에 기록한다.
         """
+        reference = usdkrw_rates[settings.krw_reference_exchange]
         venues: list[_Venue] = []
         for snap in snapshots:
             # 환산 가능한 통화(KRW/USDT)가 아니면 비교 대상이 아니다.
@@ -174,9 +194,12 @@ class ArbitrageService:
                 )
                 continue
 
-            # 모든 거래소가 같은 통일 환율(은행 고시 USD/KRW)을 쓴다.
-            to_currency = self._factor(snap.quote, currency, usdkrw_rate)
-            to_krw = self._factor(snap.quote, settings.krw_reference_quote, usdkrw_rate)
+            rate = usdkrw_rates.get(snap.exchange, reference)
+            krw = settings.krw_reference_quote
+            to_currency_buy = self._factor(snap.quote, currency, rate, is_buy=True)
+            to_currency_sell = self._factor(snap.quote, currency, rate, is_buy=False)
+            to_krw_buy = self._factor(snap.quote, krw, rate, is_buy=True)
+            to_krw_sell = self._factor(snap.quote, krw, rate, is_buy=False)
 
             best_bid = book.bids[0].price
             best_ask = book.asks[0].price
@@ -184,15 +207,17 @@ class ArbitrageService:
                 _Venue(
                     snap=snap,
                     book=book,
-                    asks=_convert_levels(book.asks, to_currency),
-                    bids=_convert_levels(book.bids, to_currency),
-                    to_currency=to_currency,
-                    to_krw=to_krw,
+                    asks=_convert_levels(book.asks, to_currency_buy),
+                    bids=_convert_levels(book.bids, to_currency_sell),
+                    to_currency_buy=to_currency_buy,
+                    to_currency_sell=to_currency_sell,
+                    to_krw_buy=to_krw_buy,
+                    to_krw_sell=to_krw_sell,
                     quote=VenueQuote(
                         exchange=snap.exchange,
                         name=_exchange_name(snap.exchange),
-                        best_bid_krw=best_bid * to_krw,
-                        best_ask_krw=best_ask * to_krw,
+                        best_bid_krw=best_bid * to_krw_sell,
+                        best_ask_krw=best_ask * to_krw_buy,
                         depth_levels=min(len(book.bids), len(book.asks)),
                     ),
                 )
@@ -259,17 +284,19 @@ class ArbitrageService:
         원화 값은 계수로 되돌려서 담는다.
         """
         book = venue.book
+        to_currency = venue.to_currency_buy if is_buy else venue.to_currency_sell
+        to_krw = venue.to_krw_buy if is_buy else venue.to_krw_sell
         best_native = book.asks[0].price if is_buy else book.bids[0].price
-        best_converted = best_native * venue.to_currency
+        best_converted = best_native * to_currency
 
-        native_average = walk.average_price / venue.to_currency
-        native_amount = walk.amount / venue.to_currency
+        native_average = walk.average_price / to_currency
+        native_amount = walk.amount / to_currency
 
         return ExecutionSide(
             exchange=venue.snap.exchange,
             name=venue.quote.name,
-            average_price_krw=native_average * venue.to_krw,
-            amount_krw=native_amount * venue.to_krw,
+            average_price_krw=native_average * to_krw,
+            amount_krw=native_amount * to_krw,
             slippage_percent=walk.slippage_percent(best_converted, is_buy=is_buy),
             levels_consumed=walk.levels_consumed,
             depth_exhausted=walk.exhausted,
@@ -334,8 +361,13 @@ class ArbitrageService:
                 "수집했는지, 상장된 코인인지 확인하세요.",
                 detail={"base": base},
             )
-        # 통일 환율 — 없거나 0 이하면 여기서 404 성격의 예외가 난다.
-        usdkrw = await require_usdkrw_rate_or_db(session)
+        # 환율 — 기준 국내 거래소 것이 없으면 여기서 404 성격의 예외가 난다
+        # (해외 거래소 환산에 쓸 기준값이 사라지기 때문).
+        reference = await require_usdkrw_rate_or_db(
+            session, settings.krw_reference_exchange
+        )
+        usdkrw_rates = await usdkrw_rates_or_db(session)
+        usdkrw_rates[settings.krw_reference_exchange] = reference
 
         # 대상 거래소 필터. 명시적으로 요청했는데 스냅샷이 없으면 실패로 기록한다.
         failures: list[ArbitrageFailure] = []
@@ -370,7 +402,7 @@ class ArbitrageService:
 
         venues = self._build_venues(
             pool,
-            usdkrw.rate,
+            usdkrw_rates,
             currency=currency,
             depth=depth,
             failures=failures,
@@ -415,10 +447,12 @@ class ArbitrageService:
         )
         capture = (profit_percent / premium_percent * 100) if premium_percent else 0.0
 
+        # 투입 금액의 원화 환산 — 표시용이라 기준 거래소의 매도호가 하나로 쓴다.
+        reference_ask = rate_for(reference, buy_usdt=True)
         input_krw = (
             amount
             if currency == settings.krw_reference_quote
-            else amount * usdkrw.rate
+            else amount * reference_ask
         )
 
         # --- 경고 ---
@@ -492,7 +526,7 @@ class ArbitrageService:
             sym=base,
             direction=direction,
             input_amount_krw=input_krw,
-            usd_krw_rate=usdkrw.rate,
+            usd_krw_rate=reference_ask,
             premium_percent=premium_percent,
             buy=buy_side,
             sell=sell_side,

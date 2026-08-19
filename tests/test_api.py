@@ -60,14 +60,15 @@ class TestFxEndpoint:
         assert r.status_code == 404
         assert r.json()["error"]["code"] == "market_data_not_found"
 
-    async def test_returns_unified_rate(self, seeded_client) -> None:
-        """환율은 거래소 구분 없는 단일 값 (하나은행 고시 매매기준율)이다."""
+    async def test_returns_rate_per_exchange(self, seeded_client) -> None:
+        """환율은 국내 거래소별 KRW-USDT 호가 (ask/bid) 다."""
         d = (await seeded_client.get("/rate")).json()
 
-        assert d["rate"] == FX_RATE
-        assert d["source"] == "hana"
-        assert d["round_no"] == 100
-        assert d["updated_at"] is not None
+        assert [r["exchange"] for r in d["rates"]] == ["bithumb", "upbit"]
+        for row in d["rates"]:
+            assert row["ask"] == FX_RATE
+            assert row["bid"] == FX_RATE
+            assert row["updated_at"] is not None
 
 
 class TestOrderbookEndpoint:

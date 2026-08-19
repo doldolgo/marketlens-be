@@ -69,35 +69,38 @@ class TestUpsertExchangeSnapshots:
 
 
 class TestUsdKrwRate:
-    async def test_insert_then_update_keeps_single_row(self, db) -> None:
-        """통일 환율은 단일 행 — 갱신해도 행이 늘지 않는다."""
-        await repository.upsert_usdkrw_rate(
-            db, rate=1400.0, source_time=NOW_MS // 1000, round_no=1
-        )
+    async def test_upsert_keeps_one_row_per_exchange(self, db) -> None:
+        """환율은 거래소당 한 행 — 같은 거래소를 갱신해도 행이 늘지 않는다."""
+        await repository.upsert_usdkrw_rate(db, exchange="upbit", ask=1401.0, bid=1400.0)
+        await repository.upsert_usdkrw_rate(db, exchange="bithumb", ask=1405.0, bid=1398.0)
         await db.commit()
-        await repository.upsert_usdkrw_rate(
-            db, rate=1410.0, source_time=NOW_MS // 1000 + 60, round_no=2
-        )
+        await repository.upsert_usdkrw_rate(db, exchange="upbit", ask=1411.0, bid=1410.0)
         await db.commit()
 
-        row = await repository.get_usdkrw_rate(db)
-        assert row is not None
-        assert row.rate == 1410.0
-        assert row.round_no == 2
-        assert row.source_time == NOW_MS // 1000 + 60
+        rows = await repository.get_usdkrw_rates(db)
+        assert set(rows) == {"upbit", "bithumb"}
+        assert (rows["upbit"].ask, rows["upbit"].bid) == (1411.0, 1410.0)
+        # 거래소마다 테더 프리미엄이 달라 값도 따로 유지돼야 한다.
+        assert (rows["bithumb"].ask, rows["bithumb"].bid) == (1405.0, 1398.0)
 
     async def test_require_usdkrw_rate_raises_when_missing(self, db) -> None:
         with pytest.raises(MarketDataNotFoundError):
-            await repository.require_usdkrw_rate(db)
+            await repository.require_usdkrw_rate(db, "upbit")
+
+    async def test_require_usdkrw_rate_is_per_exchange(self, db) -> None:
+        """한 거래소만 심어도 다른 거래소는 여전히 없는 것이다."""
+        await repository.upsert_usdkrw_rate(db, exchange="upbit", ask=1401.0, bid=1400.0)
+        await db.commit()
+        assert (await repository.require_usdkrw_rate(db, "upbit")).ask == 1401.0
+        with pytest.raises(MarketDataNotFoundError):
+            await repository.require_usdkrw_rate(db, "bithumb")
 
     async def test_require_usdkrw_rate_rejects_non_positive(self, db) -> None:
         """0 이하 환율은 없는 것으로 취급한다 — 나눗셈 보호."""
-        await repository.upsert_usdkrw_rate(
-            db, rate=0.0, source_time=NOW_MS // 1000, round_no=1
-        )
+        await repository.upsert_usdkrw_rate(db, exchange="upbit", ask=0.0, bid=0.0)
         await db.commit()
         with pytest.raises(MarketDataNotFoundError):
-            await repository.require_usdkrw_rate(db)
+            await repository.require_usdkrw_rate(db, "upbit")
 
 
 class TestQueries:

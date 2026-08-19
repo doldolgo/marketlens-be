@@ -15,9 +15,10 @@
 살 때는 매도호가(ask), 팔 때는 매수호가(bid). 방향에 따라 쓰는 호가가
 달라지므로 김프/역김프 값은 서로 독립적이다.
 
-환율은 ``usdkrw_rate`` 에 저장된 **하나은행 고시 USD/KRW 매매기준율 하나**다.
-예전의 국내 거래소별 KRW-USDT 시세(테더 프리미엄이 섞인 값) 대신, 어느
-국내 거래소를 기준으로 하든 같은 은행 환율을 쓴다.
+환율도 같은 원칙을 따른다 — ``usdkrw_rate`` 에 저장된 **기준 국내 거래소의
+KRW-USDT 호가**를 쓰되, 김프는 ask(원화로 USDT 매수) · 역프는 bid(USDT 를
+원화로 매도)로 갈라 쓴다. 테더 프리미엄은 노이즈가 아니라 실제로 치르는
+비용이라 김프 계산에 포함되어야 한다.
 """
 
 from __future__ import annotations
@@ -45,6 +46,7 @@ from app.models.ticker import PriceSide
 from app.services.live_store import (
     AnyRate,
     AnySnapshot,
+    rate_for,
     received_at_ms,
     require_snapshot_or_db,
     require_usdkrw_rate_or_db,
@@ -69,13 +71,13 @@ def snapshot_price(snap: AnySnapshot, side: PriceSide) -> float | None:
     return asks[0].price if asks else None
 
 
-async def resolve_usdkrw_rate(session: AsyncSession) -> AnyRate:
-    """통일 환율(하나은행 고시 USD/KRW 매매기준율)을 가져온다.
+async def resolve_usdkrw_rate(session: AsyncSession, domestic_id: str) -> AnyRate:
+    """한 국내 거래소의 KRW-USDT 환율(ask/bid)을 가져온다.
 
-    거래소별 환율 개념이 없어졌으므로 어떤 계산이든 이 한 값을 쓴다.
-    없으면(수집 전) 404 성격의 도메인 예외를 던진다.
+    원화 ↔ 달러 전환이 실제로 일어나는 곳이 그 거래소의 USDT 마켓이라,
+    환율도 그 거래소 것을 쓴다. 없으면(수집 전) 404 성격의 도메인 예외를 던진다.
     """
-    return await require_usdkrw_rate_or_db(session)
+    return await require_usdkrw_rate_or_db(session, domestic_id)
 
 
 def exchange_name(exchange_id: str) -> str:
@@ -165,8 +167,9 @@ class PremiumService:
     ) -> PremiumEntry:
         """해외 거래소 하나와의 프리미엄을 계산한다.
 
-        해외 가격은 USDT 표시지만 USDT≈USD 페그를 전제로 은행 USD/KRW
-        환율을 곱해 원화 환산한다 — 김프 사이트들의 표준 계산 방식이다.
+        해외 가격(USDT)은 국내 거래소의 KRW-USDT 호가를 곱해 원화 환산한다.
+        ``usd_krw_rate`` 는 호출부가 **방향에 맞는 쪽**을 골라 넘긴 값이다
+        (김프=ask, 역프=bid).
         """
         overseas_krw = overseas_price * usd_krw_rate
 
@@ -229,7 +232,10 @@ class PremiumService:
                 f"{settings.krw_reference_quote} 마켓 스냅샷이 없습니다.",
                 detail={"exchange": domestic_id, "base": base.upper()},
             )
-        rate = await resolve_usdkrw_rate(session)
+        rate = await resolve_usdkrw_rate(session, domestic_id)
+        # 방향이 정해져 있으므로 환전 방향도 하나로 정해진다 —
+        # 김프는 원화로 USDT 를 사고(ask), 역프는 USDT 를 원화로 판다(bid).
+        rate_value = rate_for(rate, buy_usdt=direction is PremiumDirection.FWD)
 
         failures: list[PremiumFailure] = []
         overseas_snaps = await self._overseas_snapshots(
@@ -274,7 +280,7 @@ class PremiumService:
                 )
                 continue
             entries.append(
-                self._build_entry(snap, price, domestic_price, rate.rate, direction)
+                self._build_entry(snap, price, domestic_price, rate_value, direction)
             )
             used.append(snap)
 
@@ -288,7 +294,7 @@ class PremiumService:
             direction=direction,
             dom=dom_snap.exchange,
             dom_price=domestic_price,
-            usd_krw_rate=rate.rate,
+            usd_krw_rate=rate_value,
             rate_updated_at=_epoch_ms(rate.updated_at),
             premiums=entries,
             failures=failures,
