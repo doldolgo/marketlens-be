@@ -46,6 +46,7 @@ from app.models.orderbook import OrderBook, OrderBookLevel
 from app.models.premium import PremiumDirection
 from app.services.live_store import (
     AnySnapshot,
+    received_at_ms,
     require_usdkrw_rate_or_db,
     snapshots_or_db,
 )
@@ -475,6 +476,7 @@ class ArbitrageService:
         stamps = [v.snap.updated_at for v in venues if v.snap.updated_at is not None]
 
         return ArbitrageResult(
+            data_received_at=received_at_ms(snapshots),
             sym=base,
             direction=direction,
             input_amount_krw=input_krw,

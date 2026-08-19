@@ -26,6 +26,7 @@ from app.core.errors import MarketDataNotFoundError
 from app.models.spread import FeedStatus, SpreadRow, SpreadsResult
 from app.services.live_store import (
     AnySnapshot,
+    received_at_ms,
     require_usdkrw_rate_or_db,
     snapshots_or_db,
 )
@@ -163,6 +164,7 @@ class SpreadService:
         return SpreadsResult(
             rate=usdkrw_rate.rate,
             rows=rows,
+            data_received_at=received_at_ms(snapshots),
             fetched_at=int(time.time() * 1000),
             elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
         )

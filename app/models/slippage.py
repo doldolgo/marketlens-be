@@ -106,5 +106,12 @@ class SlippageResult(BaseModel):
             "지금과의 차이가 크면 POST /refresh 로 갱신할 것"
         ),
     )
+    data_received_at: int | None = Field(
+        None,
+        description=(
+            "이 응답의 데이터를 **거래소에서 받은** 시각 (epoch ms). "
+            "코인별 스냅샷 갱신 시각(data_updated_at)과 뜻이 다르다"
+        ),
+    )
 
     warnings: list[str] = Field(default_factory=list, description="주의 사항")

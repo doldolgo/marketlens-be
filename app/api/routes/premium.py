@@ -221,6 +221,13 @@ class PremiumSearchResult(BaseModel):
     data_newest_at: int | None = Field(
         None, description="사용한 스냅샷 중 가장 최근 갱신 시각 (epoch ms)"
     )
+    data_received_at: int | None = Field(
+        None,
+        description=(
+            "이 응답의 데이터를 **거래소에서 받은** 시각 (epoch ms). "
+            "두 방향이 같은 사이클의 데이터이므로 하나의 값이다"
+        ),
+    )
 
     fetched_at: int = Field(..., description="서버 응답 생성 시각 (epoch ms)")
     elapsed_ms: float = Field(..., description="전체 처리 시간 (ms)")
@@ -293,6 +300,11 @@ async def search_premium(
         best_premium_percent=available.get(best_direction) if best_direction else None,
         data_oldest_at=min(oldests) if oldests else None,
         data_newest_at=max(newests) if newests else None,
+        # 두 방향이 같은 사이클을 읽으므로 값이 같다 — 혹시 갈리면 오래된 쪽.
+        data_received_at=min(
+            (v for v in (fwd.data_received_at, rev.data_received_at) if v is not None),
+            default=None,
+        ),
         fetched_at=int(time.time() * 1000),
         elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
     )

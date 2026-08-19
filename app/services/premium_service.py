@@ -45,6 +45,7 @@ from app.models.ticker import PriceSide
 from app.services.live_store import (
     AnyRate,
     AnySnapshot,
+    received_at_ms,
     require_snapshot_or_db,
     require_usdkrw_rate_or_db,
     snapshot_or_db,
@@ -282,6 +283,7 @@ class PremiumService:
         stamps = [s.updated_at for s in used if s.updated_at is not None]
 
         return PremiumResult(
+            data_received_at=received_at_ms(used),
             sym=base.upper(),
             direction=direction,
             dom=dom_snap.exchange,

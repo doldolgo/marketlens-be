@@ -19,6 +19,7 @@ DB 를 보고 있었기 때문에 "코인 하나마다 커밋"으로 최신값�
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -235,3 +236,27 @@ async def require_usdkrw_rate_or_db(session: AsyncSession) -> AnyRate:
     if rate is None or rate.rate <= 0:
         return await repository.require_usdkrw_rate(session)
     return rate
+
+
+def received_at_ms(snapshots: Sequence[AnySnapshot]) -> int | None:
+    """이 응답에 담긴 데이터를 **거래소에서 받은** 시각 (epoch ms).
+
+    메모리 경로면 마지막 수집 사이클의 수신 시각이다. DB 폴백 중이면 쓰인
+    스냅샷의 ``updated_at`` 중 **가장 오래된 것** — 여러 시각이 섞인 응답에서
+    보장할 수 있는 최신성은 가장 낡은 쪽이기 때문이다.
+
+    응답 전체의 시각이라 코인별 ``data_updated_at`` 과 다르고, 서버가 응답을
+    만든 ``fetched_at`` 과도 다르다.
+    """
+    at = live_store.received_at
+    if at is not None and not live_store.is_empty():
+        return int(at * 1000)
+
+    stamps = [s.updated_at for s in snapshots if s.updated_at is not None]
+    if not stamps:
+        return None
+    oldest = min(stamps)
+    if oldest.tzinfo is None:
+        # SQLite(테스트)는 naive UTC 를 준다 — 로컬 시간으로 읽히면 시차만큼 틀어진다.
+        oldest = oldest.replace(tzinfo=timezone.utc)
+    return int(oldest.timestamp() * 1000)

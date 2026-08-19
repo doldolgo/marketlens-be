@@ -23,6 +23,7 @@ from app.models.matrix import MatrixCoinEntry, MatrixDirection, MatrixResult
 from app.models.orderbook import OrderBookLevel
 from app.services.live_store import (
     AnySnapshot,
+    received_at_ms,
     require_usdkrw_rate_or_db,
     snapshots_or_db,
 )
@@ -236,6 +237,7 @@ class MatrixService:
             )
 
         return MatrixResult(
+            data_received_at=received_at_ms(snapshots),
             amount_krw=amount_krw,
             coins=entries,
             scanned_coins=len(entries),

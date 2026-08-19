@@ -23,6 +23,7 @@ from app.exchanges.registry import get_exchange
 from app.models.comparison import ArbitrageSpread, ComparisonResult, ExchangeQuote
 from app.services.live_store import (
     AnySnapshot,
+    received_at_ms,
     snapshots_or_db,
     usdkrw_rate_or_db,
 )
@@ -181,6 +182,7 @@ class ComparisonService:
         quotes.sort(key=lambda q: q.price)
 
         return ComparisonResult(
+            data_received_at=received_at_ms(snapshots),
             sym=base.upper(),
             common_currency=currency,
             usd_krw_rate=usdkrw_rate,

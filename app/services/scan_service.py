@@ -25,7 +25,11 @@ from app.exchanges.registry import get_exchange
 from app.models.premium import PremiumDirection
 from app.models.scan import ScanEntry, ScanResult, SortOrder
 from app.models.ticker import PriceSide
-from app.services.live_store import AnySnapshot, snapshots_or_db
+from app.services.live_store import (
+    AnySnapshot,
+    received_at_ms,
+    snapshots_or_db,
+)
 from app.services.premium_service import (
     exchange_name,
     premium_service,
@@ -299,6 +303,7 @@ class ScanService:
         )
 
         return ScanResult(
+            data_received_at=received_at_ms(snapshots),
             order=order,
             dom=domestic_id,
             fx_list=overseas_ids,

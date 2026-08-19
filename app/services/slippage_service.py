@@ -23,7 +23,10 @@ from app.exchanges.registry import get_exchange
 from app.models.orderbook import OrderBook
 from app.models.slippage import FillLevel, OrderSide, SlippageResult
 from app.models.symbol import Symbol
-from app.services.live_store import require_snapshot_or_db
+from app.services.live_store import (
+    received_at_ms,
+    require_snapshot_or_db,
+)
 from app.services.orderbook_walk import WalkResult, walk_by_amount, walk_by_quantity
 
 #: 기본 호가 깊이. 저장된 호가(수집 한도 내)를 사실상 전부 훑는 수준이다.
@@ -66,6 +69,7 @@ class SlippageService:
         amount: float | None,
         quantity: float | None,
         data_updated_at: int | None = None,
+        data_received_at: int | None = None,
     ) -> SlippageResult:
         """호가창과 요청으로 결과를 만든다."""
         is_buy = side is OrderSide.BUY
@@ -145,6 +149,7 @@ class SlippageService:
             top_level_amount=top.price * top.size,
             fills=self._build_fills(walk),
             data_updated_at=data_updated_at,
+            data_received_at=data_received_at,
             warnings=warnings,
         )
 
@@ -212,6 +217,7 @@ class SlippageService:
             amount=amount,
             quantity=quantity,
             data_updated_at=_epoch_ms(snap.updated_at),
+            data_received_at=received_at_ms([snap]),
         )
 
 

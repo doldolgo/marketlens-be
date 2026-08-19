@@ -102,14 +102,26 @@
 
 조회 API 는 데이터가 오래돼도 그대로 계산한다. 대신 응답마다 신선도 필드가 있다.
 
-| 필드 | 어디에 | 의미 |
+| 필드 | 범위 | 의미 |
 |---|---|---|
-| `data_updated_at` | 단일 스냅샷 기반 응답 (`/slippage` 등) | 그 스냅샷의 DB 갱신 시각 (epoch ms) |
+| **`data_received_at`** | **응답 전체** | 이 데이터를 **거래소에서 받은** 시각 (epoch ms) |
+| `fetched_at` | 응답 전체 | 서버가 **응답을 만든** 시각 |
+| `data_updated_at` | 코인별 (일부 모델) | 그 **코인 스냅샷**이 갱신된 시각 |
 | `data_oldest_at` / `data_newest_at` | 여러 스냅샷을 쓰는 응답 | 사용한 스냅샷 중 가장 오래된 / 최근 갱신 시각 |
 | `updated_at` | `/rate` | 환율의 DB 갱신 시각 |
 
-지금과의 차이가 크면 `POST /refresh` 로 갱신한다. 갱신 주기는 클라이언트
-(또는 스케줄러)가 정한다 — 서버가 알아서 갱신하지 않는다.
+**셋은 뜻이 다르다.** 신선도 판단의 기준은 `data_received_at` 이다 —
+`fetched_at` 은 수집이 멈춰 있어도 요청할 때마다 갱신되므로 신선도를 말해주지
+않는다. `data_received_at` 은 조회 API 전부 (`/spreads` `/matrix` `/arbitrage`
+`/slippage` `/premium` `/compare` `/premium/scan`)에 담긴다.
+
+값의 출처는 두 가지다. 평상시에는 마지막 수집 사이클의 수신 시각이고, 앱
+재기동 직후 첫 사이클 전(DB 폴백)에는 쓰인 스냅샷의 갱신 시각 중 **가장 오래된
+것**이다.
+
+**낡은 데이터도 그대로 내려간다 — 응답에서 걸러내지 않는다.** 수집이 멈췄을 때
+행을 빼 버리면 장애가 "데이터 없음"처럼 보인다. 낡았는지는 `data_received_at`
+과 `status` / `age` 로 소비자가 판단한다.
 
 테이블은 앱 기동 시 없으면 자동 생성된다 (`CREATE TABLE IF NOT EXISTS` 방식).
 
@@ -607,6 +619,7 @@ curl "http://localhost:8000/compare?sym=ETH&common_currency=USDT"
     "absolute": 9397.94,
     "percent": 0.0104
   },
+  "data_received_at": 1786370137012,
   "data_oldest_at": 1786370137012,
   "data_newest_at": 1786370137012,
   "fetched_at": 1786370950000,
@@ -659,6 +672,7 @@ curl "http://localhost:8000/premium?sym=XRP"
   "rev": { "direction": "rev", "premiums": [ "..." ] },
   "best_direction": "rev",
   "best_premium_percent": 0.0145,
+  "data_received_at": 1786370137012,
   "data_oldest_at": 1786370137012,
   "data_newest_at": 1786370137012,
   "fetched_at": 1786370950000,
@@ -750,6 +764,7 @@ curl "http://localhost:8000/premium/rev?sym=BTC"
     }
   ],
   "failures": [],
+  "data_received_at": 1786370137012,
   "data_oldest_at": 1786370137012,
   "data_newest_at": 1786370137012,
   "fetched_at": 1786370950000,
@@ -766,6 +781,7 @@ curl "http://localhost:8000/premium/rev?sym=BTC"
 | `usd_krw_rate` / `rate_updated_at` | 적용 환율 — 통일 환율(하나은행 고시)과 그 DB 저장 시각 |
 | `premiums` | 해외 거래소별 결과. **수익률 내림차순** |
 | `failures` | 스냅샷이 없거나 가격을 뽑지 못한 거래소 (부분 실패 허용) |
+| `data_received_at` | 이 데이터를 거래소에서 받은 시각 (응답 전체) |
 | `data_oldest_at` / `data_newest_at` | 사용한 스냅샷의 갱신 시각 범위 |
 
 ##### `premiums[]` 필드
@@ -881,6 +897,7 @@ SCAN_EXCLUDED_BASES='["AI","PROS"]' uvicorn app.main:app
   "best_rev": { "...": "같은 형태" },
   "top_fwd": [],
   "top_rev": [],
+  "data_received_at": 1786370137012,
   "data_oldest_at": 1786370137012,
   "data_newest_at": 1786370137012,
   "warnings": ["..."],
@@ -1029,6 +1046,7 @@ curl "http://localhost:8000/slippage/binance?symbol=BTC/USDT&amount=50000"
       "cumulative_amount": 52581166.0, "cumulative_average": 91446053.0 }
   ],
   "data_updated_at": 1786370137012,
+  "data_received_at": 1786370137012,
   "warnings": []
 }
 ```
@@ -1046,6 +1064,7 @@ curl "http://localhost:8000/slippage/binance?symbol=BTC/USDT&amount=50000"
 | `levels_consumed` / `depth_exhausted` / `depth_available` | 소진 단계 수 / 호가 부족 여부 / 저장된 단계 수 |
 | `fills` | 단계별 체결 내역 |
 | `data_updated_at` | 이 계산에 쓴 스냅샷의 DB 갱신 시각 — 오래됐으면 `POST /refresh` |
+| `data_received_at` | 이 데이터를 거래소에서 받은 시각 (응답 전체) |
 
 ##### `fills` — 업비트 호가창 툴팁과 같은 값
 
@@ -1137,6 +1156,7 @@ curl "http://localhost:8000/matrix?amount_krw=100000000"
   "scanned_combinations": 391,
   "dom_list": ["bithumb", "upbit"],
   "fx_list": ["binance"],
+  "data_received_at": 1786370137012,
   "data_oldest_at": 1786370137012,
   "data_newest_at": 1786370137012,
   "warnings": [
@@ -1256,6 +1276,7 @@ curl "http://localhost:8000/arbitrage?sym=XRP&amount=5000&currency=USDT&exchange
   "candidates": [ "..." ],
   "failures": [],
   "warnings": ["거래 수수료·출금 수수료·코인 전송 시간이 반영되지 않은 이론값입니다."],
+  "data_received_at": 1786370137012,
   "data_oldest_at": 1786370137012,
   "data_newest_at": 1786370137012,
   "fetched_at": 1786370950000,

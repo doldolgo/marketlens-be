@@ -162,6 +162,7 @@ _VOLATILE = {
     "data_updated_at",
     "data_oldest_at",
     "data_newest_at",
+    "data_received_at",
     "rate_updated_at",
     "oldest",
     "newest",
@@ -215,3 +216,52 @@ async def test_refresh_drops_delisted_coins_from_memory(db, monkeypatch):
         service, db, monkeypatch, domestic_bases=["BTC"], binance_bases=["BTC"]
     )
     assert {s.base for s in live_store.get_snapshots()} == {"BTC"}
+
+
+# ── data_received_at ────────────────────────────────────────────────
+
+#: 조회 API 전부 — data_received_at 은 응답 전체의 필드다.
+_QUERY_PATHS = [
+    "/spreads",
+    "/matrix",
+    "/arbitrage?sym=BTC&amount=1000000",
+    "/slippage/upbit?symbol=BTC/KRW&amount=1000000",
+    "/premium/fwd?sym=BTC",
+    "/premium?sym=BTC",
+    "/compare?sym=BTC",
+]
+
+
+@pytest.mark.parametrize("path", _QUERY_PATHS)
+async def test_data_received_at_is_filled_on_memory_path(client, db, path):
+    """메모리 경로 — 마지막 수집 사이클의 수신 시각이 그대로 담긴다."""
+    received_at = seed_live_standard()
+    res = await client.get(path)
+    assert res.status_code == 200, res.text
+
+    got = res.json()["data_received_at"]
+    assert got is not None, f"{path} 에 data_received_at 이 비어 있다"
+    assert abs(got - int(received_at * 1000)) < 1000
+
+
+@pytest.mark.parametrize("path", _QUERY_PATHS)
+async def test_data_received_at_is_filled_on_db_fallback(client, db, path):
+    """DB 폴백 중에도 값이 있어야 한다 — 없으면 재기동 직후 화면이 신선도를 모른다."""
+    await seed_standard(db)
+    assert live_store.is_empty()
+
+    res = await client.get(path)
+    assert res.status_code == 200, res.text
+
+    got = res.json()["data_received_at"]
+    assert got is not None, f"{path} 에 data_received_at 이 비어 있다"
+    # 폴백 값은 스냅샷 updated_at 중 가장 오래된 것 — 방금 심었으니 현재 시각 근처다.
+    assert abs(got - int(time.time() * 1000)) < 60_000
+
+
+async def test_data_received_at_differs_from_fetched_at(client):
+    """뜻이 다른 필드다 — 같은 값을 넣어 버리면 신선도 판단이 무의미해진다."""
+    seed_live_standard()
+    body = (await client.get("/spreads")).json()
+
+    assert body["data_received_at"] <= body["fetched_at"]

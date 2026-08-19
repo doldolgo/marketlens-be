@@ -93,5 +93,13 @@ class ComparisonResult(BaseModel):
         None, description="사용한 스냅샷 중 가장 최근 갱신 시각 (epoch ms)"
     )
 
+    data_received_at: int | None = Field(
+        None,
+        description=(
+            "이 응답의 데이터를 **거래소에서 받은** 시각 (epoch ms). "
+            "응답을 만든 시각(fetched_at) · 코인별 스냅샷 갱신 시각"
+            "(data_updated_at)과 뜻이 다르다"
+        ),
+    )
     fetched_at: int = Field(..., description="서버 응답 생성 시각 (epoch ms)")
     elapsed_ms: float = Field(..., description="전체 비교 처리에 걸린 시간 (ms)")
