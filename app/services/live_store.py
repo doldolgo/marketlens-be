@@ -50,6 +50,14 @@ class LiveSnapshot:
     #: (`app.db.models.MarketSnapshot` 의 같은 이름 필드와 뜻이 같다)
     deposit_enabled: bool | None = None
     withdrawal_enabled: bool | None = None
+    #: 이 거래소가 이 코인에 지원하는 네트워크별 입출금 상태.
+    #: ``[{"code": "BASENET", "name": "Base", "dep": true, "wd": true}, ...]``
+    #:
+    #: 코인 단위 deposit/withdrawal 만으로는 **실제로 옮길 수 있는지 알 수
+    #: 없다** — 국내가 받는 망을 해외도 지원하고 그 망이 열려 있어야 한다.
+    #: 거래소 쌍을 봐야 하는 판단이라 조회 시점(spread_service)에서 맞춘다.
+    #: 비어 있으면 그 거래소가 망을 알려주지 않은 것이다 (= 확인 불가).
+    networks: list[dict] = field(default_factory=list)
     #: 거래소가 준 시세 시각 (epoch ms)
     price_timestamp: int = 0
     #: 이 행을 메모리에 넣은 시각. **timezone-aware UTC 로만 넣는다** —

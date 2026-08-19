@@ -42,6 +42,8 @@ class SnapshotRow:
     #: 입출금 가능 여부는 3-state 다 — True=열림 / False=막힘 / None=확인 불가.
     deposit_enabled: bool | None = None
     withdrawal_enabled: bool | None = None
+    #: 네트워크별 상태 (MarketSnapshot.networks 와 같은 모양)
+    networks: list[dict] = field(default_factory=list)
     price_timestamp: int = 0
 
 
@@ -86,6 +88,7 @@ async def upsert_snapshots(session: AsyncSession, rows: list[SnapshotRow]) -> in
             "bids": r.bids,
             "deposit_enabled": r.deposit_enabled,
             "withdrawal_enabled": r.withdrawal_enabled,
+            "networks": r.networks,
             "price_timestamp": r.price_timestamp,
         }
         for r in rows
@@ -122,6 +125,7 @@ async def upsert_exchange_snapshots(
             "bids": r.bids,
             "deposit_enabled": r.deposit_enabled,
             "withdrawal_enabled": r.withdrawal_enabled,
+            "networks": r.networks,
             "price_timestamp": r.price_timestamp,
         }
         for r in rows

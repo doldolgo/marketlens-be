@@ -94,6 +94,15 @@ class MarketSnapshot(Base):
     #: 출금 가능 여부. 값의 뜻은 위와 같다.
     withdrawal_enabled: Mapped[bool | None] = mapped_column(default=None)
 
+    #: 이 거래소가 이 코인에 지원하는 네트워크별 입출금 상태.
+    #: ``[{"code": "BASENET", "name": "Base", "dep": true, "wd": true}, ...]``
+    #:
+    #: 코인 단위 deposit/withdrawal 만으로는 **실제로 옮길 수 있는지 알 수
+    #: 없다** — 국내가 받는 망을 해외도 지원하고 그 망이 열려 있어야 한다.
+    #: 거래소 쌍을 봐야 하는 판단이라 조회 시점(spread_service)에서 맞춘다.
+    #: 비어 있으면 그 거래소가 망을 알려주지 않은 것이다 (= 확인 불가).
+    networks: Mapped[list] = mapped_column(JsonList, default=list)
+
     #: 거래소가 준 시세 시각 (epoch ms). 없는 거래소는 수신 시각.
     price_timestamp: Mapped[int] = mapped_column(BigInteger, default=0)
     #: 이 행을 마지막으로 갱신한 시각 (DB 서버 시계)
