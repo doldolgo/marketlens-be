@@ -40,12 +40,20 @@ class Settings(BaseSettings):
     orderbook_max_amount_krw: float = 1_000_000_000.0
     #: 바이낸스 depth 조회 단계 수 (심볼당). 허용값: 5/10/20/50/100/500/1000.
     binance_orderbook_depth: int = 100
-    #: 바이낸스 심볼별 depth 조회의 동시 실행 수. rate limit 보호용.
-    refresh_concurrency: int = 20
     #: 입출금 실패 시각(dw_fail_events)의 보존 기간 (초). 수집 상태 창이
     #: 최근 이 기간의 실패 구간을 표시한다. 지난 행은 refresh 가 돌 때마다
     #: 지운다 — 별도 청소 잡이 없다.
     dw_fail_retention_seconds: int = 86_400
+    #: 수집 루프 주기 (초). 앱 내부 스케줄러가 이 간격으로 돈다.
+    collect_interval_seconds: float = 1.0
+    #: premium_archive 적재 주기 (초). 라이브보다 느리게 돌려 적재량을 억제한다.
+    archive_interval_seconds: float = 60.0
+    #: 입출금 상태 갱신 주기 (초). 자주 바뀌지 않으므로 저빈도로 돌린다.
+    wallet_refresh_seconds: float = 60.0
+    #: 깊이를 조회할 김프 하한 (%). 이 미만이면 슬리피지를 계산할 이유가 없다.
+    depth_watch_min_percent: float = 1.0
+    #: 깊이 조회 코인 수 상한. 바이낸스 weight 예산의 안전장치 (12개 = 한도의 68%).
+    depth_watch_max_count: int = 12
     #: POST /refresh 보호 토큰. 비우면 인증 없이 열린다 (로컬 개발용).
     #: 배포 시에는 반드시 설정할 것 — refresh 는 거래소 호출 수백 회가 나가는
     #: 비싼 작업이라, 외부인이 마음대로 트리거하면 rate limit 이 소진된다.
@@ -76,7 +84,7 @@ class Settings(BaseSettings):
     scan_excluded_bases: list[str] = []
 
     #: /spreads 에서 스냅샷이 이 초 이상 오래되면 status=stale 로 표시한다.
-    spread_stale_seconds: float = 30.0
+    spread_stale_seconds: float = 5.0
 
     # 거래소 API 베이스 URL (장애 시 프록시/미러로 갈아끼울 수 있게 설정으로 노출)
     upbit_base_url: str = "https://api.upbit.com"

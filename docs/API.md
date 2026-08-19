@@ -337,23 +337,23 @@ curl -X POST "http://localhost:8000/refresh" -H "X-Refresh-Token: <토큰>"
 ```json
 {
   "snapshots": [
-    { "exchange": "upbit", "saved": 189,
-      "wallet_status_available": true, "mode": "bulk" },
-    { "exchange": "bithumb", "saved": 313,
-      "wallet_status_available": true, "mode": "bulk" },
-    { "exchange": "binance", "saved": 202,
-      "wallet_status_available": false, "mode": "per_symbol" }
+    { "exchange": "upbit", "saved": 199,
+      "wallet_status_available": true },
+    { "exchange": "bithumb", "saved": 292,
+      "wallet_status_available": true },
+    { "exchange": "binance", "saved": 294,
+      "wallet_status_available": false }
   ],
   "usdkrw": { "rate": 1418.4, "source_time": 1786627013, "round_no": 732 },
-  "archived": 391,
-  "total_saved": 704,
+  "archived": 491,
+  "total_saved": 785,
   "failures": [],
   "warnings": [
     "binance 입출금 상태를 건너뜀 — BINANCE_API_KEY / BINANCE_SECRET_KEY 가 비어 있습니다. (해당 거래소의 deposit_enabled / withdrawal_enabled 는 null)"
   ],
-  "total_calls": 215,
+  "total_calls": 21,
   "fetched_at": 1786370137000,
-  "elapsed_ms": 2841.55
+  "elapsed_ms": 1679.32
 }
 ```
 
@@ -361,7 +361,6 @@ curl -X POST "http://localhost:8000/refresh" -H "X-Refresh-Token: <토큰>"
 |---|---|
 | `snapshots[].saved` | 저장(UPSERT)한 코인 수 — 이번 수집에 없는 코인도 지우지 않는다 |
 | `snapshots[].wallet_status_available` | 입출금 가능 여부를 채웠는지. false 면 키가 없거나 조회 실패 → null 저장 |
-| `snapshots[].mode` | `bulk`=전종목 일괄 조회 (업비트·빗썸), `per_symbol`=심볼별 조회 (바이낸스) |
 | `usdkrw` | 저장한 통일 환율 (하나은행 고시). 이번 수집 실패 시 null — 계산은 DB 의 마지막 환율로 계속 |
 | `archived` | 이번 회차에 남긴 김프/역프 기록 수 — (국내 거래소 × 코인)당 한 줄 |
 | `failures` | 수집하지 못한 항목 (`exchange`, `sym`, `error_code`, `message`) |
@@ -370,12 +369,14 @@ curl -X POST "http://localhost:8000/refresh" -H "X-Refresh-Token: <토큰>"
 
 #### 호출 비용과 주기
 
-업비트·빗썸은 전종목 일괄 조회라 호출이 몇 회로 끝나지만, 바이낸스는 depth 를
-일괄로 주는 엔드포인트가 없어 **국내 상장 교집합 코인마다 1회씩** 호출한다
-(동시 실행 수는 `REFRESH_CONCURRENCY`, 기본 20 으로 제한). 한 번의 refresh 가
-대략 **200회 안팎**의 호출을 만들므로, 초 단위로 반복 호출하면 거래소
-rate limit (바이낸스 분당 6,000 weight, 업비트 그룹당 초당 10회)에 걸릴 수 있다.
-실제 호출 수는 응답의 `total_calls` 로 확인한다.
+세 거래소 모두 전종목 일괄 조회다. 바이낸스도 심볼별 depth 를 부르지 않고
+체결가(`ticker/price`)와 최우선 호가(`ticker/bookTicker`)를 1회씩만 가져온다.
+한 번의 refresh 는 **20회 안팎**의 호출로 끝나며, 바이낸스 기준 소모량은
+고정 **8 weight** (분당 6,000 한도의 0.13%)다.
+
+대신 바이낸스 호가는 **최우선 1단계만** 저장된다 — 슬리피지 계산에 쓸 깊이가
+없으므로 `/slippage`·`/arbitrage` 는 바이낸스 쪽에서 곧바로 `depth_exhausted`
+가 된다. 실제 호출 수는 응답의 `total_calls` 로 확인한다.
 
 ---
 
@@ -1380,13 +1381,17 @@ curl "http://localhost:8000/history/status"
 
 | 용도 | 엔드포인트 | 비고 |
 |---|---|---|
-| USDT 전종목 현재가 | `GET /api/v3/ticker/price` | 1회 호출로 전종목. 국내 상장 코인과의 **교집합**을 계산해 depth 대상 결정 |
-| 심볼별 호가 | `GET /api/v3/depth?symbol=...&limit=100` | 교집합 코인마다 1회. `limit` 은 설정 `BINANCE_ORDERBOOK_DEPTH` (허용값 5/10/20/50/100/500/1000), 동시 실행은 `REFRESH_CONCURRENCY` (기본 20)로 제한 |
+| USDT 전종목 현재가 | `GET /api/v3/ticker/price` | 1회 호출로 전종목. weight 4 |
+| USDT 전종목 최우선 호가 | `GET /api/v3/ticker/bookTicker` | 1회 호출로 전종목의 `bid`/`ask` + 잔량. weight 4. 저장은 국내 상장 코인과의 **교집합**만 |
 
 - Base URL: `https://api.binance.com` (설정 `BINANCE_SPOT_BASE_URL`)
-- rate limit: **분당 6,000 weight** (IP 기준). `depth limit=100` 은 호출당
-  weight 5 — 교집합 200종목이면 refresh 1회에 약 1,000 weight 를 쓴다.
-  refresh 를 분당 수 회 이상 돌리지 않는 것이 안전하다.
+- rate limit: **분당 6,000 weight** (IP 기준). 수집은 위 두 호출뿐이라
+  refresh 1회당 **8 weight** 로 고정이다 — 1초 주기로 돌려도 분당 480,
+  한도의 8% 다.
+- 심볼별 `GET /api/v3/depth` 는 **현재 어느 경로에서도 호출하지 않는다.**
+  커넥터의 `fetch_orderbook` 은 남아 있지만 호출자가 없다 (`limit=100` 기준
+  호출당 weight 5). 조회 API(`/orderbook`·`/slippage` 등)는 거래소를 부르지
+  않고 DB 스냅샷을 읽는다.
 
 ### 하나은행 (환율 — USD/KRW 고시 매매기준율)
 

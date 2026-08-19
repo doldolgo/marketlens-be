@@ -23,9 +23,6 @@ class ExchangeRefreshStat(BaseModel):
             "deposit_enabled / withdrawal_enabled 가 null 로 저장됐다"
         ),
     )
-    mode: str = Field(
-        ..., description="`bulk`=전종목 일괄 조회, `per_symbol`=심볼별 조회"
-    )
 
 
 class UsdKrwRateInfo(BaseModel):

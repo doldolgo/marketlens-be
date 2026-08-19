@@ -1,4 +1,7 @@
-"""수집기 변환 로직 테스트 — _truncate / _to_rows / _usdt_amount (네트워크 불필요)."""
+"""수집기 변환 로직 테스트 — _truncate / _to_rows / _tops_to_rows / _usdt_amount
+
+(네트워크 불필요)
+"""
 
 from __future__ import annotations
 
@@ -7,6 +10,7 @@ import math
 import pytest
 
 from app.exchanges.private.wallet_status import WalletStatus
+from app.models.bulk import BulkQuote
 from app.models.orderbook import MarketType, OrderBook, OrderBookLevel
 from app.services.collector_service import CollectorService, _truncate
 
@@ -149,3 +153,86 @@ class TestToRows:
         books = {"BTC": make_book(), "ETH": make_book(base="ETH")}
         rows = self.rows(books, {"BTC": 100.0, "ETH": 50.0})
         assert {r.base for r in rows} == {"BTC", "ETH"}
+
+
+def make_top(
+    base: str = "BTC",
+    *,
+    bid: float | None = 99.0,
+    ask: float | None = 101.0,
+    bid_size: float | None = 2.0,
+    ask_size: float | None = 3.0,
+) -> BulkQuote:
+    return BulkQuote(
+        base=base,
+        quote="USDT",
+        native_symbol=f"{base}USDT",
+        bid=bid,
+        ask=ask,
+        bid_size=bid_size,
+        ask_size=ask_size,
+    )
+
+
+class TestTopsToRows:
+    """bookTicker 일괄 조회 결과 → 1단계짜리 스냅샷 행."""
+
+    NOW_S = 1_700_000_000
+
+    def setup_method(self) -> None:
+        self.service = CollectorService()
+
+    def rows(self, tops, lasts, wallet=None):
+        return self.service._tops_to_rows(
+            "binance", tops, lasts, wallet, self.NOW_S
+        )
+
+    def test_builds_single_level_book_from_bulk_quote(self) -> None:
+        rows = self.rows({"BTC": make_top()}, {"BTC": 100.5})
+
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.exchange == "binance"
+        assert row.base == "BTC"
+        assert row.quote == "USDT"
+        assert row.native_symbol == "BTCUSDT"
+        assert row.price == 100.5
+        assert row.asks == [[101.0, 3.0]]
+        assert row.bids == [[99.0, 2.0]]
+
+    def test_price_timestamp_is_collect_time_in_ms(self) -> None:
+        """bookTicker 에는 시각이 없다. OrderBook.timestamp 와 같은 단위(ms)로 맞춘다."""
+        rows = self.rows({"BTC": make_top()}, {"BTC": 100.5})
+        assert rows[0].price_timestamp == self.NOW_S * 1000
+
+    def test_falls_back_to_mid_when_last_missing(self) -> None:
+        rows = self.rows({"BTC": make_top()}, {})
+        assert rows[0].price == pytest.approx(100.0)  # (99+101)/2
+
+    def test_missing_size_becomes_zero_not_none(self) -> None:
+        """잔량이 없어도 행 구조는 [가격, 잔량] 을 유지해야 한다 (liqDom/liqFx 계산용)."""
+        rows = self.rows({"BTC": make_top(bid_size=None, ask_size=None)}, {"BTC": 100.0})
+
+        assert rows[0].asks == [[101.0, 0.0]]
+        assert rows[0].bids == [[99.0, 0.0]]
+
+    def test_skips_quote_without_both_sides(self) -> None:
+        tops = {"BTC": make_top(bid=None), "ETH": make_top("ETH", ask=None)}
+        assert self.rows(tops, {"BTC": 100.0, "ETH": 50.0}) == []
+
+    def test_skips_non_positive_quote(self) -> None:
+        """거래가 없는 심볼은 호가가 0 으로 온다 — 가격으로 쓸 수 없다."""
+        assert self.rows({"BTC": make_top(bid=0.0)}, {"BTC": 100.0}) == []
+
+    def test_wallet_status_is_propagated(self) -> None:
+        wallet = {"BTC": WalletStatus(deposit=True, withdrawal=False)}
+        rows = self.rows({"BTC": make_top()}, {"BTC": 100.0}, wallet)
+
+        assert rows[0].deposit_enabled is True
+        assert rows[0].withdrawal_enabled is False
+
+    def test_missing_wallet_data_becomes_false(self) -> None:
+        rows = self.rows({"BTC": make_top()}, {"BTC": 100.0}, None)
+
+        assert rows[0].deposit_enabled is False
+        assert rows[0].withdrawal_enabled is False

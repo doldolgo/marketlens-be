@@ -45,6 +45,7 @@ from app.exchanges.registry import domestic_exchange_ids, get_exchange
 from app.history import hana
 from app.history import service as history_service
 from app.history.service import premium_from_quotes
+from app.models.bulk import BulkQuote
 from app.models.orderbook import MarketType, OrderBook, OrderBookLevel
 from app.models.refresh import (
     ExchangeRefreshStat,
@@ -52,7 +53,6 @@ from app.models.refresh import (
     RefreshResult,
     UsdKrwRateInfo,
 )
-from app.models.symbol import Symbol
 
 
 #: 거래소 ID → 입출금 상태 조회 함수
@@ -136,7 +136,7 @@ class CollectorService:
             domestic_bases |= set(books)
 
         binance_result, futures_market_count = await asyncio.gather(
-            self._binance_market(domestic_bases, usdkrw_rate_value, failures, warnings),
+            self._binance_market(domestic_bases, failures),
             self._binance_futures_count(warnings),
         )
 
@@ -155,10 +155,8 @@ class CollectorService:
         #: 거래소 → 이번 회차 상장 마켓 수 (platform_status 용)
         listed_count: dict[str, int] = {}
 
-        for (eid, books, lasts), mode in [
-            *[(r, "bulk") for r in domestic_results],
-            (binance_result, "per_symbol"),
-        ]:
+        # 세 거래소 모두 전종목 일괄 조회다 — 심볼별로 도는 경로는 남아 있지 않다.
+        for eid, books, lasts in [*domestic_results, binance_result]:
             # 수집이 통째로 실패한 거래소는 DB 를 건드리지 않는다.
             # 기존 스냅샷이 남아 있고, 신선도는 updated_at 으로 판별한다.
             if not books:
@@ -171,24 +169,16 @@ class CollectorService:
                         exchange=eid,
                         saved=0,
                         wallet_status_available=wallets.get(eid) is not None,
-                        mode=mode,
                     )
                 )
                 continue
 
             wallet = wallets.get(eid)
-            rows = self._to_rows(
-                eid,
-                books,
-                lasts,
-                wallet,
-                # 바이낸스 호가는 USDT 기준이므로 최대 금액도 환산한다.
-                # (USDT≈USD 로 보고 은행 환율을 쓴다 — 자르는 깊이 기준일 뿐이라
-                #  1% 미만의 페그 오차는 결과에 의미 있는 차이를 만들지 않는다)
-                max_amount if eid != "binance" else self._usdt_amount(
-                    max_amount, usdkrw_rate_value
-                ),
-            )
+            if eid == "binance":
+                # bookTicker 는 1단계뿐이라 금액 기준으로 자를 깊이가 없다.
+                rows = self._tops_to_rows(eid, books, lasts, wallet, now_ts)
+            else:
+                rows = self._to_rows(eid, books, lasts, wallet, max_amount)
             rows_by_exchange[eid] = {r.base: r for r in rows}
             # 국내는 KRW 전종목 = 상장 현물 마켓 수. 바이낸스는 일괄 조회가
             # 준 USDT 전종목 수가 상장 마켓 수다 (호가는 교집합만 받는다).
@@ -198,7 +188,6 @@ class CollectorService:
                     exchange=eid,
                     saved=len(rows),
                     wallet_status_available=wallet is not None,
-                    mode=mode,
                 )
             )
 
@@ -468,20 +457,20 @@ class CollectorService:
     async def _binance_market(
         self,
         domestic_bases: set[str],
-        usdkrw_rate: float | None,
         failures: list[RefreshFailure],
-        warnings: list[str],
-    ) -> tuple[str, dict[str, OrderBook], dict[str, float]]:
-        """바이낸스 USDT 마켓 — 국내 상장 코인만, 심볼별 depth 조회.
+    ) -> tuple[str, dict[str, BulkQuote], dict[str, float]]:
+        """바이낸스 USDT 마켓 — 전종목 일괄 조회 2회로 끝낸다.
 
-        바이낸스는 호가 깊이를 일괄로 주는 엔드포인트가 없어 심볼별로 부른다.
-        전종목 체결가(1회 호출)로 대상을 교집합으로 좁힌 뒤 동시 실행 수를
-        제한해 rate limit 을 지킨다.
+        체결가(``ticker/price``)와 최우선 호가(``ticker/bookTicker``)를 각각
+        1회씩 부른다. 심볼별 ``depth`` 조회는 코인 308개면 1,540 weight 인데,
+        이 두 번은 합쳐서 8 weight 다. 대신 받는 호가는 1단계뿐이라 슬리피지용
+        깊이는 없다 — 최우선 호가만 쓰는 ``/spreads`` 에는 영향이 없다.
         """
         exchange = get_exchange("binance")
         try:
-            quotes = await exchange.fetch_bulk_quotes(
-                settings.overseas_quote, need_book=False
+            prices, tops = await asyncio.gather(
+                exchange.fetch_bulk_quotes(settings.overseas_quote, need_book=False),
+                exchange.fetch_bulk_quotes(settings.overseas_quote, need_book=True),
             )
         except MarketLensError as exc:
             failures.append(
@@ -500,48 +489,10 @@ class CollectorService:
             )
             return "binance", {}, {}
 
-        lasts = {b: q.last for b, q in quotes.items() if q.last is not None}
-        targets = sorted(domestic_bases & set(lasts))
-        if usdkrw_rate is None:
-            warnings.append(
-                "USD/KRW 환율(하나은행 고시)을 얻지 못해 바이낸스 호가 저장 깊이를 "
-                "금액 기준으로 자르지 못했습니다. 조회된 전체 깊이를 저장합니다."
-            )
-
-        semaphore = asyncio.Semaphore(settings.refresh_concurrency)
-
-        async def one(base: str) -> tuple[str, OrderBook | None]:
-            async with semaphore:
-                try:
-                    book = await exchange.fetch_orderbook(
-                        Symbol(base=base, quote=settings.overseas_quote),
-                        depth=settings.binance_orderbook_depth,
-                        market_type=MarketType.SPOT,
-                    )
-                    return base, book
-                except MarketLensError as exc:
-                    failures.append(
-                        RefreshFailure(
-                            exchange="binance",
-                            sym=base,
-                            error_code=exc.code,
-                            message=exc.message,
-                        )
-                    )
-                    return base, None
-                except Exception as exc:  # noqa: BLE001
-                    failures.append(
-                        RefreshFailure(
-                            exchange="binance",
-                            sym=base,
-                            error_code="unexpected_error",
-                            message=f"{type(exc).__name__}: {exc}",
-                        )
-                    )
-                    return base, None
-
-        results = await asyncio.gather(*(one(b) for b in targets))
-        books = {base: book for base, book in results if book is not None}
+        lasts = {b: q.last for b, q in prices.items() if q.last is not None}
+        # 저장은 국내에 상장된 코인만 — 김프 계산에 짝이 없는 코인은 쓸모가 없다.
+        # (lasts 는 좁히지 않는다. 상장 마켓 수 집계에 전종목 수가 필요하다)
+        books = {b: q for b, q in tops.items() if b in domestic_bases}
         return "binance", books, lasts
 
     async def _binance_futures_count(self, warnings: list[str]) -> int | None:
@@ -601,6 +552,46 @@ class CollectorService:
                     deposit_enabled=bool(status.deposit) if status else False,
                     withdrawal_enabled=bool(status.withdrawal) if status else False,
                     price_timestamp=book.timestamp,
+                )
+            )
+        return rows
+
+    def _tops_to_rows(
+        self,
+        exchange_id: str,
+        tops: dict[str, BulkQuote],
+        lasts: dict[str, float],
+        wallet: dict[str, WalletStatus] | None,
+        now_ts: int,
+    ) -> list[SnapshotRow]:
+        """최우선 호가 일괄 조회 결과를 DB 행으로 조립한다.
+
+        호가가 1단계뿐이라 _truncate 를 타지 않는다 (자를 것이 없다).
+        bookTicker 에는 체결 시각이 없으므로 수집 시각을 쓴다.
+        """
+        rows: list[SnapshotRow] = []
+        for base, q in tops.items():
+            if q.bid is None or q.ask is None or q.bid <= 0 or q.ask <= 0:
+                continue
+            price = lasts.get(base) or q.mid
+            if price is None or price <= 0:
+                continue
+
+            status = wallet.get(base) if wallet else None
+            rows.append(
+                SnapshotRow(
+                    exchange=exchange_id,
+                    base=base,
+                    native_symbol=q.native_symbol,
+                    quote=q.quote,
+                    price=price,
+                    asks=[[q.ask, q.ask_size or 0.0]],
+                    bids=[[q.bid, q.bid_size or 0.0]],
+                    # 확인 불가(키 없음/장애)는 null 이 아니라 보수적으로 False.
+                    deposit_enabled=bool(status.deposit) if status else False,
+                    withdrawal_enabled=bool(status.withdrawal) if status else False,
+                    # OrderBook.timestamp 와 같은 단위(epoch ms)로 맞춘다.
+                    price_timestamp=now_ts * 1000,
                 )
             )
         return rows
