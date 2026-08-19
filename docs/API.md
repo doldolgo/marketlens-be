@@ -215,7 +215,7 @@ Adminer (http://localhost:8080): 시스템 `PostgreSQL`, 서버 `db`,
 | `GET /matrix` | **전 코인 매트릭스** — 코인별 최대 김프·최대 역프 | 금액 1개 | 코인별 최적 조합 + 실현 수익률 + 입출금 가능 여부 |
 | `GET /arbitrage` | **N원 넣으면 실제로 얼마 남나** | 코인, 금액, 통화, 방향 | 매수/매도처, 슬리피지, 실수익 |
 | `GET /history/premium` | **김프/역프 기록** — 몇 초 뒤에 얼마로 바뀌었나 | 코인, 페어, 주/월 | dt·fwd·rev 기록 열 |
-| `GET /history/status` | **플랫폼 상태** — 마지막 수신·마켓 수·입출금 실패율 | 없음 | 플랫폼별 카운터 |
+| `GET /history/status` | **플랫폼 상태** — 마지막 수신·마켓 수·입출금 **조회** 실패율 | 없음 | 플랫폼별 카운터 |
 
 ### 조회 가능한 데이터 범위
 
@@ -955,7 +955,11 @@ curl "http://localhost:8000/spreads"
       "status": "ok",
       "age": 4.2,
       "liqDom": 2140.25,
-      "liqFx": 2141.78
+      "liqFx": 2141.78,
+      "depDom": true,
+      "wdDom": true,
+      "depFx": false,
+      "wdFx": null
     }
   ],
   "fetched_at": 1786370950000,
@@ -972,6 +976,30 @@ curl "http://localhost:8000/spreads"
 | `status` | `ok` / `stale`(갱신 후 `SPREAD_STALE_SECONDS`(기본 30초) 초과) / `fail`(저장 호가가 비어 계산 불가) |
 | `age` | 스냅샷 마지막 갱신 후 경과 초 (양측 중 오래된 쪽) |
 | `liqDom` / `liqFx` | 최우선 호가 유동성 (USD 환산) — 매수·매도 양쪽 중 **작은 쪽**. FE 슬리피지 추정용 |
+| `depDom` / `wdDom` | **국내** 거래소의 입금 / 출금 가능 여부 (3-state, 아래 표) |
+| `depFx` / `wdFx` | **해외** 거래소의 입금 / 출금 가능 여부 (3-state, 아래 표) |
+
+**입출금 4개 필드는 3-state 다.**
+
+| 값 | 뜻 |
+|---|---|
+| `true` | 확인했고 **열려 있음** |
+| `false` | 확인했고 **막힘** |
+| `null` | **확인 불가** — 키 없음 · API 장애 · 응답에 그 코인이 없음 |
+
+> ⚠️ **`null` 을 "열림"으로 읽지 말 것.** 모르는 경로를 옮길 수 있다고 말하는
+> 셈이다. 화면에서도 `false`(막힘)와 **다르게** 표시해야 한다 — 확인하지 못한
+> 것을 초록으로 칠하면 안 된다.
+
+한 행은 (국내 × 해외) 페어라 실제로 옮기려면 **양쪽 다** 열려 있어야 한다.
+
+```
+순방향(김프) : 해외에서 사서 국내로 옮겨 판다  →  wdFx  + depDom
+역방향(역프) : 국내에서 사서 해외로 옮겨 판다  →  wdDom + depFx
+```
+
+`status=fail` 인 행도 이 네 필드는 채워진다 — 호가를 못 써도 입출금 상태는
+따로 알기 때문이다.
 
 - 한쪽에만 상장된 코인은 페어가 아니므로 빠진다. `SCAN_EXCLUDED_BASES` 도 적용.
 - 스냅샷이나 환율이 하나도 없으면 `404 market_data_not_found`.
@@ -1357,7 +1385,7 @@ curl "http://localhost:8000/arbitrage?sym=XRP&amount=5000&currency=USDT&exchange
 | 엔드포인트 | 무엇을 하나 |
 |---|---|
 | `GET /history/premium?base=&unit=week\|month&date=&dom=&fx=&offset=&limit=` | 김프/역프 기록 — 각 항목은 `dt`(직전 기록에서 몇 초 뒤)·`fwd`(김프 %)·`rev`(역프 %) |
-| `GET /history/status` | 플랫폼별 마지막 수신 시각·상장 마켓 수(현물/선물)·입출금 실패율 |
+| `GET /history/status` | 플랫폼별 마지막 수신 시각·상장 마켓 수(현물/선물)·입출금 **조회** 실패율 |
 
 ```bash
 curl "http://localhost:8000/history/premium?base=BTC&unit=week&limit=20"
@@ -1481,6 +1509,7 @@ curl "http://localhost:8000/history/status"
 |---|---|
 | 키 있음 | `deposit_enabled` / `withdrawal_enabled` 가 true/false 로 저장 |
 | 키 없음 / 조회 실패 | 해당 거래소의 두 필드가 **null** 로 저장, `warnings` 에 안내. 나머지 수집은 정상 |
+| 조회는 됐으나 응답에 그 코인이 없음 | **그 코인만** 두 필드가 **null** 로 저장 |
 
 빗썸은 public 엔드포인트로 조회하므로 키가 필요 없다.
 

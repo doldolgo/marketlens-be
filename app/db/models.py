@@ -25,10 +25,10 @@
 **플랫폼 상태**
 
 ``platform_status`` — 플랫폼(거래소)당 한 행
-    마지막 수신 시각, 상장 마켓 수(현물/선물), 입출금 실패 횟수와 전체
-    업데이트 횟수. 실패율 = dw_fail_count / update_count.
+    마지막 수신 시각, 상장 마켓 수(현물/선물), 입출금 **조회** 실패 횟수와
+    전체 업데이트 횟수. 실패율 = dw_fail_count / update_count.
 
-``dw_fail_events`` — 입출금 실패가 관측된 회차 한 건당 한 행
+``dw_fail_events`` — 입출금 조회 실패가 관측된 회차 한 건당 한 행
     dw_fail_count 가 +1 될 때 그 시각을 함께 남긴다 (수집 상태 창의
     결측 구간 표시용). 최근 24시간치만 유지 — 지난 행은 refresh 가
     돌 때마다 지운다.
@@ -81,12 +81,18 @@ class MarketSnapshot(Base):
     #: 매수 호가 [[가격, 잔량], ...] 가격 내림차순
     bids: Mapped[list] = mapped_column(JsonList, default=list)
 
-    #: 입금 가능 여부. **null 을 두지 않는다** — 확인할 수 없으면(키 없음·API
-    #: 장애) 보수적으로 False 로 저장한다. "모른다"와 "막혔다"를 구분하려면
-    #: platform_status 의 실패 카운터를 본다.
-    deposit_enabled: Mapped[bool] = mapped_column(default=False)
-    #: 출금 가능 여부. 위와 같은 규칙 (확인 불가 → False).
-    withdrawal_enabled: Mapped[bool] = mapped_column(default=False)
+    #: 입금 가능 여부 — **3-state 다.**
+    #:
+    #:     True  : 확인했고 열려 있음
+    #:     False : 확인했고 막힘
+    #:     None  : 확인 불가 — 키 없음 · API 실패 · 응답에 그 코인이 없음
+    #:
+    #: **None 을 "열림"으로 취급하지 말 것.** 모르는 경로를 옮길 수 있다고
+    #: 말하는 셈이다. 판단을 `and` / `not` 으로 쓰면 None 이 falsy 라 자동으로
+    #: 보수적이 된다.
+    deposit_enabled: Mapped[bool | None] = mapped_column(default=None)
+    #: 출금 가능 여부. 값의 뜻은 위와 같다.
+    withdrawal_enabled: Mapped[bool | None] = mapped_column(default=None)
 
     #: 거래소가 준 시세 시각 (epoch ms). 없는 거래소는 수신 시각.
     price_timestamp: Mapped[int] = mapped_column(BigInteger, default=0)
@@ -146,7 +152,11 @@ class PremiumArchive(Base):
 
 
 class DwFailEvent(Base):
-    """입출금 실패가 관측된 refresh 회차 한 건 (수집 상태 창의 결측 구간 재료).
+    """입출금 **조회** 실패가 관측된 refresh 회차 한 건 (결측 구간 재료).
+
+    "조회 실패"는 거래소가 입출금 상태를 안 줬다는 뜻이다 (키 없음 · API
+    장애 · 응답 누락). 코인이 막혀 있는 것은 실패가 아니다 — 그건 정상적으로
+    관측된 결과다.
 
     platform_status 의 dw_fail_count 가 +1 되는 바로 그 갱신에서 같은
     트랜잭션으로 시각 한 줄을 남긴다. 조회 API 가 이 시각들을 이어 붙여
@@ -160,19 +170,22 @@ class DwFailEvent(Base):
 
     #: 플랫폼(거래소) ID
     exchange: Mapped[str] = mapped_column(String(32), primary_key=True)
-    #: 실패가 관측된 수신 시각 (절대 epoch 초)
+    #: 조회 실패가 관측된 수신 시각 (절대 epoch 초)
     ts: Mapped[int] = mapped_column(BigInteger, primary_key=True)
 
 
 class PlatformStatus(Base):
-    """플랫폼(거래소)당 한 행 — 수신 상태와 입출금 실패율의 재료.
+    """플랫폼(거래소)당 한 행 — 수신 상태와 입출금 **조회** 실패율의 재료.
 
     POST /refresh 가 market_snapshots 를 업데이트한 뒤 같은 플랫폼의 행을
     함께 갱신한다:
         - ``last_received_ts`` 를 이번 수신 시각으로, ``update_count`` +1
-        - 이번 업데이트에서 입금 또는 출금 불가 코인이 하나라도 있었으면
-          ``dw_fail_count`` +1
+        - 이번 업데이트에서 입출금 상태를 **못 받아온** 코인이 하나라도
+          있었으면 ``dw_fail_count`` +1
     실패율 = dw_fail_count / update_count.
+
+    막힌 코인 수를 세는 지표가 아니다. 그렇게 세면 코인이 늘수록 비율이
+    1.0 에 수렴해 아무것도 말해주지 못한다.
     """
 
     __tablename__ = "platform_status"
@@ -185,7 +198,7 @@ class PlatformStatus(Base):
     spot_market_count: Mapped[int] = mapped_column(Integer, default=0)
     #: 상장 선물 마켓 수 (선물이 없는 플랫폼은 0)
     futures_market_count: Mapped[int] = mapped_column(Integer, default=0)
-    #: 입출금 불가가 관측된 업데이트 횟수 (업데이트당 최대 +1)
+    #: 입출금 조회 실패가 관측된 업데이트 횟수 (업데이트당 최대 +1)
     dw_fail_count: Mapped[int] = mapped_column(Integer, default=0)
     #: 전체 업데이트 횟수 (last_received_ts 갱신마다 +1)
     update_count: Mapped[int] = mapped_column(Integer, default=0)

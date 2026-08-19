@@ -2,7 +2,8 @@
 
 FE `src/data/types.ts` 의 SpreadRow 가 원본 계약이다.
 
-    { sym, dom, fx, fwd, rev, usd, spark, status, age, liqDom, liqFx }
+    { sym, dom, fx, fwd, rev, usd, spark, status, age, liqDom, liqFx,
+      depDom, wdDom, depFx, wdFx }
 
 (국내 거래소 × 해외 거래소 × 코인) 페어 하나가 한 행이며, 한 행에
 **김프(fwd)와 역프(rev)를 함께** 담는다. 가격 기준은 다른 프리미엄 API 와
@@ -77,6 +78,32 @@ class SpreadRow(BaseModel):
         ...,
         alias="liqFx",
         description="해외 최우선 호가 유동성 (USDT) — 매수·매도 양쪽 중 작은 쪽",
+    )
+
+    # ── 입출금 가능 여부 — **3-state 다** ────────────────────────────────
+    #
+    #   true  : 확인했고 열려 있음
+    #   false : 확인했고 막힘
+    #   null  : **확인 불가** — 키 없음 · API 장애 · 응답에 그 코인이 없음
+    #
+    # **null 을 "열림"으로 읽지 말 것.** 화면에서도 막힘과 다르게 그려야 한다
+    # — 확인 못 한 것을 초록으로 칠하면 못 옮기는 경로를 옮길 수 있다고
+    # 말하는 셈이다.
+    #
+    # 한 행은 (국내 × 해외) 페어라 실제로 옮기려면 **양쪽 다** 필요하다.
+    # 순방향(김프)은 해외 출금(wdFx) + 국내 입금(depDom),
+    # 역방향(역프)은 국내 출금(wdDom) + 해외 입금(depFx) 이 열려야 한다.
+    dep_dom: bool | None = Field(
+        None, alias="depDom", description="국내 거래소 입금 가능 여부 (3-state)"
+    )
+    wd_dom: bool | None = Field(
+        None, alias="wdDom", description="국내 거래소 출금 가능 여부 (3-state)"
+    )
+    dep_fx: bool | None = Field(
+        None, alias="depFx", description="해외 거래소 입금 가능 여부 (3-state)"
+    )
+    wd_fx: bool | None = Field(
+        None, alias="wdFx", description="해외 거래소 출금 가능 여부 (3-state)"
     )
 
 

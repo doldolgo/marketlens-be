@@ -456,10 +456,22 @@ class ArbitrageService:
                 f"{buy_side.name}에서 {base} 출금이 막혀 있습니다. "
                 "이 경로는 현재 실행할 수 없습니다."
             )
+        elif withdrawal_available is None:
+            # 경고를 아예 안 내면 "경고 없음 = 괜찮음"으로 읽힌다.
+            # 모르는 것은 모른다고 말한다.
+            warnings.append(
+                f"{buy_side.name}의 {base} 출금 가능 여부를 확인하지 "
+                "못했습니다. 열려 있다고 가정하지 마십시오."
+            )
         if deposit_available is False:
             warnings.append(
                 f"{sell_side.name}에서 {base} 입금이 막혀 있습니다. "
                 "이 경로는 현재 실행할 수 없습니다."
+            )
+        elif deposit_available is None:
+            warnings.append(
+                f"{sell_side.name}의 {base} 입금 가능 여부를 확인하지 "
+                "못했습니다. 열려 있다고 가정하지 마십시오."
             )
         if input_krw > settings.orderbook_max_amount_krw:
             warnings.append(

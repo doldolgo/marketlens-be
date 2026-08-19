@@ -351,7 +351,11 @@ class CollectorService:
                     )
                 )
                 saved_by_exchange[eid] += 1
-                if not (r.deposit_enabled and r.withdrawal_enabled):
+                # **조회 실패**만 센다 — 막힌 코인이 있는 것은 실패가 아니라
+                # 정상적인 관측 결과다. 예전엔 "불가 코인이 하나라도 있으면"
+                # 이라 코인이 300개면 사실상 매 회차 참이었고, 비율이 항상
+                # 1.000 에 붙어 지표로 죽어 있었다.
+                if r.deposit_enabled is None or r.withdrawal_enabled is None:
                     dw_failed_by_exchange[eid] = True
         # 이번에 환율을 못 받았으면 None 을 넘겨 직전 값을 유지한다.
         live_rate = (
@@ -871,9 +875,12 @@ class CollectorService:
                     price=price,
                     asks=_truncate(book.asks, max_amount),
                     bids=_truncate(book.bids, max_amount),
-                    # 확인 불가(키 없음/장애)는 null 이 아니라 보수적으로 False.
-                    deposit_enabled=bool(status.deposit) if status else False,
-                    withdrawal_enabled=bool(status.withdrawal) if status else False,
+                    # 조회 자체가 실패했거나(wallet=None) 응답에 이 코인이
+                    # 없으면(status=None) **확인 불가**다 — 막힘(False)이
+                    # 아니라 None 으로 둔다. 둘을 구분할 근거가 없으므로
+                    # 한 값으로 합친다.
+                    deposit_enabled=status.deposit if status else None,
+                    withdrawal_enabled=status.withdrawal if status else None,
                     price_timestamp=book.timestamp,
                 )
             )
@@ -910,9 +917,12 @@ class CollectorService:
                     price=price,
                     asks=[[q.ask, q.ask_size or 0.0]],
                     bids=[[q.bid, q.bid_size or 0.0]],
-                    # 확인 불가(키 없음/장애)는 null 이 아니라 보수적으로 False.
-                    deposit_enabled=bool(status.deposit) if status else False,
-                    withdrawal_enabled=bool(status.withdrawal) if status else False,
+                    # 조회 자체가 실패했거나(wallet=None) 응답에 이 코인이
+                    # 없으면(status=None) **확인 불가**다 — 막힘(False)이
+                    # 아니라 None 으로 둔다. 둘을 구분할 근거가 없으므로
+                    # 한 값으로 합친다.
+                    deposit_enabled=status.deposit if status else None,
+                    withdrawal_enabled=status.withdrawal if status else None,
                     # OrderBook.timestamp 와 같은 단위(epoch ms)로 맞춘다.
                     price_timestamp=now_ts * 1000,
                 )

@@ -84,6 +84,11 @@ class SpreadService:
                 age=age,
                 liq_dom=0.0,
                 liq_fx=0.0,
+                # 호가를 못 써도 입출금 상태는 따로 안다 — 그대로 싣는다
+                dep_dom=dom_snap.deposit_enabled,
+                wd_dom=dom_snap.withdrawal_enabled,
+                dep_fx=fx_snap.deposit_enabled,
+                wd_fx=fx_snap.withdrawal_enabled,
             )
 
         # /premium 과 동일한 공식 — fwd: 해외 ask 로 사서 국내 bid 에 판다
@@ -106,6 +111,10 @@ class SpreadService:
             age=age,
             liq_dom=liq_dom,
             liq_fx=liq_fx,
+            dep_dom=dom_snap.deposit_enabled,
+            wd_dom=dom_snap.withdrawal_enabled,
+            dep_fx=fx_snap.deposit_enabled,
+            wd_fx=fx_snap.withdrawal_enabled,
         )
 
     async def build(self, session: AsyncSession) -> SpreadsResult:

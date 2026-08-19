@@ -52,8 +52,8 @@ class MatrixService:
         buy_asks_krw: list[OrderBookLevel],
         sell_bids_krw: list[OrderBookLevel],
         amount_krw: float,
-        withdrawal_available: bool,
-        deposit_available: bool,
+        withdrawal_available: bool | None,
+        deposit_available: bool | None,
     ) -> MatrixDirection | None:
         """한 방향(한 조합)의 표면 프리미엄 · 실현 수익률 · 슬리피지를 계산한다.
 

@@ -67,18 +67,20 @@ CLEANUP_DDL: list[str] = [
     "DROP TABLE IF EXISTS fx_chunks",
     "DROP TABLE IF EXISTS history_cursors",
     "DROP TABLE IF EXISTS krw_rates",
-    # 입출금 가능 여부에서 null 을 없앤다 — "확인 불가"도 False 로 통일한다.
-    # 이미 쌓인 null 을 메운 뒤 NOT NULL 을 건다 (순서를 바꾸면 실패한다).
-    "UPDATE market_snapshots SET deposit_enabled = FALSE "
-    "WHERE deposit_enabled IS NULL",
-    "UPDATE market_snapshots SET withdrawal_enabled = FALSE "
-    "WHERE withdrawal_enabled IS NULL",
+    # 입출금 가능 여부를 3-state 로 되돌린다 — "확인 불가"(null)를 "막힘"
+    # (False)과 구분하기 위해서다. 예전엔 여기서 null 을 False 로 메우고
+    # NOT NULL 을 걸었다 (커밋 4ae3847).
+    #
+    # **이 저장소에는 Alembic 이 없다.** create_all 은 "없는 것만 만들기"라
+    # 이미 있는 컬럼의 nullable 을 바꾸지 않는다. 한 번 걸린 NOT NULL 은
+    # 여기서 직접 풀지 않으면 남는다 — 그래서 마이그레이션이 DDL 로 상주한다.
+    # (이미 풀린 컬럼에 다시 걸어도 에러가 나지 않는다. 매 기동 실행해도 안전)
     "ALTER TABLE market_snapshots "
-    "ALTER COLUMN deposit_enabled SET DEFAULT FALSE, "
-    "ALTER COLUMN deposit_enabled SET NOT NULL",
+    "ALTER COLUMN deposit_enabled DROP NOT NULL, "
+    "ALTER COLUMN deposit_enabled DROP DEFAULT",
     "ALTER TABLE market_snapshots "
-    "ALTER COLUMN withdrawal_enabled SET DEFAULT FALSE, "
-    "ALTER COLUMN withdrawal_enabled SET NOT NULL",
+    "ALTER COLUMN withdrawal_enabled DROP NOT NULL, "
+    "ALTER COLUMN withdrawal_enabled DROP DEFAULT",
     # 옛 이름 정리 — 환율 테이블 fx_rate → usdkrw_rate.
     # (`fx` 는 해외 거래소를 가리키는 이름이라 환율에는 쓰지 않는다)
     # 뷰가 테이블을 참조하므로 뷰부터 지운다.

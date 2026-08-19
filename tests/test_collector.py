@@ -131,20 +131,24 @@ class TestToRows:
         assert rows[0].deposit_enabled is True
         assert rows[0].withdrawal_enabled is False
 
-    def test_missing_wallet_entry_becomes_false(self) -> None:
-        """지갑 목록에 그 코인이 없으면 null 이 아니라 보수적으로 False."""
+    def test_missing_wallet_entry_is_unknown_not_blocked(self) -> None:
+        """지갑 목록에 그 코인이 없으면 **확인 불가**(None)다 — 막힘이 아니다."""
         wallet = {"ETH": WalletStatus(deposit=True, withdrawal=True)}
         rows = self.rows({"BTC": make_book()}, {"BTC": 100.0}, wallet)
 
-        assert rows[0].deposit_enabled is False
-        assert rows[0].withdrawal_enabled is False
+        assert rows[0].deposit_enabled is None
+        assert rows[0].withdrawal_enabled is None
 
-    def test_no_wallet_data_becomes_false(self) -> None:
-        """지갑 조회 자체가 실패해도 null 을 두지 않는다."""
+    def test_no_wallet_data_is_unknown_not_blocked(self) -> None:
+        """지갑 조회 자체가 실패하면 그 거래소 행은 전부 확인 불가다.
+
+        False 로 적으면 "확인해 보니 막혔다"는 뜻이 되어, 거래소 API 장애가
+        전 코인 입출금 중단으로 둔갑한다.
+        """
         rows = self.rows({"BTC": make_book()}, {"BTC": 100.0}, None)
 
-        assert rows[0].deposit_enabled is False
-        assert rows[0].withdrawal_enabled is False
+        assert rows[0].deposit_enabled is None
+        assert rows[0].withdrawal_enabled is None
 
     def test_orderbook_is_truncated_by_max_amount(self) -> None:
         book = make_book(
@@ -238,11 +242,12 @@ class TestTopsToRows:
         assert rows[0].deposit_enabled is True
         assert rows[0].withdrawal_enabled is False
 
-    def test_missing_wallet_data_becomes_false(self) -> None:
+    def test_missing_wallet_data_is_unknown_not_blocked(self) -> None:
+        """조회 실패는 확인 불가(None) — 막힘(False)이 아니다."""
         rows = self.rows({"BTC": make_top()}, {"BTC": 100.0}, None)
 
-        assert rows[0].deposit_enabled is False
-        assert rows[0].withdrawal_enabled is False
+        assert rows[0].deposit_enabled is None
+        assert rows[0].withdrawal_enabled is None
 
 
 def dom_row(

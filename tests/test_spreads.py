@@ -151,6 +151,7 @@ class TestEndpoint:
         assert set(row) == {
             "sym", "dom", "fx", "fwd", "rev", "usd",
             "spark", "status", "age", "liqDom", "liqFx",
+            "depDom", "wdDom", "depFx", "wdFx",
         }
         assert row["status"] in ("ok", "stale", "fail")
         assert row["spark"] == []
