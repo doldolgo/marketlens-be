@@ -22,3 +22,9 @@ services:
     # .env 를 컨테이너 환경변수로 주입한다 (.dockerignore 가 이미지에서 .env 를
     # 제외하므로 이 지정이 없으면 컨테이너는 설정을 하나도 못 받는다).
     env_file: .env
+    networks:
+      - marketlens-net
+
+networks:
+  marketlens-net:
+    external: true
