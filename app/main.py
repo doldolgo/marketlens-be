@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -27,6 +28,15 @@ from app.core.config import settings
 from app.core.errors import MarketLensError
 from app.core.http import shutdown_http_client, startup_http_client
 from app.db.database import dispose_engine, init_db
+
+
+# uvicorn 은 자기 로거(uvicorn.*)만 설정한다. 이걸 넣지 않으면 app.* 로거의
+# 출력이 어디에도 나가지 않아, 수집기가 남기는 깊이 선정 결과와 실패 로그를
+# 운영 중에 볼 수 없다.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+)
 
 
 @asynccontextmanager

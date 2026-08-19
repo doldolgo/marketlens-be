@@ -6,12 +6,15 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import pytest
 
+from app.db.repository import SnapshotRow
 from app.exchanges.private.wallet_status import WalletStatus
 from app.models.bulk import BulkQuote
 from app.models.orderbook import MarketType, OrderBook, OrderBookLevel
+import app.services.collector_service as collector_module
 from app.services.collector_service import CollectorService, _truncate
 
 NOW_MS = 1_700_000_000_000
@@ -236,3 +239,178 @@ class TestTopsToRows:
 
         assert rows[0].deposit_enabled is False
         assert rows[0].withdrawal_enabled is False
+
+
+def dom_row(
+    exchange: str = "upbit",
+    base: str = "BTC",
+    *,
+    bid: float = 140_000.0,
+    deposit: bool = True,
+) -> SnapshotRow:
+    """국내 스냅샷 행 — 깊이 대상 선별에 필요한 필드만 채운다."""
+    return SnapshotRow(
+        exchange=exchange,
+        base=base,
+        native_symbol=f"KRW-{base}",
+        quote="KRW",
+        price=bid,
+        bids=[[bid, 1.0]],
+        asks=[[bid * 1.001, 1.0]],
+        deposit_enabled=deposit,
+    )
+
+
+class TestSelectDepthTargets:
+    """김프가 벌어졌고 '실제로 옮길 수 있는' 코인만 깊이를 조회한다."""
+
+    RATE = 1400.0
+
+    def setup_method(self) -> None:
+        self.service = CollectorService()
+
+    def select(self, domestic_rows, tops, wallet, rate=RATE):
+        return self.service._select_depth_targets(domestic_rows, tops, rate, wallet)
+
+    def case(self, *, fwd_percent: float, fx_wd: bool = True, dom_dep: bool = True):
+        """원하는 김프율이 나오도록 국내 매수호가를 역산해 한 코인짜리 입력을 만든다."""
+        ask = 100.0
+        dom_bid = (1 + fwd_percent / 100) * ask * self.RATE
+        return (
+            {"upbit": {"BTC": dom_row(bid=dom_bid, deposit=dom_dep)}},
+            {"BTC": make_top(ask=ask, bid=ask * 0.999)},
+            {"BTC": WalletStatus(deposit=True, withdrawal=fx_wd)},
+        )
+
+    def test_selects_coin_above_threshold(self) -> None:
+        assert self.select(*self.case(fwd_percent=2.0)) == ["BTC"]
+
+    def test_skips_premium_below_threshold(self) -> None:
+        """기본 하한 1.0% 미만이면 슬리피지를 계산할 이유가 없다."""
+        assert self.select(*self.case(fwd_percent=0.5)) == []
+
+    def test_skips_when_binance_withdrawal_closed(self) -> None:
+        """해외에서 출금이 막히면 김프가 아무리 커도 옮길 수 없다."""
+        assert self.select(*self.case(fwd_percent=10.0, fx_wd=False)) == []
+
+    def test_skips_when_domestic_deposit_closed(self) -> None:
+        """국내 입금이 막힌 경우 — 김프가 크게 벌어지는 전형적 원인이다."""
+        assert self.select(*self.case(fwd_percent=10.0, dom_dep=False)) == []
+
+    def test_caps_at_max_count_and_orders_by_premium(self) -> None:
+        """후보 20개면 상한 12개로 잘리고, 김프 높은 순이어야 한다."""
+        ask = 100.0
+        dom, tops, wallet = {"upbit": {}}, {}, {}
+        for i in range(20):
+            base = f"C{i:02d}"
+            fwd = 1.0 + i  # C19 가 가장 높다
+            dom["upbit"][base] = dom_row(base=base, bid=(1 + fwd / 100) * ask * self.RATE)
+            tops[base] = make_top(base, ask=ask, bid=ask * 0.999)
+            wallet[base] = WalletStatus(deposit=True, withdrawal=True)
+
+        out = self.select(dom, tops, wallet)
+
+        assert len(out) == 12
+        assert out == [f"C{i:02d}" for i in range(19, 7, -1)]
+
+    def test_no_rate_selects_nothing(self) -> None:
+        """환율이 없으면 김프를 계산할 수 없다 — 조용히 건너뛴다."""
+        assert self.select(*self.case(fwd_percent=10.0), rate=None) == []
+
+    def test_uses_highest_domestic_bid_across_exchanges(self) -> None:
+        """국내 여러 곳 중 가장 유리한 매도처(최고 매수호가)를 기준으로 판단한다."""
+        ask = 100.0
+        low = 1.005 * ask * self.RATE   # 0.5% — 단독이면 탈락
+        high = 1.03 * ask * self.RATE   # 3.0% — 이걸 써야 선정
+        dom = {
+            "upbit": {"BTC": dom_row("upbit", bid=low)},
+            "bithumb": {"BTC": dom_row("bithumb", bid=high)},
+        }
+        tops = {"BTC": make_top(ask=ask, bid=ask * 0.999)}
+        wallet = {"BTC": WalletStatus(deposit=True, withdrawal=True)}
+
+        assert self.select(dom, tops, wallet) == ["BTC"]
+
+
+class TestApplyDepth:
+    """선정된 코인만 깊은 호가로 덮어쓴다. 실패는 기록하되 수집을 막지 않는다."""
+
+    def setup_method(self) -> None:
+        self.service = CollectorService()
+
+    def binance_row(self) -> SnapshotRow:
+        """일괄 조회가 만든 1단계짜리 행."""
+        return SnapshotRow(
+            exchange="binance",
+            base="BTC",
+            native_symbol="BTCUSDT",
+            quote="USDT",
+            price=100.0,
+            asks=[[101.0, 1.0]],
+            bids=[[99.0, 1.0]],
+        )
+
+    def patch_exchange(self, monkeypatch, fetch) -> None:
+        monkeypatch.setattr(
+            collector_module,
+            "get_exchange",
+            lambda _eid: SimpleNamespace(fetch_orderbook=fetch),
+        )
+
+    async def test_overwrites_with_truncated_depth(self, monkeypatch) -> None:
+        deep = make_book(
+            base="BTC",
+            quote="USDT",
+            exchange="binance",
+            asks=levels((101.0, 1.0), (102.0, 1.0), (103.0, 1.0)),
+            bids=levels((99.0, 1.0), (98.0, 1.0), (97.0, 1.0)),
+        )
+
+        async def fetch(*_a, **_kw):
+            return deep
+
+        self.patch_exchange(monkeypatch, fetch)
+        rows = {"BTC": self.binance_row()}
+        failures: list = []
+
+        # 1,000,000 KRW ÷ 환율 1400 ≈ 714 USDT → 101 원어치씩이면 전 단계를 다 담는다
+        applied = await self.service._apply_depth(["BTC"], rows, 1400.0, failures)
+
+        assert applied == 1
+        assert failures == []
+        assert rows["BTC"].asks == [[101.0, 1.0], [102.0, 1.0], [103.0, 1.0]]
+        assert rows["BTC"].bids == [[99.0, 1.0], [98.0, 1.0], [97.0, 1.0]]
+
+    async def test_failure_is_recorded_and_row_kept(self, monkeypatch) -> None:
+        """깊이를 못 받아도 일괄 조회로 얻은 최우선 호가는 살아 있어야 한다."""
+
+        async def fetch(*_a, **_kw):
+            raise RuntimeError("boom")
+
+        self.patch_exchange(monkeypatch, fetch)
+        rows = {"BTC": self.binance_row()}
+        failures: list = []
+
+        applied = await self.service._apply_depth(["BTC"], rows, 1400.0, failures)
+
+        assert applied == 0
+        assert len(failures) == 1
+        assert failures[0].sym == "BTC"
+        assert rows["BTC"].asks == [[101.0, 1.0]]
+
+    async def test_empty_book_does_not_wipe_top_of_book(self, monkeypatch) -> None:
+        empty = make_book(
+            base="BTC", quote="USDT", exchange="binance", asks=[], bids=[]
+        )
+
+        async def fetch(*_a, **_kw):
+            return empty
+
+        self.patch_exchange(monkeypatch, fetch)
+        rows = {"BTC": self.binance_row()}
+
+        applied = await self.service._apply_depth(["BTC"], rows, 1400.0, [])
+
+        assert applied == 0
+        assert rows["BTC"].asks == [[101.0, 1.0]]
+        assert rows["BTC"].bids == [[99.0, 1.0]]

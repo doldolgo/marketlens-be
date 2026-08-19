@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -53,7 +54,10 @@ from app.models.refresh import (
     RefreshResult,
     UsdKrwRateInfo,
 )
+from app.models.symbol import Symbol
 
+
+logger = logging.getLogger(__name__)
 
 #: 거래소 ID → 입출금 상태 조회 함수
 _WALLET_FETCHERS = {
@@ -139,6 +143,7 @@ class CollectorService:
             self._binance_market(domestic_bases, failures),
             self._binance_futures_count(warnings),
         )
+        binance_tops = binance_result[1]
 
         # 3단계 — DB 행 조립. 아직 저장하지 않는다.
         #
@@ -189,6 +194,29 @@ class CollectorService:
                     saved=len(rows),
                     wallet_status_available=wallet is not None,
                 )
+            )
+
+        # 3.5단계 — 깊이 선별 조회.
+        #
+        # 바이낸스 일괄 조회는 최우선 1단계만 준다. 슬리피지 계산이 필요한
+        # 코인 — 김프가 벌어졌고 실제로 옮길 수 있는 코인 — 에 한해서만
+        # 심볼별 depth 를 추가로 받아 그 행의 호가를 덮어쓴다.
+        # 평상시 대상은 0~2개이므로 대부분의 사이클은 이 단계를 건너뛴다.
+        depth_targets = self._select_depth_targets(
+            {eid: rows_by_exchange.get(eid, {}) for eid in domestic_ids},
+            binance_tops,
+            usdkrw_rate_value,
+            wallets.get("binance"),
+        )
+        logger.info(
+            "깊이 조회 대상 %d개: %s", len(depth_targets), depth_targets or "-"
+        )
+        if depth_targets:
+            await self._apply_depth(
+                depth_targets,
+                rows_by_exchange.get("binance", {}),
+                usdkrw_rate_value,
+                failures,
             )
 
         # 4단계 — 교집합 / 합집합.
@@ -494,6 +522,119 @@ class CollectorService:
         # (lasts 는 좁히지 않는다. 상장 마켓 수 집계에 전종목 수가 필요하다)
         books = {b: q for b, q in tops.items() if b in domestic_bases}
         return "binance", books, lasts
+
+    def _select_depth_targets(
+        self,
+        domestic_rows: dict[str, dict[str, SnapshotRow]],
+        tops: dict[str, BulkQuote],
+        rate: float | None,
+        wallet_binance: dict[str, WalletStatus] | None,
+    ) -> list[str]:
+        """김프가 벌어졌고 실제로 옮길 수 있는 코인만 고른다.
+
+        김프 공식은 spread_service.py 의 fwd 와 동일하게 맞춘다:
+            fwd = (국내_bid / (해외_ask * 환율) - 1) * 100
+
+        입출금이 막힌 코인은 제외한다 — 옮길 수 없으면 슬리피지를 계산할 의미가
+        없고, 실제로 김프가 크게 벌어진 코인은 대부분 입금이 막혀서 벌어진다.
+        """
+        if rate is None or rate <= 0:
+            return []
+
+        cands: list[tuple[float, str]] = []
+        for base, q in tops.items():
+            if q.ask is None or q.ask <= 0:
+                continue
+            # 국내 여러 거래소 중 가장 높은 매수호가를 쓴다 (가장 유리한 매도처)
+            dom_bid = max(
+                (
+                    r.bids[0][0]
+                    for r in (rows.get(base) for rows in domestic_rows.values())
+                    if r and r.bids
+                ),
+                default=None,
+            )
+            if dom_bid is None:
+                continue
+
+            fwd = (dom_bid / (q.ask * rate) - 1) * 100
+            if fwd < settings.depth_watch_min_percent:
+                continue
+
+            # 해외 출금 + 국내 입금이 둘 다 되어야 실제로 옮길 수 있다
+            fx_status = wallet_binance.get(base) if wallet_binance else None
+            if not (fx_status and fx_status.withdrawal):
+                continue
+            dom_ok = any(
+                (r is not None and r.deposit_enabled)
+                for r in (rows.get(base) for rows in domestic_rows.values())
+            )
+            if not dom_ok:
+                continue
+
+            cands.append((fwd, base))
+
+        cands.sort(reverse=True)
+        return [b for _, b in cands[: settings.depth_watch_max_count]]
+
+    async def _apply_depth(
+        self,
+        bases: list[str],
+        binance_rows: dict[str, SnapshotRow],
+        usdkrw_rate: float | None,
+        failures: list[RefreshFailure],
+    ) -> int:
+        """선정된 코인의 바이낸스 깊이를 받아 1단계 호가를 덮어쓴다.
+
+        개별 실패는 기록만 하고 수집 전체는 계속한다 — 깊이는 부가 정보라
+        하나 못 받았다고 이번 회차를 통째로 버릴 이유가 없다.
+        """
+        exchange = get_exchange("binance")
+        # 바이낸스 호가는 USDT 기준이므로 자르는 기준 금액도 환산한다.
+        max_amount = self._usdt_amount(settings.orderbook_max_amount_krw, usdkrw_rate)
+
+        async def one(base: str) -> tuple[str, OrderBook] | None:
+            try:
+                book = await exchange.fetch_orderbook(
+                    Symbol(base=base, quote=settings.overseas_quote),
+                    depth=settings.binance_orderbook_depth,
+                    market_type=MarketType.SPOT,
+                )
+            except MarketLensError as exc:
+                failures.append(
+                    RefreshFailure(
+                        exchange="binance",
+                        sym=base,
+                        error_code=exc.code,
+                        message=exc.message,
+                    )
+                )
+                return None
+            except Exception as exc:  # noqa: BLE001 — 깊이 실패가 수집을 죽이면 안 된다
+                failures.append(
+                    RefreshFailure(
+                        exchange="binance",
+                        sym=base,
+                        error_code="unexpected_error",
+                        message=f"{type(exc).__name__}: {exc}",
+                    )
+                )
+                return None
+            return base, book
+
+        applied = 0
+        for result in await asyncio.gather(*(one(b) for b in bases)):
+            if result is None:
+                continue
+            base, book = result
+            row = binance_rows.get(base)
+            # 빈 호가로 덮어쓰면 최우선 호가마저 잃는다 — 받은 게 있을 때만 교체.
+            if row is None or not book.asks or not book.bids:
+                continue
+            row.asks = _truncate(book.asks, max_amount)
+            row.bids = _truncate(book.bids, max_amount)
+            applied += 1
+        return applied
 
     async def _binance_futures_count(self, warnings: list[str]) -> int | None:
         """바이낸스 USDT 선물의 상장 마켓 수 (일괄 조회 1회).
