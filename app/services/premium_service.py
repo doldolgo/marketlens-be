@@ -34,7 +34,6 @@ from app.core.errors import (
     UnsupportedExchangeError,
 )
 from app.db import repository
-from app.db.models import MarketSnapshot, UsdKrwRate
 from app.exchanges.registry import domestic_exchange_ids, get_exchange
 from app.models.premium import (
     PremiumDirection,
@@ -43,6 +42,14 @@ from app.models.premium import (
     PremiumResult,
 )
 from app.models.ticker import PriceSide
+from app.services.live_store import (
+    AnyRate,
+    AnySnapshot,
+    require_snapshot_or_db,
+    require_usdkrw_rate_or_db,
+    snapshot_or_db,
+    snapshots_or_db,
+)
 
 def resolve_side(*, is_buy: bool) -> PriceSide:
     """매수/매도 여부로 어느 호가를 집을지 결정한다.
@@ -52,7 +59,7 @@ def resolve_side(*, is_buy: bool) -> PriceSide:
     return PriceSide.ASK if is_buy else PriceSide.BID
 
 
-def snapshot_price(snap: MarketSnapshot, side: PriceSide) -> float | None:
+def snapshot_price(snap: AnySnapshot, side: PriceSide) -> float | None:
     """스냅샷에서 ``side`` 에 해당하는 최우선 호가를 꺼낸다. 없으면 None."""
     if side is PriceSide.BID:
         bids = repository.levels_from_json(snap.bids)
@@ -61,13 +68,13 @@ def snapshot_price(snap: MarketSnapshot, side: PriceSide) -> float | None:
     return asks[0].price if asks else None
 
 
-async def resolve_usdkrw_rate(session: AsyncSession) -> UsdKrwRate:
-    """통일 환율(하나은행 고시 USD/KRW 매매기준율)을 DB 에서 가져온다.
+async def resolve_usdkrw_rate(session: AsyncSession) -> AnyRate:
+    """통일 환율(하나은행 고시 USD/KRW 매매기준율)을 가져온다.
 
     거래소별 환율 개념이 없어졌으므로 어떤 계산이든 이 한 값을 쓴다.
     없으면(수집 전) 404 성격의 도메인 예외를 던진다.
     """
-    return await repository.require_usdkrw_rate(session)
+    return await require_usdkrw_rate_or_db(session)
 
 
 def exchange_name(exchange_id: str) -> str:
@@ -83,7 +90,7 @@ def _epoch_ms(dt: datetime | None) -> int | None:
 
 
 class PremiumService:
-    """국내 가격과 해외 가격의 방향별 괴리를 계산한다. 데이터는 전부 DB."""
+    """국내 가격과 해외 가격의 방향별 괴리를 계산한다. 데이터는 전부 메모리."""
 
     def resolve_domestic(self, domestic: str | None) -> str:
         """국내 기준 거래소를 결정한다.
@@ -110,14 +117,14 @@ class PremiumService:
         exchanges: list[str] | None,
         domestic_id: str,
         failures: list[PremiumFailure],
-    ) -> list[MarketSnapshot]:
+    ) -> list[AnySnapshot]:
         """비교 대상 해외(USDT) 스냅샷을 모은다.
 
-        ``exchanges`` 생략 시 DB 에 있는 USDT 스냅샷 전체 (국내 기준 거래소 제외).
+        ``exchanges`` 생략 시 있는 USDT 스냅샷 전체 (국내 기준 거래소 제외).
         명시했다면 거래소 ID 를 검증하고, 스냅샷이 없는 곳은 failures 에 기록한다.
         """
         if exchanges is None:
-            snaps = await repository.get_snapshots(session, base=base)
+            snaps = await snapshots_or_db(session, base=base)
             return [
                 s
                 for s in snaps
@@ -125,11 +132,11 @@ class PremiumService:
             ]
 
         symbol_str = f"{base.upper()}/{settings.overseas_quote}"
-        found: list[MarketSnapshot] = []
+        found: list[AnySnapshot] = []
         for exchange_id in exchanges:
             # 등록되지 않은 거래소 ID 는 여기서 404 로 걸러진다.
             eid = get_exchange(exchange_id).id
-            snap = await repository.get_snapshot(session, eid, base)
+            snap = await snapshot_or_db(session, eid, base)
             if snap is None or snap.quote != settings.overseas_quote:
                 failures.append(
                     PremiumFailure(
@@ -149,7 +156,7 @@ class PremiumService:
 
     def _build_entry(
         self,
-        snap: MarketSnapshot,
+        snap: AnySnapshot,
         overseas_price: float,
         domestic_price: float,
         usd_krw_rate: float,
@@ -214,7 +221,7 @@ class PremiumService:
         started = time.perf_counter()
         domestic_id = self.resolve_domestic(domestic)
 
-        dom_snap = await repository.require_snapshot(session, domestic_id, base)
+        dom_snap = await require_snapshot_or_db(session, domestic_id, base)
         if dom_snap.quote != settings.krw_reference_quote:
             raise MarketDataNotFoundError(
                 f"DB 에 {domestic_id} 거래소의 {base.upper()} "
@@ -247,7 +254,7 @@ class PremiumService:
             )
 
         entries: list[PremiumEntry] = []
-        used: list[MarketSnapshot] = [dom_snap]
+        used: list[AnySnapshot] = [dom_snap]
 
         for snap in sorted(overseas_snaps, key=lambda s: s.exchange):
             price = snapshot_price(snap, overseas_side)

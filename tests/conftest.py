@@ -1,15 +1,24 @@
 """공용 테스트 픽스처 — in-memory SQLite + FastAPI 세션 주입.
 
-네트워크 호출은 어디에도 없다. 조회 API 는 전부 DB 만 읽으므로,
-시나리오 데이터를 SQLite 에 심어두고 서비스/라우트를 **실제 코드**로 태운다.
+네트워크 호출은 어디에도 없다. 조회 API 는 메모리 아니면 DB 만 읽으므로,
+시나리오 데이터를 심어두고 서비스/라우트를 **실제 코드**로 태운다.
 
 - ``engine`` / ``db``     : in-memory SQLite (StaticPool 로 커넥션 하나를 공유)
 - ``client``              : httpx.ASGITransport + dependency_overrides[get_session]
                             (lifespan 을 돌리지 않으므로 실제 DB 접속 시도가 없다)
 - ``seed_standard``       : 국내 2곳(업비트·빗썸) + 바이낸스 + 통일 환율 표준 시나리오
+- ``seed_live_store``     : 같은 시나리오를 **메모리**(live_store)에 심는다
+
+조회 API 는 메모리(live_store)를 먼저 보고, 비어 있으면 DB 로 폴백한다.
+``_reset_live_store`` 가 매 테스트 전후로 메모리를 비우므로, 아무것도 하지
+않은 테스트는 **DB 폴백 경로**를 검증한다. ``seed_live_store`` 를 함께 쓰면
+같은 데이터로 **메모리 경로**를 검증한다.
 """
 
 from __future__ import annotations
+
+import time
+from datetime import datetime, timezone
 
 import httpx
 import pytest
@@ -20,8 +29,22 @@ from app.core.config import settings
 from app.db import repository
 from app.db.models import Base
 from app.db.repository import SnapshotRow
+from app.services.live_store import LiveRate, LiveSnapshot, live_store
 
 NOW_MS = 1_700_000_000_000
+
+
+@pytest.fixture(autouse=True)
+def _reset_live_store():
+    """메모리 저장소는 프로세스 싱글턴이라 테스트 사이로 새어 나간다.
+
+    수집기 테스트가 채워둔 값이 다음 테스트의 조회 결과를 바꾸지 않도록
+    앞뒤로 비운다. 기본 상태가 "비어 있음"이므로 손대지 않은 테스트는
+    자연히 DB 폴백 경로를 탄다.
+    """
+    live_store.clear()
+    yield
+    live_store.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -214,6 +237,59 @@ async def client(session_factory):
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
     app.dependency_overrides.pop(get_session, None)
+
+
+def live_snapshot(
+    row: SnapshotRow, *, updated_at: datetime | None = None
+) -> LiveSnapshot:
+    """DB 시드용 SnapshotRow 를 그대로 메모리 스냅샷으로 옮긴다."""
+    return LiveSnapshot(
+        exchange=row.exchange,
+        base=row.base,
+        native_symbol=row.native_symbol,
+        quote=row.quote,
+        price=row.price,
+        asks=row.asks,
+        bids=row.bids,
+        deposit_enabled=row.deposit_enabled,
+        withdrawal_enabled=row.withdrawal_enabled,
+        price_timestamp=row.price_timestamp,
+        updated_at=updated_at or datetime.now(timezone.utc),
+    )
+
+
+def seed_live_standard(rate: float = FX_RATE) -> float:
+    """seed_standard 와 **같은 시세**를 메모리에 심는다.
+
+    DB 폴백 경로와 메모리 경로가 같은 결과를 내는지 대조하는 데 쓴다.
+
+    Returns:
+        메모리에 심은 시각 (epoch 초) — data_received_at 대조용.
+    """
+    rows = [
+        *(snapshot_row("upbit", b, p) for b, p in UPBIT_PRICES.items()),
+        *(
+            snapshot_row("bithumb", b, p, deposit=False, withdrawal=False)
+            for b, p in BITHUMB_PRICES.items()
+        ),
+        *(
+            snapshot_row("binance", b, p, quote="USDT", krw_factor=rate)
+            for b, p in BINANCE_PRICES.items()
+        ),
+    ]
+    received_at = time.time()
+    live_store.replace(
+        [live_snapshot(r) for r in rows],
+        LiveRate(rate=rate, source_time=NOW_MS // 1000, round_no=100),
+        received_at,
+    )
+    return received_at
+
+
+@pytest.fixture
+def seed_live_store():
+    """표준 시나리오를 메모리에 심는다 (조회가 DB 대신 메모리를 보게 된다)."""
+    return seed_live_standard()
 
 
 @pytest.fixture

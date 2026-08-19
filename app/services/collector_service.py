@@ -1,7 +1,8 @@
-"""수집기 — 거래소 API 를 호출해 DB 를 갱신하는 유일한 곳.
+"""수집기 — 거래소 API 를 호출해 메모리와 DB 를 갱신하는 유일한 곳.
 
 ``POST /refresh`` 가 이 서비스를 부른다. 그 외의 모든 조회 API 는 거래소를
-직접 부르지 않고 여기서 저장한 DB 를 읽는다.
+직접 부르지 않고, 여기서 :mod:`app.services.live_store` 에 올려둔 메모리
+스냅샷을 읽는다 (재기동 직후 첫 사이클 전에는 DB 로 폴백한다).
 
 수집 대상
     1. 국내 거래소(업비트·빗썸)의 **KRW 전종목** — 현재가 + 호가 깊이
@@ -9,7 +10,9 @@
     3. 각 거래소의 **입출금 가능 여부** (업비트·바이낸스는 API 키 필요, 빗썸은 public)
     4. **환율** — 하나은행 고시 USD/KRW 매매기준율 (모든 원화 환산 통일)
 
-저장은 세 갈래다.
+저장은 네 갈래다.
+    - ``live_store`` (프로세스 메모리) — 조회 API 가 읽는 최신 시세.
+      사이클마다 **통째로 교체**한다.
     - ``market_snapshots`` — 코인을 찾아 **UPSERT 만** 한다 (삭제 없음).
       실시간 스프레드 창의 데이터.
     - ``premium_archive`` — 방금 갱신한 스냅샷에서 코인·시각·김프·역프만
@@ -27,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import datetime, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -55,6 +59,7 @@ from app.models.refresh import (
     UsdKrwRateInfo,
 )
 from app.models.symbol import Symbol
+from app.services.live_store import LiveRate, LiveSnapshot, live_store
 
 
 logger = logging.getLogger(__name__)
@@ -257,6 +262,47 @@ class CollectorService:
         overseas_union: set[str] = set(rows_by_exchange.get("binance", {}))
 
         intersection = domestic_union & overseas_union
+
+        # 4.5단계 — **메모리 적재**. 조회 API 가 읽는 진실은 여기다.
+        #
+        # 3.5단계(깊이 선별 조회)가 끝나 호가가 확정된 **뒤**에 넣는다 — 그
+        # 전에 넣으면 깊이가 반영 안 된 1단계짜리 호가가 노출된다.
+        # 담는 범위는 DB 와 같은 **교집합**이다. 한쪽 시장에만 남은 코인은
+        # 김프를 계산할 수 없어 실시간 창에 띄우지 않는다 (아래 5단계에서
+        # DB 에서도 지운다). 통째로 교체하므로 상폐 코인은 별도 삭제 로직
+        # 없이 자동으로 빠진다.
+        received_at = time.time()
+        live_now = datetime.now(timezone.utc)
+        live_snapshots = [
+            LiveSnapshot(
+                exchange=r.exchange,
+                base=r.base,
+                native_symbol=r.native_symbol,
+                quote=r.quote,
+                price=r.price,
+                asks=r.asks,
+                bids=r.bids,
+                deposit_enabled=r.deposit_enabled,
+                withdrawal_enabled=r.withdrawal_enabled,
+                price_timestamp=r.price_timestamp,
+                updated_at=live_now,
+            )
+            for rows in rows_by_exchange.values()
+            for base, r in rows.items()
+            if base in intersection
+        ]
+        # 이번에 환율을 못 받았으면 None 을 넘겨 직전 값을 유지한다.
+        live_rate = (
+            LiveRate(
+                rate=float(usdkrw_observation.rate),
+                source_time=usdkrw_observation.ts,
+                round_no=usdkrw_observation.round_no,
+                updated_at=live_now,
+            )
+            if usdkrw_observation is not None
+            else None
+        )
+        live_store.replace(live_snapshots, live_rate, received_at)
 
         # 5단계 — 짝을 잃은 코인 정리.
         #
