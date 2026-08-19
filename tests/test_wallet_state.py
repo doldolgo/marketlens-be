@@ -239,3 +239,56 @@ class TestRestartResilience:
             assert any(
                 f"ALTER COLUMN {col} DROP NOT NULL" in d for d in flat
             ), f"{col} 의 NOT NULL 을 푸는 DDL 이 없다"
+
+
+class TestSpreadsCarriesThreeStates:
+    """수집 → 저장 → ``GET /spreads`` 까지 세 상태가 살아 있는가.
+
+    화면이 mock 을 쓸 수밖에 없던 이유가 이 필드의 부재였다. 메모리 경로와
+    DB 폴백 **양쪽 다** 확인한다 — 한쪽만 맞으면 재기동 전후로 화면이 달라진다.
+    """
+
+    #: 국내는 입금 확인 불가 · 출금 열림 / 해외는 입금 막힘 · 출금 확인 불가
+    EXPECTED = {"depDom": None, "wdDom": True, "depFx": False, "wdFx": None}
+
+    @staticmethod
+    def _rows():
+        return [
+            snapshot_row(
+                "upbit", "BTC", 100_000_000.0, deposit=None, withdrawal=True
+            ),
+            snapshot_row(
+                "binance",
+                "BTC",
+                50_000.0,
+                quote="USDT",
+                krw_factor=FX_RATE,
+                deposit=False,
+                withdrawal=None,
+            ),
+        ]
+
+    async def test_db_path(self, client, db) -> None:
+        dom, fx = self._rows()
+        await seed_rows(db, "upbit", [dom])
+        await seed_rows(db, "binance", [fx])
+        await seed_usdkrw_rate(db)
+
+        row = (await client.get("/spreads")).json()["rows"][0]
+        assert {k: row[k] for k in self.EXPECTED} == self.EXPECTED
+
+    async def test_memory_path(self, client, db) -> None:
+        import time as _time
+
+        from conftest import NOW_MS, live_snapshot
+
+        from app.services.live_store import LiveRate
+
+        live_store.replace(
+            [live_snapshot(r) for r in self._rows()],
+            LiveRate(rate=FX_RATE, source_time=NOW_MS // 1000, round_no=100),
+            _time.time(),
+        )
+
+        row = (await client.get("/spreads")).json()["rows"][0]
+        assert {k: row[k] for k in self.EXPECTED} == self.EXPECTED
