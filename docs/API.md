@@ -215,7 +215,7 @@ Adminer (http://localhost:8080): 시스템 `PostgreSQL`, 서버 `db`,
 | `GET /matrix` | **전 코인 매트릭스** — 코인별 최대 김프·최대 역프 | 금액 1개 | 코인별 최적 조합 + 실현 수익률 + 입출금 가능 여부 |
 | `GET /arbitrage` | **N원 넣으면 실제로 얼마 남나** | 코인, 금액, 통화, 방향 | 매수/매도처, 슬리피지, 실수익 |
 | `GET /history/premium` | **김프/역프 기록** — 몇 초 뒤에 얼마로 바뀌었나 | 코인, 페어, 주/월 | dt·fwd·rev 기록 열 |
-| `GET /history/status` | **플랫폼 상태** — 마지막 수신·마켓 수·입출금 실패율 | 없음 | 플랫폼별 카운터 |
+| `GET /history/status` | **플랫폼 상태** — 마지막 수신·마켓 수·입출금 **조회** 실패율 | 없음 | 플랫폼별 카운터 |
 
 ### 조회 가능한 데이터 범위
 
@@ -1385,7 +1385,7 @@ curl "http://localhost:8000/arbitrage?sym=XRP&amount=5000&currency=USDT&exchange
 | 엔드포인트 | 무엇을 하나 |
 |---|---|
 | `GET /history/premium?base=&unit=week\|month&date=&dom=&fx=&offset=&limit=` | 김프/역프 기록 — 각 항목은 `dt`(직전 기록에서 몇 초 뒤)·`fwd`(김프 %)·`rev`(역프 %) |
-| `GET /history/status` | 플랫폼별 마지막 수신 시각·상장 마켓 수(현물/선물)·입출금 실패율 |
+| `GET /history/status` | 플랫폼별 마지막 수신 시각·상장 마켓 수(현물/선물)·입출금 **조회** 실패율 |
 
 ```bash
 curl "http://localhost:8000/history/premium?base=BTC&unit=week&limit=20"

@@ -138,11 +138,18 @@ class PlatformStatusEntry(BaseModel):
     spot_market_count: int = Field(..., description="상장 현물 마켓 수")
     futures_market_count: int = Field(..., description="상장 선물 마켓 수 (없으면 0)")
     dw_fail_count: int = Field(
-        ..., description="입출금 불가가 관측된 업데이트 횟수"
+        ...,
+        description=(
+            "입출금 상태를 **못 받아온** 업데이트 횟수. 막힌 코인 수가 "
+            "아니라 조회 실패 횟수다"
+        ),
     )
     update_count: int = Field(..., description="전체 업데이트 횟수")
     dw_fail_rate: float = Field(
-        ..., description="입출금 실패율 = dw_fail_count / update_count (0~1)"
+        ...,
+        description=(
+            "입출금 **조회** 실패율 = dw_fail_count / update_count (0~1)"
+        ),
     )
     dw_fail_windows: list[DwFailWindow] = Field(
         ...,
@@ -337,10 +344,14 @@ async def premium_history(
     summary="플랫폼별 수신 상태·입출금 실패율",
     description=(
         "플랫폼(거래소)당 한 행 — 마지막 수신 시각, 상장 마켓 수(현물/선물), "
-        "입출금 실패 횟수와 전체 업데이트 횟수.\n\n"
+        "입출금 **조회** 실패 횟수와 전체 업데이트 횟수.\n\n"
         "`POST /refresh` 가 market_snapshots 를 업데이트할 때마다 함께 갱신된다: "
-        "전체 업데이트 횟수 +1, 그 회차에 입금 또는 출금 불가 코인이 하나라도 "
-        "있었으면 실패 횟수 +1. `dw_fail_rate` = 실패 횟수 ÷ 전체 횟수.\n\n"
+        "전체 업데이트 횟수 +1, 그 회차에 입출금 상태를 **못 받아온** 코인이 "
+        "하나라도 있었으면 실패 횟수 +1. `dw_fail_rate` = 실패 횟수 ÷ 전체 "
+        "횟수.\n\n"
+        "**막힌 코인 수를 세는 지표가 아니다.** 코인이 막혀 있는 것은 정상적인 "
+        "관측 결과이고, 그걸 실패로 세면 코인이 늘수록 비율이 1.0 에 수렴해 "
+        "지표가 죽는다.\n\n"
         "`dw_fail_windows` 는 최근 24시간(`retention_seconds`) 안에서 실패가 "
         "**언제부터 언제까지** 이어졌는지의 구간 목록이다 — 실패 횟수가 +1 될 때 "
         "같이 기록된 시각들을, `max_gap` 초 이내로 이어지는 것끼리 묶은 것이다. "

@@ -292,3 +292,65 @@ class TestSpreadsCarriesThreeStates:
 
         row = (await client.get("/spreads")).json()["rows"][0]
         assert {k: row[k] for k in self.EXPECTED} == self.EXPECTED
+
+
+class TestFailureMetricCountsQueryFailures:
+    """``dw_fail_*`` 은 "막힌 코인"이 아니라 "조회 실패"를 센다.
+
+    예전 정의는 "입출금 불가 코인이 하나라도 있으면 실패"였다. 코인이 300개면
+    그중 하나는 늘 막혀 있어 비율이 항상 1.000 이었다 — 실제로 세 거래소 모두
+    1686/1686 이었다. 코인이 늘수록 1.0 에 수렴하는 지표는 아무것도 말해주지
+    않는다.
+    """
+
+    async def _dw_failed(self, db, monkeypatch, wallet_status=None, fails=False):
+        service = CollectorService()
+        await refresh_once(
+            service,
+            db,
+            monkeypatch,
+            domestic_bases=["BTC", "ETH"],
+            binance_bases=["BTC", "ETH"],
+            wallet_status=wallet_status,
+            wallet_fails=fails,
+        )
+        return service._pending.dw_failed
+
+    async def test_blocked_coin_is_not_a_failure(self, db, monkeypatch) -> None:
+        """막힌 코인이 있는 것은 **정상적인 관측 결과**다."""
+        failed = await self._dw_failed(
+            db,
+            monkeypatch,
+            wallet_status={
+                "BTC": WalletStatus(deposit=False, withdrawal=False),
+                "ETH": WalletStatus(deposit=True, withdrawal=True),
+            },
+        )
+        assert failed["upbit"] is False, "막혔다고 조회가 실패한 것은 아니다"
+
+    async def test_unknown_state_is_a_failure(self, db, monkeypatch) -> None:
+        """상태를 못 받아온 회차만 실패로 센다."""
+        failed = await self._dw_failed(db, monkeypatch, fails=True)
+        assert failed["upbit"] is True
+
+    async def test_all_open_is_not_a_failure(self, db, monkeypatch) -> None:
+        failed = await self._dw_failed(db, monkeypatch)
+        assert failed["upbit"] is False
+
+    async def test_rate_is_not_pinned_at_one(self, db) -> None:
+        """실패·성공이 섞이면 비율이 0 과 1 사이에 놓인다 (지표가 살아 있다)."""
+        for failed in (False, True, False, False):
+            await repository.bump_platform_status(
+                db,
+                exchange="upbit",
+                received_ts=1_700_000_000,
+                spot_market_count=200,
+                futures_market_count=0,
+                dw_failed=failed,
+            )
+        await db.commit()
+
+        row = (await repository.get_platform_statuses(db))[0]
+        assert row.update_count == 4
+        assert row.dw_fail_count == 1
+        assert 0.0 < row.dw_fail_count / row.update_count < 1.0

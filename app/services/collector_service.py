@@ -351,7 +351,11 @@ class CollectorService:
                     )
                 )
                 saved_by_exchange[eid] += 1
-                if not (r.deposit_enabled and r.withdrawal_enabled):
+                # **조회 실패**만 센다 — 막힌 코인이 있는 것은 실패가 아니라
+                # 정상적인 관측 결과다. 예전엔 "불가 코인이 하나라도 있으면"
+                # 이라 코인이 300개면 사실상 매 회차 참이었고, 비율이 항상
+                # 1.000 에 붙어 지표로 죽어 있었다.
+                if r.deposit_enabled is None or r.withdrawal_enabled is None:
                     dw_failed_by_exchange[eid] = True
         # 이번에 환율을 못 받았으면 None 을 넘겨 직전 값을 유지한다.
         live_rate = (
