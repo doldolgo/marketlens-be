@@ -44,16 +44,13 @@ logger = logging.getLogger(__name__)
 
 
 async def _collect_loop() -> None:
-    """수집 사이클을 앱 안에서 돌린다.
+    """수집 사이클을 앱 안에서 돌린다 (거래소 → 메모리).
 
     crontab 은 최소 단위가 1분이라 1초 주기를 만들 수 없다. 게다가 기존 방식
     (``curl ... > /dev/null``)은 실패를 전부 버려서, 실제로 8시간 결측이
     났는데도 아무도 알지 못했다.
 
-    ⚠️ 이 루프는 **프로세스 안**에 있다. uvicorn 을 ``--workers 2`` 이상으로
-    띄우면 워커마다 루프가 돌아 중복 수집이 된다. 현재 Dockerfile 은 워커
-    옵션이 없어 단일 프로세스이므로 안전하다 — 워커를 늘릴 거라면 수집을
-    별도 프로세스로 떼거나 프로세스 간 락을 둬야 한다.
+    DB 쓰기는 여기 없다 — :func:`_persist_loop` 이 따로 담당한다.
     """
     backoff = 1.0
     consecutive_failures = 0
@@ -77,20 +74,70 @@ async def _collect_loop() -> None:
         await asyncio.sleep(settings.collect_interval_seconds)
 
 
+async def _persist_loop() -> None:
+    """메모리의 현재 시세를 주기적으로 DB 에 내린다 (메모리 → DB).
+
+    수집 사이클과 분리한 이유 — DB 쓰기가 사이클 시간의 85%(2.6초 중 2.2초)를
+    차지했는데, 조회가 더 이상 DB 를 보지 않으므로 사이클이 이걸 기다릴 이유가
+    없다. DB 는 이제 기록(premium_archive)과 **재기동 직후 폴백**을 위해 남는다.
+
+    수집보다 **먼저 자지 않는다** — 기동 직후에는 메모리가 비어 있어 쓸 것이
+    없으므로 한 주기 대기하고 시작한다.
+    """
+    backoff = 1.0
+    consecutive_failures = 0
+    while True:
+        await asyncio.sleep(settings.persist_interval_seconds)
+        try:
+            async with get_session_factory()() as session:
+                result = await collector_service.persist(session)
+            logger.info(
+                "DB 저장 — 스냅샷 %d행 · 아카이브 %d행 · 삭제 %d행 (%.0fms)",
+                result.saved,
+                result.archived,
+                result.deleted,
+                result.elapsed_ms,
+            )
+            backoff = 1.0
+            consecutive_failures = 0
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            consecutive_failures += 1
+            logger.exception("DB 저장 실패 (연속 %d회)", consecutive_failures)
+            # DB 장애가 길어질 때 같은 실패를 주기마다 반복하지 않는다.
+            backoff = min(backoff * 2, 60.0)
+            await asyncio.sleep(backoff)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """앱 수명 동안 백그라운드 루프 **두 개**를 함께 띄운다.
+
+    ⚠️ 두 루프 모두 **프로세스 안**에 있다. uvicorn 을 ``--workers 2`` 이상으로
+    띄우면 워커마다 수집 루프가 돌아 중복 수집이 되고, 저장 루프까지 겹쳐
+    같은 행을 서로 다른 순서로 UPSERT/DELETE 하게 된다 (``_refresh_lock`` 은
+    프로세스 안에서만 유효하다). 현재 Dockerfile 은 워커 옵션이 없어 단일
+    프로세스이므로 안전하다 — 워커를 늘릴 거라면 두 루프를 별도 프로세스로
+    떼거나 프로세스 간 락을 둬야 한다.
+    """
     # 공용 HTTP 커넥션 풀과 DB 엔진을 앱 수명과 함께 관리한다.
     await startup_http_client()
     await init_db()
-    collect_task = asyncio.create_task(_collect_loop())
+    tasks = [
+        asyncio.create_task(_collect_loop()),
+        asyncio.create_task(_persist_loop()),
+    ]
     try:
         yield
     finally:
-        collect_task.cancel()
-        try:
-            await collect_task
-        except asyncio.CancelledError:
-            pass
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         await shutdown_http_client()
         await dispose_engine()
 

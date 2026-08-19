@@ -46,7 +46,14 @@ class Settings(BaseSettings):
     dw_fail_retention_seconds: int = 86_400
     #: 수집 루프 주기 (초). 앱 내부 스케줄러가 이 간격으로 돈다.
     collect_interval_seconds: float = 1.0
-    #: premium_archive 적재 주기 (초). 라이브보다 느리게 돌려 적재량을 억제한다.
+    #: DB 저장 루프 주기 (초). 수집 사이클과 **분리된 별도 태스크**가 이 간격으로
+    #: 메모리의 현재 시세를 market_snapshots 에 내린다. 조회가 DB 를 보지 않으므로
+    #: 수집이 이 쓰기를 기다릴 이유가 없다.
+    persist_interval_seconds: float = 60.0
+    #: premium_archive 적재 주기 (초). 저장 루프 **안에서** 이 주기로 따로 가드한다.
+    #: persist 와 합치지 않은 이유 — 스냅샷은 행 수가 고정된 현재 상태 미러지만
+    #: 아카이브는 append 전용이라 주기가 곧 DB 증가 속도다. 신선도와 증가량은
+    #: 서로 다른 판단이므로 손잡이를 따로 둔다.
     archive_interval_seconds: float = 60.0
     #: 입출금 상태 갱신 주기 (초). 자주 바뀌지 않으므로 저빈도로 돌린다.
     wallet_refresh_seconds: float = 60.0

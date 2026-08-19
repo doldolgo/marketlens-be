@@ -421,7 +421,11 @@ class TestApplyDepth:
 
 
 class TestArchiveThrottle:
-    """premium_archive 는 라이브 수집보다 느리게 적재한다 (3-4 주기 가드)."""
+    """premium_archive 는 저장 루프 안에서 한 번 더 주기 가드를 받는다.
+
+    DB 쓰기가 수집 사이클에서 저장 루프(``persist``)로 옮겨졌으므로, 한
+    "회차" = 수집(메모리) + 저장(DB) 두 단계다.
+    """
 
     async def _archive_count(self, db) -> int:
         return (
@@ -453,15 +457,16 @@ class TestArchiveThrottle:
         monkeypatch.setattr(service, "_wallet", wallet)
         monkeypatch.setattr(service, "_usdkrw_rate", rate)
         await service.refresh(db)
+        await service.persist(db)
 
     async def test_archives_once_within_the_interval(self, db, monkeypatch) -> None:
-        """60초 안에 여러 번 수집해도 적재는 첫 회차 한 번만 일어난다."""
+        """60초 안에 여러 번 돌아도 적재는 첫 회차 한 번만 일어난다."""
         monkeypatch.setattr(settings, "archive_interval_seconds", 60.0)
         service = CollectorService()
 
         await self._refresh_once(service, db, monkeypatch)
         after_first = await self._archive_count(db)
-        assert after_first > 0, "첫 사이클은 적재해야 한다"
+        assert after_first > 0, "첫 회차는 적재해야 한다"
 
         for _ in range(3):
             await self._refresh_once(service, db, monkeypatch)

@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -64,6 +65,10 @@ from app.services.live_store import LiveRate, LiveSnapshot, live_store
 
 logger = logging.getLogger(__name__)
 
+#: 스냅샷 UPSERT 한 문장의 최대 행 수 — asyncpg 파라미터 한도(32,767개) 보호.
+#: 행당 열이 11개라 이론 상한은 2,979행이다. 현재 실측 491행.
+_UPSERT_BATCH = 2_000
+
 #: 거래소 ID → 입출금 상태 조회 함수
 _WALLET_FETCHERS = {
     "upbit": fetch_upbit_wallet_status,
@@ -92,8 +97,35 @@ def _truncate(levels: list[OrderBookLevel], max_amount: float) -> list[list[floa
     return out
 
 
+@dataclass(slots=True)
+class _PendingPersist:
+    """수집 사이클이 관측했지만 **메모리에는 안 담기는** 값들.
+
+    저장 루프가 DB 를 채우려면 스냅샷 말고도 이 값들이 필요한데, 전부 그
+    회차에만 알 수 있는 것들이다 (상장 마켓 수는 교집합 밖 코인까지 세고,
+    입출금 실패 여부는 저장 시점이 아니라 관측 시점의 사실이다).
+    """
+
+    received_ts: int
+    listed_count: dict[str, int]
+    futures_market_count: int | None
+    dw_failed: dict[str, bool]
+    usdkrw_observation: hana.UsdKrwObservation | None
+    usdkrw_rate_value: float | None
+
+
+@dataclass(slots=True)
+class PersistResult:
+    """저장 루프 한 번의 결과 (로그·테스트용 — API 응답이 아니다)."""
+
+    saved: int = 0
+    archived: int = 0
+    deleted: int = 0
+    elapsed_ms: float = 0.0
+
+
 class CollectorService:
-    """거래소 → DB 단방향 수집."""
+    """거래소 → 메모리 수집 + 메모리 → DB 저장."""
 
     def __init__(self) -> None:
         # 동시 refresh 를 직렬화한다. 두 수집이 같은 행을 서로 다른 순서로
@@ -107,11 +139,28 @@ class CollectorService:
         self._last_wallet_ts: float = 0.0
         #: 거래소 → 입출금 상태. wallet_refresh_seconds 주기로만 갱신한다.
         self._wallet_cache: dict[str, dict[str, WalletStatus] | None] = {}
+        #: 마지막 수집 사이클이 관측한, 저장 루프가 필요로 하는 값들.
+        #: 아직 한 사이클도 안 돌았으면 None — 저장 루프는 그냥 넘어간다.
+        self._pending: _PendingPersist | None = None
 
     async def refresh(self, session: AsyncSession) -> RefreshResult:
-        """모든 수집 대상을 가져와 DB 를 갱신한다. 동시 호출은 직렬화된다."""
+        """모든 수집 대상을 가져와 **메모리**를 갱신한다. 동시 호출은 직렬화된다.
+
+        DB 는 건드리지 않는다 — :meth:`persist` 가 별도 주기로 내린다.
+        ``session`` 은 환율 수집 실패 시 DB 의 마지막 값을 읽는 데만 쓴다.
+        """
         async with self._refresh_lock:
             return await self._refresh(session)
+
+    async def persist(self, session: AsyncSession) -> PersistResult:
+        """메모리의 현재 시세를 DB 에 내린다. 수집과 상호 배제된다.
+
+        같은 락을 쓰는 이유 — 수집이 메모리를 통째로 교체하는 도중에 저장이
+        읽으면 반쪽짜리 상태가 DB 에 남는다. 저장이 1분에 한 번, 수집이 1초에
+        한 번이라 락 경합은 실질적으로 없다.
+        """
+        async with self._refresh_lock:
+            return await self._persist(session)
 
     async def _refresh(self, session: AsyncSession) -> RefreshResult:
         started = time.perf_counter()
@@ -273,24 +322,33 @@ class CollectorService:
         # 없이 자동으로 빠진다.
         received_at = time.time()
         live_now = datetime.now(timezone.utc)
-        live_snapshots = [
-            LiveSnapshot(
-                exchange=r.exchange,
-                base=r.base,
-                native_symbol=r.native_symbol,
-                quote=r.quote,
-                price=r.price,
-                asks=r.asks,
-                bids=r.bids,
-                deposit_enabled=r.deposit_enabled,
-                withdrawal_enabled=r.withdrawal_enabled,
-                price_timestamp=r.price_timestamp,
-                updated_at=live_now,
-            )
-            for rows in rows_by_exchange.values()
-            for base, r in rows.items()
-            if base in intersection
-        ]
+        live_snapshots: list[LiveSnapshot] = []
+        saved_by_exchange: dict[str, int] = {eid: 0 for eid in rows_by_exchange}
+        dw_failed_by_exchange: dict[str, bool] = {
+            eid: False for eid in rows_by_exchange
+        }
+        for eid, rows in rows_by_exchange.items():
+            for base, r in rows.items():
+                if base not in intersection:
+                    continue
+                live_snapshots.append(
+                    LiveSnapshot(
+                        exchange=r.exchange,
+                        base=r.base,
+                        native_symbol=r.native_symbol,
+                        quote=r.quote,
+                        price=r.price,
+                        asks=r.asks,
+                        bids=r.bids,
+                        deposit_enabled=r.deposit_enabled,
+                        withdrawal_enabled=r.withdrawal_enabled,
+                        price_timestamp=r.price_timestamp,
+                        updated_at=live_now,
+                    )
+                )
+                saved_by_exchange[eid] += 1
+                if not (r.deposit_enabled and r.withdrawal_enabled):
+                    dw_failed_by_exchange[eid] = True
         # 이번에 환율을 못 받았으면 None 을 넘겨 직전 값을 유지한다.
         live_rate = (
             LiveRate(
@@ -304,105 +362,27 @@ class CollectorService:
         )
         live_store.replace(live_snapshots, live_rate, received_at)
 
-        # 5단계 — 짝을 잃은 코인 정리.
+        # 5단계 — 저장 루프에 넘길 관측값 기록.
         #
-        # 합집합에는 있지만 교집합에는 없는 코인 = 한쪽 시장에만 남은 코인이다.
-        # 김프를 계산할 수 없어 실시간 창에 띄울 수 없으므로, **DB 에 남아 있던
-        # 마지막 값으로 김프를 한 번 계산해 아카이브한 뒤** 스냅샷을 지운다.
-        #
-        # 합집합을 이번 회차 조회 결과로만 만들면 빠뜨리는 경우가 있다. 어제
-        # 업비트+바이낸스에 있다가 오늘 업비트에서 상폐된 코인은 국내 목록에도
-        # 없고, 바이낸스 호가도 (국내 상장분만 받으므로) 안 받아온다 — 이번
-        # 회차 어느 집합에도 안 잡히는데 DB 에는 남아 있다. 그래서 합집합의
-        # 실질은 **DB 에 행이 있는 코인 전체**로 잡는다.
-        stored_bases = await repository.list_snapshot_bases(session)
-        orphans = sorted(stored_bases - intersection)
-
-        # premium_archive 는 라이브 수집보다 훨씬 느리게 적재한다.
-        # 1초마다 쌓으면 (국내 2 × 코인 245)로 하루 4,400만 행이 되어 DB 가
-        # 버티지 못한다. archive_interval_seconds 마다 한 번만 남긴다.
-        do_archive = (
-            cycle_ts - self._last_archive_ts >= settings.archive_interval_seconds
+        # DB 쓰기는 이 사이클이 하지 않는다. 조회가 더 이상 DB 를 보지 않으므로
+        # 사이클이 쓰기를 기다릴 이유가 없다 (쓰기가 사이클 시간의 85% 였다).
+        # 스냅샷 자체는 live_store 에서 읽으면 되지만, **이번 회차에만 관측되는
+        # 값**(상장 마켓 수·선물 마켓 수·입출금 실패 여부·환율 고시)은 여기서
+        # 넘겨줘야 한다.
+        self._pending = _PendingPersist(
+            received_ts=now_ts,
+            listed_count=listed_count,
+            futures_market_count=futures_market_count,
+            dw_failed=dw_failed_by_exchange,
+            usdkrw_observation=usdkrw_observation,
+            usdkrw_rate_value=usdkrw_rate_value,
         )
-        if do_archive:
-            self._last_archive_ts = cycle_ts
-
-        archived = 0
-        deleted = 0
-        for base in orphans:
-            # 짝을 잃은 코인의 마지막 김프는 이 기회를 놓치면 영영 못 남긴다.
-            # 그래도 주기 가드를 따른다 — 스냅샷 삭제는 아래에서 항상 수행되고,
-            # 이 코인은 이미 실시간 창에서 빠진 상태다.
-            if do_archive:
-                archived += await self._archive_stored(
-                    session, base, usdkrw_rate_value, now_ts
-                )
-            deleted += await repository.delete_snapshots_by_base(session, base)
-            await session.commit()  # ← 코인 하나가 끝날 때마다 즉시 반영
-
-        # 6단계 — 교집합 갱신. **코인 하나마다 저장하고 커밋한다.**
-        #
-        # 전부 모아 마지막에 한 번 커밋하면 사이클이 끝날 때까지 조회 API 가
-        # 옛 값을 본다. 코인 단위로 끊으면 처리된 코인부터 곧바로 최신이 된다.
-        if do_archive and usdkrw_rate_value is None:
-            warnings.append(
-                "환율이 없어 이번 회차의 김프 기록(premium_archive)을 건너뜁니다."
-            )
-
-        saved_by_exchange: dict[str, int] = {eid: 0 for eid in rows_by_exchange}
-        dw_failed_by_exchange: dict[str, bool] = {
-            eid: False for eid in rows_by_exchange
-        }
-
-        for base in sorted(intersection):
-            coin_rows = [
-                rows_by_exchange[eid][base]
-                for eid in rows_by_exchange
-                if base in rows_by_exchange[eid]
-            ]
-            if not coin_rows:
-                continue
-
-            # 있으면 갱신, 없으면 새로 추가 (UPSERT).
-            await repository.upsert_snapshots(session, coin_rows)
-            for r in coin_rows:
-                saved_by_exchange[r.exchange] += 1
-                if not (r.deposit_enabled and r.withdrawal_enabled):
-                    dw_failed_by_exchange[r.exchange] = True
-
-            # 김프/역프 기록 — (국내 × 해외) 짝마다 한 줄.
-            if do_archive and usdkrw_rate_value is not None:
-                archived += await self._archive_rows(
-                    session, base, coin_rows, usdkrw_rate_value, now_ts
-                )
-
-            await session.commit()  # ← 코인 하나가 끝날 때마다 즉시 반영
-
-        # 7단계 — 거래소 단위 마무리 (플랫폼 상태 · 환율).
-        for eid in rows_by_exchange:
-            await repository.bump_platform_status(
-                session,
-                exchange=eid,
-                received_ts=now_ts,
-                spot_market_count=listed_count.get(eid, 0),
-                futures_market_count=(
-                    futures_market_count if eid == "binance" else 0
-                ),
-                dw_failed=dw_failed_by_exchange[eid],
-            )
-
-        if usdkrw_observation is not None:
-            # 라이브 환율 단일 행(usdkrw_rate) 갱신 — 역행은 UPSERT 가드가 막는다.
-            await history_service.record_usdkrw_observation(session, usdkrw_observation)
-
-        await session.commit()
 
         for stat in stats:
             stat.saved = saved_by_exchange.get(stat.exchange, 0)
 
         return RefreshResult(
             snapshots=stats,
-            deleted=deleted,
             usdkrw=(
                 UsdKrwRateInfo(
                     rate=float(usdkrw_observation.rate),
@@ -413,11 +393,123 @@ class CollectorService:
                 else None
             ),
             total_saved=sum(s.saved for s in stats),
-            archived=archived,
             failures=failures,
             warnings=warnings,
             total_calls=sum(request_counts().values()) - calls_before,
             fetched_at=int(time.time() * 1000),
+            elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
+        )
+
+    # ------------------------------------------------------------------
+    # 저장 — 메모리 → DB (수집 사이클과 분리된 별도 주기)
+    # ------------------------------------------------------------------
+
+    async def _persist(self, session: AsyncSession) -> PersistResult:
+        """메모리의 현재 시세를 DB 에 기록한다.
+
+        수집 사이클에서 떼어낸 이유는 성능이다 — DB 쓰기가 사이클 시간의 85%
+        (2.6초 중 2.2초)를 차지했는데, 조회가 더 이상 DB 를 보지 않으므로
+        사이클이 이걸 기다릴 이유가 없다. DB 는 이제 **기록과 재기동 복구용**
+        이다.
+
+        여기서는 **마지막에 한 번만 커밋한다.** 코인마다 커밋하던 이유("사이클이
+        끝날 때까지 조회 API 가 옛 값을 본다")가 사라졌기 때문이다.
+        """
+        started = time.perf_counter()
+        pending = self._pending
+        if pending is None:
+            # 아직 한 사이클도 안 돌았다 (앱 기동 직후). 쓸 것이 없다.
+            return PersistResult()
+
+        snapshots = live_store.get_snapshots()
+        rows_by_base: dict[str, list[SnapshotRow]] = {}
+        for snap in snapshots:
+            rows_by_base.setdefault(snap.base, []).append(
+                SnapshotRow(
+                    exchange=snap.exchange,
+                    base=snap.base,
+                    native_symbol=snap.native_symbol,
+                    quote=snap.quote,
+                    price=snap.price,
+                    asks=snap.asks,
+                    bids=snap.bids,
+                    deposit_enabled=snap.deposit_enabled,
+                    withdrawal_enabled=snap.withdrawal_enabled,
+                    price_timestamp=snap.price_timestamp,
+                )
+            )
+
+        # premium_archive 는 append 전용이라 주기가 곧 DB 증가 속도다.
+        # 저장 주기와 손잡이를 따로 두고 여기서 한 번 더 가드한다.
+        cycle_ts = time.monotonic()
+        do_archive = (
+            cycle_ts - self._last_archive_ts >= settings.archive_interval_seconds
+        )
+        if do_archive:
+            self._last_archive_ts = cycle_ts
+
+        now_ts = pending.received_ts
+        rate = pending.usdkrw_rate_value
+        if do_archive and rate is None:
+            logger.warning("환율이 없어 이번 회차의 김프 기록을 건너뜁니다.")
+
+        # 짝을 잃은 코인 정리 — 메모리에 없는데 DB 에 남아 있는 코인.
+        #
+        # 국내·해외 한쪽에만 남아 김프를 계산할 수 없게 된 코인이다. 지우기
+        # 전에 **DB 에 남아 있는 마지막 값**으로 김프를 한 번 아카이브한다 —
+        # 이 기회를 놓치면 상장폐지 시점의 기록이 영영 끊긴다.
+        stored_bases = await repository.list_snapshot_bases(session)
+        orphans = sorted(stored_bases - set(rows_by_base))
+        archived = 0
+        deleted = 0
+        for base in orphans:
+            if do_archive:
+                archived += await self._archive_stored(session, base, rate, now_ts)
+            deleted += await repository.delete_snapshots_by_base(session, base)
+
+        # 스냅샷 저장 — 코인마다 쪼개지 않고 한 문장으로 UPSERT 한다.
+        # (코인 단위로 끊던 이유였던 "조회가 옛 값을 본다"가 사라졌다)
+        # 다만 asyncpg 파라미터 한도(32,767개)가 있어 행 수 × 열 수로 묶는다.
+        all_rows = [row for rows in rows_by_base.values() for row in rows]
+        saved = 0
+        for i in range(0, len(all_rows), _UPSERT_BATCH):
+            saved += await repository.upsert_snapshots(
+                session, all_rows[i : i + _UPSERT_BATCH]
+            )
+
+        # 김프/역프 기록 — (국내 × 해외) 짝마다 한 줄.
+        if do_archive and rate is not None:
+            for base, coin_rows in rows_by_base.items():
+                archived += await self._archive_rows(
+                    session, base, coin_rows, rate, now_ts
+                )
+
+        # 플랫폼 상태 — 카운터가 저장 주기로 올라간다. 실패율은
+        # dw_fail_count / update_count 라 둘 다 같은 주기면 비율은 그대로다.
+        for eid, dw_failed in pending.dw_failed.items():
+            await repository.bump_platform_status(
+                session,
+                exchange=eid,
+                received_ts=now_ts,
+                spot_market_count=pending.listed_count.get(eid, 0),
+                futures_market_count=(
+                    pending.futures_market_count if eid == "binance" else 0
+                ),
+                dw_failed=dw_failed,
+            )
+
+        if pending.usdkrw_observation is not None:
+            # 라이브 환율 단일 행(usdkrw_rate) 갱신 — 역행은 UPSERT 가드가 막는다.
+            await history_service.record_usdkrw_observation(
+                session, pending.usdkrw_observation
+            )
+
+        await session.commit()
+
+        return PersistResult(
+            saved=saved,
+            archived=archived,
+            deleted=deleted,
             elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
         )
 

@@ -297,3 +297,67 @@ async def seeded_client(client, db):
     """표준 시나리오가 심어진 클라이언트."""
     await seed_standard(db)
     return client
+
+
+# ── 수집 사이클 하네스 (거래소 호출을 전부 대체한다) ──────────────────
+
+
+async def refresh_once(
+    service, db, monkeypatch, *, domestic_bases, binance_bases
+):
+    """거래소 호출을 전부 대체해 수집 사이클 한 번을 돌린다."""
+    from types import SimpleNamespace
+
+    from app.exchanges.private.wallet_status import WalletStatus
+    from app.models.bulk import BulkQuote
+    from app.models.orderbook import MarketType, OrderBook, OrderBookLevel
+
+    def book(base: str, exchange: str) -> OrderBook:
+        return OrderBook(
+            exchange=exchange,
+            symbol=f"{base}/KRW",
+            native_symbol=f"KRW-{base}",
+            market_type=MarketType.SPOT,
+            base=base,
+            quote="KRW",
+            bids=[OrderBookLevel(price=99.0, size=1.0)],
+            asks=[OrderBookLevel(price=101.0, size=1.0)],
+            timestamp=1_700_000_000_000,
+            latency_ms=1.0,
+        )
+
+    async def domestic(eid, failures):
+        return eid, {b: book(b, eid) for b in domestic_bases}, dict.fromkeys(
+            domestic_bases, 140_000.0
+        )
+
+    async def binance(bases, failures):
+        tops = {
+            b: BulkQuote(
+                base=b,
+                quote="USDT",
+                native_symbol=f"{b}USDT",
+                bid=99.9,
+                bid_size=1.0,
+                ask=100.0,
+                ask_size=1.0,
+            )
+            for b in binance_bases
+        }
+        return "binance", tops, dict.fromkeys(binance_bases, 100.0)
+
+    async def futures(warnings):
+        return 1
+
+    async def wallet(eid, warnings):
+        return {b: WalletStatus(deposit=True, withdrawal=True) for b in domestic_bases}
+
+    async def rate(failures):
+        return SimpleNamespace(rate=1400.0, ts=1_700_000_000, round_no=1)
+
+    monkeypatch.setattr(service, "_domestic_market", domestic)
+    monkeypatch.setattr(service, "_binance_market", binance)
+    monkeypatch.setattr(service, "_binance_futures_count", futures)
+    monkeypatch.setattr(service, "_wallet", wallet)
+    monkeypatch.setattr(service, "_usdkrw_rate", rate)
+    await service.refresh(db)
