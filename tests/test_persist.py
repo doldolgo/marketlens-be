@@ -11,6 +11,7 @@ from sqlalchemy import func, select
 
 from app.core.config import settings
 from app.db.models import MarketSnapshot, PlatformStatus, UsdKrwRate
+from app.services import collector_service as collector_module
 from app.services.collector_service import CollectorService
 from app.services.live_store import live_store
 from conftest import refresh_once
@@ -136,3 +137,21 @@ async def test_archive_throttles_independently_of_persist(db, monkeypatch):
 
     assert second.saved > 0, "스냅샷은 매 저장마다 내려야 한다"
     assert second.archived == 0, "아카이브 주기가 안 지났는데 쌓였다"
+
+
+async def test_first_archive_does_not_depend_on_machine_uptime(db, monkeypatch):
+    """갓 부팅한 기계에서도 첫 회차는 적재해야 한다.
+
+    ``time.monotonic()`` 은 부팅 후 경과 시간이다. 마지막 실행 시각을 0.0 으로
+    두면 "아주 옛날"이라는 뜻이 되지 못한다 — uptime 이 주기보다 짧으면
+    ``now - 0 >= interval`` 이 거짓이라 첫 적재가 통째로 사라진다.
+    개발자 기계는 며칠씩 켜져 있어 안 드러나고, 방금 뜬 CI 러너에서만 터졌다.
+    """
+    monkeypatch.setattr(settings, "archive_interval_seconds", 3600.0)
+    monkeypatch.setattr(collector_module.time, "monotonic", lambda: 5.0)  # uptime 5초
+
+    service = CollectorService()
+    await refresh_once(
+        service, db, monkeypatch, domestic_bases=["BTC"], binance_bases=["BTC"]
+    )
+    assert (await service.persist(db)).archived > 0

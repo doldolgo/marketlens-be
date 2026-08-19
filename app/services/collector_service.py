@@ -135,7 +135,11 @@ class CollectorService:
         self._refresh_lock = asyncio.Lock()
         # 저빈도 작업의 마지막 실행 시각 (time.monotonic 기준).
         # 라이브 수집은 1초마다 돌지만 아래 둘은 그 주기로 돌 이유가 없다.
-        self._last_archive_ts: float = 0.0
+        #
+        # **None = 아직 한 번도 안 했다.** 0.0 을 쓰면 안 된다 — monotonic 은
+        # 부팅 후 경과 시간이라 갓 부팅한 기계에서는 0 이 "아주 옛날"이 아니다.
+        # uptime 이 주기보다 짧으면 첫 회차가 통째로 건너뛰어진다.
+        self._last_archive_ts: float | None = None
         self._last_wallet_ts: float = 0.0
         #: 거래소 → 입출금 상태. wallet_refresh_seconds 주기로만 갱신한다.
         self._wallet_cache: dict[str, dict[str, WalletStatus] | None] = {}
@@ -443,7 +447,8 @@ class CollectorService:
         # 저장 주기와 손잡이를 따로 두고 여기서 한 번 더 가드한다.
         cycle_ts = time.monotonic()
         do_archive = (
-            cycle_ts - self._last_archive_ts >= settings.archive_interval_seconds
+            self._last_archive_ts is None
+            or cycle_ts - self._last_archive_ts >= settings.archive_interval_seconds
         )
         if do_archive:
             self._last_archive_ts = cycle_ts
