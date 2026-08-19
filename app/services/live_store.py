@@ -46,8 +46,10 @@ class LiveSnapshot:
     price: float
     asks: list[list[float]] = field(default_factory=list)
     bids: list[list[float]] = field(default_factory=list)
-    deposit_enabled: bool = False
-    withdrawal_enabled: bool = False
+    #: 입출금 가능 여부는 3-state 다 — True=열림 / False=막힘 / None=확인 불가.
+    #: (`app.db.models.MarketSnapshot` 의 같은 이름 필드와 뜻이 같다)
+    deposit_enabled: bool | None = None
+    withdrawal_enabled: bool | None = None
     #: 거래소가 준 시세 시각 (epoch ms)
     price_timestamp: int = 0
     #: 이 행을 메모리에 넣은 시각. **timezone-aware UTC 로만 넣는다** —

@@ -35,18 +35,21 @@ class MatrixDirection(BaseModel):
         ),
     )
 
-    withdrawal_available: bool = Field(
-        False,
+    withdrawal_available: bool | None = Field(
+        None,
         description=(
             "**구매처에서 이 코인을 출금할 수 있는지.** 코인을 옮기려면 구매처 "
-            "출금이 열려 있어야 한다. 확인 불가(키 없음·API 장애)도 False 다 — "
-            "모르는 경로를 열린 것처럼 보여주지 않는다"
+            "출금이 열려 있어야 한다. `true`=확인했고 열림 / "
+            "`false`=확인했고 막힘 / `null`=**확인 불가**(키 없음·API 장애·"
+            "응답 누락). **null 을 열림으로 읽지 말 것** — 모르는 경로를 "
+            "열린 것처럼 보여주지 않는다"
         ),
     )
-    deposit_available: bool = Field(
-        False,
+    deposit_available: bool | None = Field(
+        None,
         description=(
-            "**판매처에서 이 코인을 입금받을 수 있는지.** 확인 불가도 False."
+            "**판매처에서 이 코인을 입금받을 수 있는지.** 값의 뜻은 "
+            "`withdrawal_available` 과 같다 (`null`=확인 불가)."
         ),
     )
 

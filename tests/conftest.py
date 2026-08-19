@@ -104,8 +104,8 @@ def snapshot_row(
     *,
     quote: str = "KRW",
     krw_factor: float = 1.0,
-    deposit: bool = True,
-    withdrawal: bool = True,
+    deposit: bool | None = True,
+    withdrawal: bool | None = True,
     native: str | None = None,
     ts: int = NOW_MS,
 ) -> SnapshotRow:
@@ -143,7 +143,9 @@ async def seed_usdkrw_rate(session, rate: float = FX_RATE) -> None:
 async def seed_standard(session) -> None:
     """국내 2곳 + 바이낸스 + 환율 — 조회 API 테스트의 표준 시나리오.
 
-    빗썸은 입출금 상태를 알 수 없는 상황(None)으로 심는다.
+    빗썸은 입출금이 **막힌**(False) 상황으로 심는다. "확인 불가"(None)는
+    이 시드로 덮지 않는다 — 세 상태를 구분해 태우는 테스트는
+    ``test_wallet_state.py`` 가 직접 행을 만들어 쓴다.
     """
     await seed_rows(
         session,
@@ -303,9 +305,21 @@ async def seeded_client(client, db):
 
 
 async def refresh_once(
-    service, db, monkeypatch, *, domestic_bases, binance_bases
+    service,
+    db,
+    monkeypatch,
+    *,
+    domestic_bases,
+    binance_bases,
+    wallet_status=None,
+    wallet_fails=False,
 ):
-    """거래소 호출을 전부 대체해 수집 사이클 한 번을 돌린다."""
+    """거래소 호출을 전부 대체해 수집 사이클 한 번을 돌린다.
+
+    ``wallet_status`` 로 지갑 응답을 코인별로 지정할 수 있다 (기본: 전부 열림).
+    ``wallet_fails=True`` 면 지갑 조회가 실패한 상황을 만든다 — 수집기는 이때
+    입출금을 **확인 불가(None)** 로 둬야 한다.
+    """
     from types import SimpleNamespace
 
     from app.exchanges.private.wallet_status import WalletStatus
@@ -350,6 +364,12 @@ async def refresh_once(
         return 1
 
     async def wallet(eid, warnings):
+        if wallet_fails:
+            # _wallet() 은 예외를 삼키고 None 을 돌려준다 (경고만 남긴다)
+            warnings.append(f"{eid} 입출금 상태 조회 실패 — 테스트")
+            return None
+        if wallet_status is not None:
+            return dict(wallet_status)
         return {b: WalletStatus(deposit=True, withdrawal=True) for b in domestic_bases}
 
     async def rate(failures):

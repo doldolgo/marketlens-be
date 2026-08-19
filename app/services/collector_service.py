@@ -871,9 +871,12 @@ class CollectorService:
                     price=price,
                     asks=_truncate(book.asks, max_amount),
                     bids=_truncate(book.bids, max_amount),
-                    # 확인 불가(키 없음/장애)는 null 이 아니라 보수적으로 False.
-                    deposit_enabled=bool(status.deposit) if status else False,
-                    withdrawal_enabled=bool(status.withdrawal) if status else False,
+                    # 조회 자체가 실패했거나(wallet=None) 응답에 이 코인이
+                    # 없으면(status=None) **확인 불가**다 — 막힘(False)이
+                    # 아니라 None 으로 둔다. 둘을 구분할 근거가 없으므로
+                    # 한 값으로 합친다.
+                    deposit_enabled=status.deposit if status else None,
+                    withdrawal_enabled=status.withdrawal if status else None,
                     price_timestamp=book.timestamp,
                 )
             )
@@ -910,9 +913,12 @@ class CollectorService:
                     price=price,
                     asks=[[q.ask, q.ask_size or 0.0]],
                     bids=[[q.bid, q.bid_size or 0.0]],
-                    # 확인 불가(키 없음/장애)는 null 이 아니라 보수적으로 False.
-                    deposit_enabled=bool(status.deposit) if status else False,
-                    withdrawal_enabled=bool(status.withdrawal) if status else False,
+                    # 조회 자체가 실패했거나(wallet=None) 응답에 이 코인이
+                    # 없으면(status=None) **확인 불가**다 — 막힘(False)이
+                    # 아니라 None 으로 둔다. 둘을 구분할 근거가 없으므로
+                    # 한 값으로 합친다.
+                    deposit_enabled=status.deposit if status else None,
+                    withdrawal_enabled=status.withdrawal if status else None,
                     # OrderBook.timestamp 와 같은 단위(epoch ms)로 맞춘다.
                     price_timestamp=now_ts * 1000,
                 )

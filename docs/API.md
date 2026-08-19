@@ -1481,6 +1481,7 @@ curl "http://localhost:8000/history/status"
 |---|---|
 | 키 있음 | `deposit_enabled` / `withdrawal_enabled` 가 true/false 로 저장 |
 | 키 없음 / 조회 실패 | 해당 거래소의 두 필드가 **null** 로 저장, `warnings` 에 안내. 나머지 수집은 정상 |
+| 조회는 됐으나 응답에 그 코인이 없음 | **그 코인만** 두 필드가 **null** 로 저장 |
 
 빗썸은 public 엔드포인트로 조회하므로 키가 필요 없다.
 
